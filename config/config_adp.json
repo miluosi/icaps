@@ -1,0 +1,141 @@
+{
+  "demand_response": {
+    "use_intense_requests": true
+  },
+  "training": {
+    "adp_value": 0.5,
+    "assignmentgurobi": true,
+    "learning_rate": 0.001,
+    "min_learning_rate": 0.001,
+    "batch_size": 256,
+    "buffer_size": 20000,
+    "gamma": 0.95,
+    "target_update_frequency": 100,
+    "gradient_clip_norm": 10.0,
+    "weight_decay": 1e-5,
+    "scheduler": {
+      "factor": 0.9,
+      "patience": 200,
+      "verbose": true
+    }
+  },
+  "sampling": {
+    "default_method": "adaptive",
+    "methods": {
+      "balanced": {
+        "assign_weight": 0.5,
+        "idle_weight": 0.3,
+        "charge_weight": 0.2
+      },
+      "importance": {
+        "action_rarity_weight": 1.0,
+        "reward_rarity_weight": 1.0,
+        "time_weight": 0.5,
+        "assign_bonus": 2.0,
+        "min_weight": 0.1
+      },
+      "thompson": {
+        "prior_success": 1,
+        "prior_failure": 1,
+        "success_threshold": 0
+      },
+      "prioritized": {
+        "alpha": 0.6,
+        "action_bonus_assign": 2.0,
+        "action_bonus_charge": 1.5,
+        "action_bonus_idle": 1.0,
+        "rarity_bonus_high_assign": 3.0,
+        "rarity_bonus_positive_charge": 2.0
+      }
+    },
+    "adaptive_schedule": {
+      "stage_1": {
+        "steps": 1000,
+        "method": "balanced",
+        "description": "初期使用平衡采样建立基础"
+      },
+      "stage_2": {
+        "steps": 3000,
+        "method": "importance",
+        "description": "中期使用重要性采样"
+      },
+      "stage_3": {
+        "steps": 5000,
+        "method": "thompson",
+        "description": "后期使用Thompson采样"
+      },
+      "stage_4": {
+        "steps": "unlimited",
+        "method": "prioritized",
+        "description": "高级阶段使用优先经验回放"
+      }
+    }
+  },
+  "network": {
+    "hidden_layers": [256, 256, 128],
+    "embedding_dims": {
+      "action_type": 16,
+      "vehicle_id": 32,
+      "vehicle_type": 8,
+      "context": 64
+    },
+    "dropout_rate": 0.1,
+    "activation": "relu",
+    "batch_norm": true
+  },
+  "environment": {
+    "max_vehicles": 50,
+    "max_charging_stations": 12,
+    "episode_length": 100,
+    "charging_threshold": 0.2,
+    "movement_penalty": -0.2,
+    "success_reward": 15.0,
+    "charging_reward": 5.0
+  },
+  "logging": {
+    "debug_frequency": 100,
+    "save_frequency": 1000,
+    "log_gradients": true,
+    "log_q_values": true,
+    "log_sampling_stats": true,
+    "verbose_training": false
+  },
+  "experiment": {
+    "name": "ev_adp_training",
+    "version": "v2.0",
+    "description": "Enhanced EV-ADP with advanced sampling strategies",
+    "tags": ["reinforcement_learning", "electric_vehicles", "charging_optimization"],
+    "seed": 42
+  },
+  "paths": {
+    "model_save_dir": "results/models",
+    "log_dir": "logs",
+    "checkpoint_dir": "checkpoints",
+    "results_dir": "results"
+  },
+  "optimization": {
+    "gurobi": {
+      "time_limit": 30,
+      "mip_gap": 0.01,
+      "threads": 4,
+      "method": 2,
+      "presolve": 2
+    },
+    "neural_network": {
+      "use_double_dqn": true,
+      "use_dueling": false,
+      "use_per": true,
+      "use_noisy_nets": false
+    }
+  },
+  "validation": {
+    "frequency": 500,
+    "episodes": 10,
+    "metrics": ["avg_reward", "completion_rate", "charging_efficiency"],
+    "save_best_model": true
+  },
+  "performance": {
+    "record_time": false,
+    "time_stats_output": "results/time_analysis"
+  }
+}

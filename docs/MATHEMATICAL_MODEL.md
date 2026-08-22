@@ -1,0 +1,255 @@
+# Mixed-Fleet ADP 数学模型
+
+## 1. 决策过程
+
+离散决策时刻为：
+
+$$
+t\in\{0,1,\ldots,T-1\}.
+$$
+
+车辆集合由 human-driven EV 和 autonomous EV 两部分构成：
+
+$$
+\mathcal{V}=\mathcal{V}^{\mathrm{EV}}\cup\mathcal{V}^{\mathrm{AEV}},
+\qquad
+\mathcal{V}^{\mathrm{EV}}\cap\mathcal{V}^{\mathrm{AEV}}=\varnothing.
+$$
+
+时刻的系统状态包含车辆位置、电量、载客/空闲状态，活跃订单，充电站占用与队列，以及时间和需求特征：
+
+$$
+s_t=
+\left(
+\{\ell_{v,t},b_{v,t},m_{v,t}\}_{v\in\mathcal V},
+\mathcal R_t,
+\{c_{j,t},q_{j,t}\}_{j\in\mathcal C},
+\tau_t,
+d_t
+\right).
+$$
+
+每辆车的候选动作包括服务订单、前往充电站、重定位和保持空闲：
+
+$$
+\mathcal A_v(s_t)=
+\mathcal A_v^{\mathrm{serve}}
+\cup\mathcal A_v^{\mathrm{charge}}
+\cup\mathcal A_v^{\mathrm{relocate}}
+\cup\{a_v^{\mathrm{idle}}\}.
+$$
+
+## 2. 联合可行 assignment
+
+令二元变量表示车辆是否选择候选动作：
+
+$$
+x_{v,a,t}\in\{0,1\}.
+$$
+
+每辆车至多执行一个动作：
+
+$$
+\sum_{a\in\mathcal A_v(s_t)}x_{v,a,t}\le 1,
+\qquad \forall v\in\mathcal V.
+$$
+
+每个订单至多由一辆车服务：
+
+$$
+\sum_{v\in\mathcal V}
+\sum_{a\in\mathcal A_v^{\mathrm{serve}}(r)}
+x_{v,a,t}
+\le 1,
+\qquad \forall r\in\mathcal R_t.
+$$
+
+考虑可用充电位和允许进入的队列容量，站点约束为：
+
+$$
+\sum_{v\in\mathcal V}
+\sum_{a\in\mathcal A_v^{\mathrm{charge}}(j)}
+x_{v,a,t}
+\le
+\bar c_j-c_{j,t}+\bar q_j-q_{j,t},
+\qquad \forall j\in\mathcal C.
+$$
+
+候选集合已过滤续航不可行的动作。若动作的总行驶能耗为所需电量，则：
+
+$$
+b_{v,t}-e_{v,a,t}\ge b_v^{\min}.
+$$
+
+## 3. 即时收益与 ADP 分数
+
+即时收益统一计入订单收益、移动成本、拒单损失、充电成本和排队惩罚：
+
+$$
+g_{v,a,t}
+=p_{v,a,t}
+-c^{\mathrm{move}}_{v,a,t}
+-c^{\mathrm{reject}}_{v,a,t}
+-c^{\mathrm{charge}}_{v,a,t}
+-\lambda^{\mathrm{wait}}w_{v,a,t}.
+$$
+
+价值网络估计动作后状态的 continuation value：
+
+$$
+\widehat V_{\theta}(s^{x}_{v,a,t}).
+$$
+
+因此交给 ILP、MCMF 或 heuristic 的统一边分数为：
+
+$$
+Q_{v,a,t}
+=g_{v,a,t}
++\gamma\widehat V_{\theta}(s^{x}_{v,a,t}).
+$$
+
+精确联合分配求解：
+
+$$
+x_t^{\star}
+\in
+\arg\max_{x\in\mathcal X(s_t)}
+\sum_{v\in\mathcal V}
+\sum_{a\in\mathcal A_v(s_t)}
+Q_{v,a,t}x_{v,a,t}.
+$$
+
+其中可行域集中表达订单互斥、每车一动作、充电容量和电量约束。MCMF 在固定可分解边分数下实现相同的 capacitated projection；heuristic 则按优先级和分数排序逐项接受仍可行的动作。
+
+## 4. Heuristic 排列
+
+对每个可行车辆—动作边构造排序键：
+
+$$
+k(v,a,t)=
+\left(
+\pi^{\mathrm{critical}}_{v,a,t},
+\pi^{\mathrm{service}}_{v,a,t},
+Q_{v,a,t},
+-d_{v,a,t}
+\right).
+$$
+
+按字典序从高到低扫描候选边，并维护剩余订单与站点容量。已经接受的边集合记为：
+
+$$
+\mathcal H_n.
+$$
+
+heuristic 更新为：
+
+$$
+\mathcal H_{n+1}=
+\begin{cases}
+\mathcal H_n\cup\{(v,a)\}, &
+\text{if }\mathcal H_n\cup\{(v,a)\}\in\mathcal X(s_t),\\
+\mathcal H_n, & \text{otherwise}.
+\end{cases}
+$$
+
+## 5. 价值学习
+
+一条训练 transition 记为：
+
+$$
+\left(s_t,x_t,r_t,s_{t+1}\right).
+$$
+
+基本 TD target 为：
+
+$$
+y_t=r_t+\gamma\widehat V_{\bar\theta}(s_{t+1}),
+$$
+
+网络以均方 TD 误差更新：
+
+$$
+\mathcal L_{\mathrm{TD}}(\theta)
+=
+\frac{1}{B}
+\sum_{i=1}^{B}
+\left(
+\widehat V_{\theta}(s_i^{x})-y_i
+\right)^2.
+$$
+
+post-demand direct 模型把基础 continuation、队列特征和未来需求 head 分开：
+
+$$
+\widehat V_{\theta}
+=
+\widehat V_{\theta}^{\mathrm{base}}
++\alpha_q\widehat q_{\theta}^{\mathrm{queue}}
++\alpha_d\widehat d_{\theta}^{\mathrm{post}}.
+$$
+
+## 6. 三种 heuristic 实验的严格区别
+
+精确联合分配策略与 heuristic 分配策略分别记为：
+
+$$
+\pi^{\mathrm{exact}},
+\qquad
+\pi^{\mathrm{heu}}.
+$$
+
+两个训练算子为：
+
+$$
+\theta^{\mathrm{exact}}
+=\operatorname{Train}(\pi^{\mathrm{exact}}),
+\qquad
+\theta^{\mathrm{heu}}
+=\operatorname{Train}(\pi^{\mathrm{heu}}).
+$$
+
+三种评估策略分别是：
+
+$$
+\mathrm{HEU}=\pi^{\mathrm{heu}}(g),
+$$
+
+$$
+\mathrm{ADP\mbox{-}HEU}
+=
+\pi^{\mathrm{heu}}
+\left(g+\gamma\widehat V_{\theta^{\mathrm{exact}}}\right),
+$$
+
+$$
+\mathrm{ADP\mbox{-}HEU\mbox{-}HEU}
+=
+\pi^{\mathrm{heu}}
+\left(g+\gamma\widehat V_{\theta^{\mathrm{heu}}}\right).
+$$
+
+这一定义保证旧 `ADP-HEU` 没有被重解释：它始终使用 `gurobi` 标签的 exact-trained checkpoint；只有 `ADP-HEU-HEU` 使用 `heu` 标签的 heuristic-trained checkpoint。
+
+## 7. 评估指标
+
+服务率为：
+
+$$
+\mathrm{ServiceRate}
+=
+\frac{N_{\mathrm{completed}}}{N_{\mathrm{generated}}}.
+$$
+
+仅在实际等待过的车辆上计算平均充电等待：
+
+$$
+\overline W_{+}
+=
+\frac{
+\sum_v W_v\mathbf 1\{W_v>0\}
+}{
+\sum_v\mathbf 1\{W_v>0\}
+}.
+$$
+
+论文比较至少同时报告累计收益、完成订单、服务率、EV/AEV 分组结果、等待时间、拒单/掉线结果以及每个 assignment backend 的运行时间。
