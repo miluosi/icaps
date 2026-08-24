@@ -336,8 +336,11 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         queue_wait_features=None,
         vehicle_neighbour_candidates: dict[int, list[dict]] | None = None,
         post_demand_features=None,
+        graph_snapshot=None,
+        target_context: bool = False,
+        vehicle_types=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        graph = self._graph_context()
+        graph = self._graph_context(graph_snapshot, target=target_context)
         source_embeddings = self._vehicle_source_embeddings(
             graph,
             vehicle_ids,
@@ -371,7 +374,15 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         rows = []
         type_weights = []
         for index in range(len(vehicle_ids)):
-            vehicle_type = self._vehicle_type(int(vehicle_ids[index]))
+            if vehicle_types is not None:
+                vehicle_type = int(vehicle_types[index])
+            else:
+                vehicle_type = int(
+                    graph["vehicle_type_by_id"].get(
+                        int(vehicle_ids[index]),
+                        self._vehicle_type(int(vehicle_ids[index])),
+                    )
+                )
             state = self._state_features(
                 location=int(vehicle_locations[index]),
                 current_time=float(current_times[index]),

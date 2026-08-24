@@ -22,6 +22,9 @@ import pickle
 from pathlib import Path as PathlibPath
 import logging
 
+from src.recourse.replay import PrioritizedJointReplayBuffer
+from src.recourse.types import RecourseTransition
+
 
 def _resolve_aux_zone_dim(env, default: int = 4) -> int:
     if env is None:
@@ -429,6 +432,10 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         self.replay_buffer_size = int(replay_buffer_size)
         self.total_experiences_seen = 0
         self.experience_buffer = deque(maxlen=self.replay_buffer_size)
+        self.joint_replay_buffer = PrioritizedJointReplayBuffer(
+            capacity=max(1, self.replay_buffer_size // 5)
+        )
+        self._replay_collection_context = None
         
         # Training metrics tracking
         self.training_losses = []
@@ -464,6 +471,21 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
 
 
 
+
+    def _vehicle_type_id(self, vehicle_id: int) -> int:
+        vehicles = getattr(self.env, "vehicles", {}) if self.env is not None else {}
+        if int(vehicle_id) not in vehicles:
+            # Compatibility callers without an environment receive the
+            # declared default type; critically, no id-parity inference is
+            # performed.
+            return 1
+        return int(vehicles[int(vehicle_id)].get("type", 1))
+
+    def set_replay_collection_context(self, action) -> None:
+        self._replay_collection_context = action
+
+    def store_recourse_transition(self, transition: RecourseTransition) -> None:
+        self.joint_replay_buffer.add(transition)
 
     def _init_rejection_predictor(self):
         """初始化拒绝概率预测神经网络"""
@@ -1252,7 +1274,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # 从Environment中获取车辆类型（需要从外部传入或者推断）
         # 假设vehicle_id为偶数是EV，奇数是AEV（简化处理）
         # 实际应用中应该从环境或配置中获取
-        vehicle_type_id = 1 if vehicle_id % 2 == 0 else 2  # 1=EV, 2=AEV
+        vehicle_type_id = self._vehicle_type_id(vehicle_id)
         
         # 🆕 计算target location的曼哈顿距离并归一化
         if hasattr(self, 'env') and self.env is not None and hasattr(self.env, '_manhattan_distance_loc'):
@@ -2203,7 +2225,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             adjustment += urgency_bonus
             
         # 5. 车辆类型的影响
-        vehicle_type_id = 1 if vehicle_id % 2 == 0 else 2  # 简化的车辆类型判断
+        vehicle_type_id = self._vehicle_type_id(vehicle_id)
         if vehicle_type_id == 2:  # AEV类型车辆
             # AEV在某些情况下可能有优势
             aev_bonus = 0.05 if battery_level > 0.7 else -0.05
@@ -2589,7 +2611,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         else:
             # 回退到默认值
             battery_level = 1.0
-            vehicle_type = 1 if vehicle_id % 2 == 0 else 2
+            vehicle_type = self._vehicle_type_id(vehicle_id)
             current_time = 0
             num_requests = 0
             pickup_time_minutes = 0.0
@@ -2693,7 +2715,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             vehicle_idle_time: 车辆idle时间 (归一化0-1，默认0.0)
         """
         vehicle_info = self.env.vehicles.get(vehicle_id, {}) if hasattr(self, 'env') and hasattr(self.env, 'vehicles') else {}
-        vehicle_type = int(vehicle_info.get('type', 1 if vehicle_id % 2 == 0 else 2))
+        vehicle_type = int(vehicle_info.get('type', self._vehicle_type_id(vehicle_id)))
         
         # 🔧 确保location是int类型，如果是tuple则转换为location ID
         def ensure_location_id(loc):
@@ -2725,9 +2747,15 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         if next_hour_of_day is None:
             next_raw_time = current_time + dur_time
             next_hour_of_day = self.env.get_hour_of_day(next_raw_time) if hasattr(self.env, 'get_hour_of_day') else (next_raw_time / self.episode_length * 24.0 if self.episode_length > 0 else 0.0)
-        request_obj = None
+        action_context = self._replay_collection_context
+        action_metadata = getattr(action_context, "metadata", None)
+        request_obj = (
+            getattr(action_metadata, "request_snapshot", None)
+            if action_metadata is not None
+            else None
+        )
         rejection_feature_vector = None
-        if action_type.startswith('assign') and hasattr(self, 'env') and self.env is not None:
+        if request_obj is None and action_type.startswith('assign') and hasattr(self, 'env') and self.env is not None:
             try:
                 request_id = int(str(action_type).split('_', 1)[1])
                 request_obj = getattr(self.env, 'active_requests', {}).get(request_id)
@@ -2825,7 +2853,25 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             'next_prior_features': next_prior_features,
             'next_hour_of_day': next_hour_of_day,
         }
+        if action_metadata is not None:
+            experience.update({
+                'schema_version': 1,
+                'transition_id': action_metadata.transition_id,
+                'stage_id': int(action_metadata.stage_id),
+                'acceptance_outcome': action_metadata.acceptance_outcome,
+                'residual_category': action_metadata.residual_category,
+                'state_snapshot': action_metadata.state_snapshot,
+                'feasible_graph_snapshot': action_metadata.feasible_graph_snapshot,
+                'residual_state_snapshot': action_metadata.residual_state_snapshot,
+                'next_state_snapshot': action_metadata.next_state_snapshot,
+                'joint_action_snapshot': action_metadata.joint_action_snapshot,
+            })
+            experience.update(action_metadata.extras)
+        experience.setdefault('mode', getattr(self.env, 'decision_mode', 'integrated'))
+        experience.setdefault('recourse_variant', getattr(self.env, 'recourse_variant', 'legacy'))
+        experience.setdefault('solver_backend', getattr(self.env, 'mcmf_backend', 'unknown'))
         self.experience_buffer.append(experience)
+        self._replay_collection_context = None
         previous_total_seen = getattr(self, 'total_experiences_seen', max(0, len(self.experience_buffer) - 1))
         self.total_experiences_seen = previous_total_seen + 1
     
@@ -4431,7 +4477,10 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # Calculate target Q-values with duration-adjusted discount and terminal state handling
         with torch.no_grad():
-            bootstrap_mask = is_done_tensor * (1.0 - rejected_tensor)
+            # EV rejection is a within-epoch realization, not a terminal
+            # state.  Only genuine environment/vehicle termination masks the
+            # continuation target.
+            bootstrap_mask = is_done_tensor
             target_q_values = rewards_tensor + (gamma ** dur_times_tensor) * next_q_values * bootstrap_mask
             
             # 添加数值稳定性检查
@@ -4697,7 +4746,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 'request_value': value_b,
                 'action_type': torch.tensor([[self._action_type_id(action_type)]], dtype=torch.long, device=self.device),
                 'vehicle_id': torch.tensor([[vehicle_id + 1]], dtype=torch.long, device=self.device),
-                'vehicle_type': torch.tensor([[1 if vehicle_id % 2 == 0 else 2]], dtype=torch.long, device=self.device)
+                'vehicle_type': torch.tensor([[self._vehicle_type_id(vehicle_id)]], dtype=torch.long, device=self.device)
             }
             inputs_list.append(sample)
             labels_list.append(label)
@@ -5110,7 +5159,7 @@ class LikelihoodZonePredictor(nn.Module):
     """Predict unnormalized log-likelihood scores from time and leader context.
     This branch is used for strict Bayes fusion:
 
-        p(z | t, c) \propto p(z | t) p(c | z, t)
+        p(z | t, c) \\propto p(z | t) p(c | z, t)
 
     The network outputs zone-wise evidence scores that are treated as
     unnormalized log p(c | z, t).

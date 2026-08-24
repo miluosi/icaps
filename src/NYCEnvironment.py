@@ -34,6 +34,11 @@ from src.charging_station import ChargingStation, ChargingStationManager
 from src.charging_wait_metrics import positive_wait_metrics
 from src.qvalue_precision import qvalue_rounding_diagnostics, round_qvalue_matrix
 from src.Request import Request
+from src.recourse.coordinator import RecourseCoordinator
+from src.recourse.lifecycle import RequestLifecycleTracker
+from src.recourse.state_snapshot import StateSnapshotBuilder
+from src.recourse.target_builder import RecourseTargetBuilder
+from src.recourse.types import JointActionSnapshot, RequestSnapshot
 
 # ---------------------------------------------------------------------------
 # Haversine helper (km)
@@ -491,8 +496,16 @@ class NYCEnvironment:
         self.unoffered_request_served_count = 0
         self._current_ev_stage_request_ids: set = set()
         self._current_ev_offered_request_ids: set = set()
-        self._stage1_recourse_target_by_transition: dict = {}
         self._same_epoch_blocked_request_ids: set = set()
+        self.request_lifecycle = RequestLifecycleTracker()
+        self.recourse_coordinator = RecourseCoordinator(
+            lifecycle=self.request_lifecycle
+        )
+        self.state_variant = "joint_state_shared_critic"
+        self.learner_variant = "optimization_anchored_residual"
+        self._last_offer_realizations: dict[tuple[int, int, int], dict] = {}
+        self._pending_recourse_actions: dict[int, object] = {}
+        self.expired_request_ids: set[int] = set()
         self.ev_charge_soc_threshold = 0.25
         self.ev_charge_soc_slope = 12.0
         self.ev_station_choice_beta = 1.0
@@ -1378,8 +1391,13 @@ class NYCEnvironment:
         self.unoffered_request_served_count = 0
         self._current_ev_stage_request_ids = set()
         self._current_ev_offered_request_ids = set()
-        self._stage1_recourse_target_by_transition = {}
         self._same_epoch_blocked_request_ids = set()
+        self._ensure_recourse_runtime()
+        self.request_lifecycle.reset()
+        self.recourse_coordinator.pending = None
+        self._last_offer_realizations = {}
+        self._pending_recourse_actions = {}
+        self.expired_request_ids = set()
         current_date_label = self._current_date_label()
         if current_date_label is not None:
             self._prepare_day_demand(current_date_label)
@@ -2556,7 +2574,7 @@ class NYCEnvironment:
         rejection_logit_shift: float = 0.0,
         common_random_numbers: bool = False,
     ) -> None:
-        """Configure the additive R0--R4 experiment without changing APIs."""
+        """Configure explicit R0--R4 execution and target semantics."""
         variant = str(variant or "legacy").strip().lower()
         if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4"}:
             raise ValueError(
@@ -2569,16 +2587,38 @@ class NYCEnvironment:
         self.rejection_logit_shift = shift
         self.common_random_numbers = bool(common_random_numbers)
 
+    def _ensure_recourse_runtime(self) -> None:
+        if not hasattr(self, "request_lifecycle"):
+            self.request_lifecycle = RequestLifecycleTracker()
+        if not hasattr(self, "recourse_coordinator"):
+            self.recourse_coordinator = RecourseCoordinator(
+                lifecycle=self.request_lifecycle
+            )
+        if not hasattr(self, "state_variant"):
+            self.state_variant = "joint_state_shared_critic"
+        if not hasattr(self, "learner_variant"):
+            self.learner_variant = "optimization_anchored_residual"
+        if not hasattr(self, "_last_offer_realizations"):
+            self._last_offer_realizations = {}
+
+    def _epoch_id(self) -> int:
+        return StateSnapshotBuilder.epoch_id(self)
+
     def _acceptance_uniform(self, vehicle_id: int, request) -> float:
         """Return an offer-keyed uniform shared by paired experiment runs."""
         if not bool(getattr(self, "common_random_numbers", False)):
             return random.random()
         request_id = getattr(request, "request_id", "unknown")
         day_index = int(getattr(self, "episode_day_index", 0) or 0)
+        self._ensure_recourse_runtime()
+        epoch_id = self._epoch_id()
+        attempt_index = self.request_lifecycle.next_attempt_index(
+            epoch_id, int(vehicle_id), int(request_id)
+        )
         key = (
             f"{int(getattr(self, '_recourse_experiment_seed', 0))}|"
-            f"{day_index}|{float(self.current_time):.9f}|"
-            f"{int(vehicle_id)}|{request_id}"
+            f"{day_index}|{epoch_id}|{int(vehicle_id)}|{request_id}|"
+            f"{attempt_index}"
         ).encode("utf-8")
         digest = hashlib.blake2b(key, digest_size=8).digest()
         integer = int.from_bytes(digest, byteorder="big", signed=False)
@@ -2611,11 +2651,27 @@ class NYCEnvironment:
         return self._calculate_known_rejection_probability(vehicle_id, request, sample_noise=True)
 
     def _should_reject_request(self, vehicle_id: int, request) -> bool:
-        if not self.ifreject or getattr(self, "recourse_variant", "legacy") == "r0":
-            return False
-        return self._acceptance_uniform(vehicle_id, request) < (
-            self._calculate_rejection_probabilityreal(vehicle_id, request)
+        variant_policy = RecourseTargetBuilder.variant_policy(
+            getattr(self, "recourse_variant", "legacy")
         )
+        if not self.ifreject or not variant_policy.rejection_enabled:
+            self._last_offer_realizations[(self._epoch_id(), int(vehicle_id), int(request.request_id))] = {
+                "acceptance_probability": 1.0,
+                "uniform": 1.0,
+                "rejected": False,
+            }
+            return False
+        rejection_probability = self._calculate_rejection_probabilityreal(
+            vehicle_id, request
+        )
+        acceptance_uniform = self._acceptance_uniform(vehicle_id, request)
+        rejected = acceptance_uniform < rejection_probability
+        self._last_offer_realizations[(self._epoch_id(), int(vehicle_id), int(request.request_id))] = {
+            "acceptance_probability": 1.0 - float(rejection_probability),
+            "uniform": float(acceptance_uniform),
+            "rejected": bool(rejected),
+        }
+        return rejected
 
     def _request_action_outcome_features(self, vehicle_id: int, request, value_function=None) -> dict:
         vehicle_location = int(self.vehicles[vehicle_id]['location'])
@@ -2640,6 +2696,7 @@ class NYCEnvironment:
         action.dropoff_location = int(getattr(request, 'dropoff', action.pickup_location))
         action.value_target_location = action.dropoff_location
         action.request_value = float(getattr(request, 'final_value', 0.0))
+        action.metadata.request_snapshot = RequestSnapshot.from_request(request)
         for key, value in features.items():
             setattr(action, key, value)
 
@@ -2908,9 +2965,14 @@ class NYCEnvironment:
         vehicle = self.vehicles.get(vehicle_id)
         if vehicle is None or int(vehicle.get('type', 1)) != 2:
             return False
+        epoch_id = self._epoch_id()
         rejected_at = self.ev_rejection_times.get(request_id)
-        if rejected_at is None or float(rejected_at) != float(self.current_time):
+        if rejected_at is None or int(rejected_at) != epoch_id:
             return False
+        self._ensure_recourse_runtime()
+        self.request_lifecycle.record_aev_assignment(
+            int(request_id), vehicle_id=int(vehicle_id), epoch_id=epoch_id
+        )
         recourse_ids = self.ev_rejected_recovered_same_epoch_ids
         is_new = request_id not in recourse_ids
         recourse_ids.add(request_id)
@@ -2936,13 +2998,45 @@ class NYCEnvironment:
         if vehicle['assigned_request'] is not None or vehicle['passenger_onboard'] is not None:
             return False
 
-        # rejection check
-        if self._should_reject_request(vehicle_id, request):
+        # Rejection is an observed outcome on a selected EV offer.  Persist
+        # the offer in the lifecycle regardless of realization.
+        rejected = self._should_reject_request(vehicle_id, request)
+        if self._is_ev(vehicle_id):
+            self._ensure_recourse_runtime()
+            epoch_id = self._epoch_id()
+            realization = self._last_offer_realizations.get(
+                (epoch_id, int(vehicle_id), int(request_id)),
+                {
+                    "acceptance_probability": 0.0 if rejected else 1.0,
+                    "uniform": 0.0 if rejected else 1.0,
+                },
+            )
+            pending = self.recourse_coordinator.pending
+            transition_id = (
+                pending.transition_id
+                if pending is not None
+                else f"unlinked:{epoch_id}:{vehicle_id}:{request_id}"
+            )
+            self.request_lifecycle.record_offer(
+                transition_id=transition_id,
+                epoch_id=epoch_id,
+                request=request,
+                ev_id=int(vehicle_id),
+                vehicle=dict(vehicle),
+                acceptance_probability=float(
+                    realization.get("acceptance_probability", 0.0)
+                ),
+                acceptance_uniform=float(realization.get("uniform", 0.0)),
+                accepted=not rejected,
+                rejection_reason="driver_reject" if rejected else None,
+            )
+        if rejected:
             vehicle['rejected_requests'] += 1
             self._record_ev_rejection(vehicle_id)
             if self._is_ev(vehicle_id):
                 self.ev_rejected_request_ids.add(request_id)
-                self.ev_rejection_times[request_id] = float(self.current_time)
+                self.ev_rejection_times[request_id] = self._epoch_id()
+                request.ev_rejected_epoch_id = self._epoch_id()
             vehicle['assigned_request'] = request_id
             self.rejected_requests.append(request)
             vehicle['idle_target'] = None
@@ -2987,6 +3081,12 @@ class NYCEnvironment:
             ):
                 rejected_request_id = vehicle['passenger_onboard']
                 self.ev_rejected_picked_up_by_aev_ids.add(rejected_request_id)
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_pickup(
+                    rejected_request_id,
+                    vehicle_id=int(vehicle_id),
+                    epoch_id=self._epoch_id(),
+                )
                 rejected_at = float(
                     self.ev_rejection_times.get(
                         rejected_request_id,
@@ -3029,6 +3129,10 @@ class NYCEnvironment:
             self.completed_requests.append(completed)
             if completed.request_id in self.ev_rejected_request_ids:
                 self.ev_rejected_completed_ids.add(completed.request_id)
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_completion(
+                    completed.request_id, epoch_id=self._epoch_id()
+                )
             if vehicle['type'] == 1:
                 self.completed_requests_ev.append(completed)
             completed.completed_real_hour = completed_real_hour
@@ -3696,6 +3800,18 @@ class NYCEnvironment:
         self._check_dead_battery_vehicles()
         dead_battery_time = time.time() - dead_battery_start
 
+        rejected_leader_actions = {
+            vehicle_id: action
+            for vehicle_id, action in getattr(
+                self, "_pending_recourse_actions", {}
+            ).items()
+            if isinstance(action, ServiceAction)
+            and int(getattr(action.metadata, "stage_id", 0)) == 1
+            and bool(getattr(action, "was_rejected", False))
+        }
+        done_after_update = self.current_time >= self.episode_length
+        self._finalize_joint_collection(rewards, done_after_update)
+
         q_learning_aev_start = time.time()
         self._activate_bayes_step_context('aev')
         aev_bayes_context = getattr(self, '_bayes_step_contexts', {}).get('aev')
@@ -3710,6 +3826,14 @@ class NYCEnvironment:
         if self.value_function_ev is not None and hasattr(self.value_function_ev, 'remember_zone_distribution_context'):
             self.value_function_ev.remember_zone_distribution_context(self.current_time, ev_bayes_context)
         self._update_q_learning(storeactions_ev, True)
+        missing_rejected_rows = {
+            vehicle_id: action
+            for vehicle_id, action in rejected_leader_actions.items()
+            if storeactions_ev is None
+            or storeactions_ev.get(vehicle_id) is not action
+        }
+        if missing_rejected_rows:
+            self._update_q_learning(missing_rejected_rows, True)
         q_learning_ev_time = time.time() - q_learning_ev_start
 
         record_usage_start = time.time()
@@ -3735,7 +3859,7 @@ class NYCEnvironment:
                 flush=True,
             )
 
-        done = self.current_time >= self.episode_length
+        done = done_after_update
         ev_idle_mean = float(np.mean(self.ev_idle_durations)) if self.ev_idle_durations else 0.0
         ev_idle_count = len(self.ev_idle_durations)
         ev_in_penalty = sum(1 for vid in self.vehicles if self._in_ev_penalty(vid))
@@ -3790,7 +3914,7 @@ class NYCEnvironment:
             )
         else:
             new_requests = self.generate_requests()
-        self.whole_req_num += len(new_requests) - len(new_requests)  # already counted in generate_requests
+        # generate_requests() owns generated-demand accounting.
 
         # Idle timer & penalty timer
         for vid, v in self.vehicles.items():
@@ -3844,6 +3968,9 @@ class NYCEnvironment:
             )
             if not being_served:
                 self.active_requests.pop(rid, None)
+                self.expired_request_ids.add(int(rid))
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_expiry(int(rid))
 
     # ==================================================================
     # Charging / battery helpers
@@ -3917,6 +4044,14 @@ class NYCEnvironment:
             current_request_num = getattr(action, 'req_num', 0)
             veh_curloc = self.vehicles[vehicle_id]['location']
             veh_type = self.vehicles[vehicle_id]['type']
+            current_value_function = (
+                self.value_function_ev if veh_type == 1 else self.value_function
+            )
+            bind_context = getattr(
+                current_value_function, "set_replay_collection_context", None
+            )
+            if callable(bind_context):
+                bind_context(action)
             action_start_time = float(getattr(action, 'current_time', self.current_time))
             default_action_duration = max(1.0, float(self.current_time) - action_start_time)
             action_dur_time = float(getattr(action, 'dur_time', default_action_duration) or default_action_duration)
@@ -4180,6 +4315,68 @@ class NYCEnvironment:
                             rejection_reason=getattr(action, 'rejection_reason', 'driver_reject'),
                             rejection_sample=getattr(action, 'rejection_sample', None),
                         )
+                    if next_action is not None:
+                        next_features = self._next_action_training_features(
+                            vehicle_id,
+                            next_action,
+                            reject_target,
+                            fallback_value=0.0,
+                        )
+                    else:
+                        next_features = {
+                            'request_value': 0.0,
+                            'target_location': int(veh_curloc),
+                            'action_type': 'idle',
+                            'post_action_distance': 0.0,
+                            'post_action_duration': 0.0,
+                            'post_action_zoneid': int(
+                                self.get_zone_embedding_id(veh_curloc)
+                            ),
+                        }
+                    rejection_reward = float(
+                        getattr(
+                            action,
+                            'dur_reward',
+                            getattr(action, 'rejection_reward', 0.0),
+                        )
+                    )
+                    self.value_function_ev.store_experience(
+                        vehicle_id=vehicle_id,
+                        action_type=f"assign_{action.request_id}",
+                        vehicle_location=current_location,
+                        target_location=reject_target,
+                        current_time=action_start_time,
+                        reward=rejection_reward,
+                        next_vehicle_location=(
+                            getattr(action, 'vehicle_loc_post', None)
+                            if getattr(action, 'vehicle_loc_post', None) is not None
+                            else veh_curloc
+                        ),
+                        next_target_location=next_features['target_location'],
+                        battery_level=current_battery,
+                        next_battery_level=batterynow,
+                        other_vehicles=other_vehicles,
+                        num_requests=num_requests,
+                        request_value=float(getattr(action, 'request_value', 0.0)),
+                        next_action_type=next_features['action_type'],
+                        next_request_value=next_features['request_value'],
+                        dur_time=max(0.0, action_dur_time),
+                        is_system_done=getattr(self, 'done', False),
+                        vehicle_idle_time=getattr(action, 'idle_time', 0),
+                        next_vehicle_idle_time=self.vehicles[vehicle_id]['idle_timer'],
+                        post_action_location=getattr(action, 'post_action_location', reject_target),
+                        post_action_distance=getattr(action, 'post_action_distance', reject_distance),
+                        post_action_duration=getattr(action, 'post_action_duration', 0.0),
+                        post_action_zoneid=getattr(action, 'post_action_zoneid', 0),
+                        next_post_action_distance=next_features.get('post_action_distance', 0.0),
+                        next_post_action_duration=next_features.get('post_action_duration', 0.0),
+                        next_post_action_zoneid=next_features.get('post_action_zoneid', 0),
+                        next_candidate_actions=(
+                            getattr(next_action, 'bootstrap_candidates', [])
+                            if next_action is not None else []
+                        ),
+                        was_rejected=True,
+                    )
 
                 elif isinstance(action, ServiceAction) and hasattr(action, 'request_id') and next_action is not None and action.dur_reward > store_threshold:
                     r_exec = actions[vehicle_id].dur_reward
@@ -4563,12 +4760,29 @@ class NYCEnvironment:
                                                        rebalance_num=len(vehicles_to_rebalance), onlyev=onlyev)
         matrix_time = time.time() - matrix_start
         qvalue_start = time.time()
-        if self.adp_value > 0 and self.value_function is not None:
+        if getattr(self, "_structured_only_planning", False):
+            bqv = self.generate_vehicle_qvalue_withoutqnetwork(
+                vehicles_to_rebalance
+            )
+            qvalue_mode = "structured_only"
+        elif self.adp_value > 0 and self.value_function is not None:
             bqv = self.generate_vehicle_qvalue(vehicles_to_rebalance, onlyev=onlyev)
             qvalue_mode = 'network'
         else:
             bqv = self.generate_vehicle_qvalue_withoutqnetwork(vehicles_to_rebalance)
             qvalue_mode = 'fallback'
+        can_snapshot_graph = bool(
+            hasattr(self, "vehicles")
+            and all(
+                int(vehicle_id) in self.vehicles
+                for vehicle_id in vehicles_to_rebalance
+            )
+        )
+        structured_qvalues = (
+            self.generate_vehicle_qvalue_withoutqnetwork(vehicles_to_rebalance)
+            if can_snapshot_graph
+            else bqv
+        )
         qvalue_time = time.time() - qvalue_start
 
         solver_use_mcmf = self.usemcmf
@@ -4617,6 +4831,26 @@ class NYCEnvironment:
                     ar = list(self.active_requests.values()) if self.active_requests else []
                     result = self.gurobi_optimizer._heuristic_assignment_with_reject(
                         vehicles_to_rebalance, ar, charging_stations, heuristic_action_matrix)
+
+        if can_snapshot_graph:
+            stage_state = getattr(self, "_active_stage_state_snapshot", None)
+            graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                self,
+                list(vehicles_to_rebalance),
+                np.asarray(vam),
+                np.asarray(bqv),
+                np.asarray(structured_qvalues),
+                num_requests=int(nr),
+                num_stations=int(ns),
+                num_zones=int(nz),
+                stage_id=int(getattr(self, "_active_recourse_stage", 0) or 0),
+                solver_backend=solver_name,
+                state=stage_state,
+            )
+            selected_edge_ids = StateSnapshotBuilder.selected_edge_ids(graph, result)
+            graph = graph.with_selected(selected_edge_ids, status="selected")
+            RecourseTargetBuilder.verify_feasible(graph, graph.selected_edge_ids)
+            self._last_feasible_graph_snapshot = graph
 
         solver_time = time.time() - solver_start
         total_time = time.time() - solve_start
@@ -4957,76 +5191,6 @@ class NYCEnvironment:
 
         return new_assignments
 
-    def _attach_stage2_recourse_targets(
-        self,
-        *,
-        actions: dict,
-        selected_assignments: dict,
-        ev_stage_action_ids: list[int],
-    ) -> None:
-        """Allocate the joint stage-2 value over selected stage-1 edges.
-
-        The residual critic is an additive edge surrogate.  Giving each of
-        the ``n`` selected EV edges ``V2/n`` makes their summed Bellman target
-        equal ``sum(R1-G1) + V2`` without counting the recourse value ``n``
-        times.
-        """
-        value_function = getattr(self, 'value_function', None)
-        component_fn = getattr(
-            value_function,
-            'target_components_for_candidate',
-            None,
-        )
-        if not callable(component_fn) or not ev_stage_action_ids:
-            return
-
-        other_vehicles = sum(
-            vehicle.get('assigned_request') is not None
-            or vehicle.get('passenger_onboard') is not None
-            for vehicle in self.vehicles.values()
-        )
-        total_structured_value = 0.0
-        total_target_residual1 = 0.0
-        total_target_residual2 = 0.0
-        selected_edge_count = 0
-        for vehicle_id in selected_assignments:
-            if self._is_ev(vehicle_id):
-                continue
-            action = actions.get(vehicle_id)
-            if action is None:
-                continue
-            candidate = self._candidate_from_action(vehicle_id, action)
-            if candidate is None:
-                continue
-            structured, residual1, residual2 = component_fn(
-                vehicle_id=int(vehicle_id),
-                candidate=candidate,
-                current_time=float(self.current_time),
-                other_vehicles=float(other_vehicles),
-                num_requests=float(len(self.active_requests)),
-            )
-            total_structured_value += float(structured)
-            total_target_residual1 += float(residual1)
-            total_target_residual2 += float(residual2)
-            selected_edge_count += 1
-
-        if selected_edge_count == 0:
-            total_stage2_value = 0.0
-        else:
-            # Clip the two joint additive residual sums, not each edge
-            # independently.  This is G2 + min(Delta2_1, Delta2_2).
-            total_stage2_value = total_structured_value + min(
-                total_target_residual1,
-                total_target_residual2,
-            )
-        value_share = total_stage2_value / float(len(ev_stage_action_ids))
-        target_map = getattr(self, '_stage1_recourse_target_by_transition', None)
-        if target_map is None:
-            target_map = {}
-            self._stage1_recourse_target_by_transition = target_map
-        for vehicle_id in ev_stage_action_ids:
-            target_map[(int(vehicle_id), float(self.current_time))] = value_share
-
     def _build_fallback_actions(self, actions):
         """Generate actions for vehicles not yet assigned (same as ChargingIntegrated)."""
         for vid, v in self.vehicles.items():
@@ -5089,6 +5253,100 @@ class NYCEnvironment:
                 else:
                     v['no_charge_cooldown_until'] = self.current_time + 5
 
+    def _begin_joint_collection(self, mode: str):
+        self._ensure_recourse_runtime()
+        self._pending_recourse_actions = {}
+        if getattr(self, "evaluatemode", False):
+            return None
+        solver_backend = (
+            "auction"
+            if getattr(self, "useauction", False)
+            else (
+                f"mcmf:{getattr(self, 'mcmf_backend', 'unknown')}"
+                if getattr(self, "usemcmf", False)
+                else ("gurobi" if self.assignmentgurobi else "heuristic")
+            )
+        )
+        return self.recourse_coordinator.begin(
+            self,
+            mode=mode,
+            recourse_variant=getattr(self, "recourse_variant", "legacy"),
+            state_variant=getattr(
+                self, "state_variant", "joint_state_shared_critic"
+            ),
+            learner_variant=getattr(
+                self, "learner_variant", "optimization_anchored_residual"
+            ),
+            solver_backend=solver_backend,
+        )
+
+    def _annotate_stage_actions(
+        self,
+        actions: dict,
+        graph,
+        *,
+        state_snapshot,
+        residual_state=None,
+        aev_stage_graph=None,
+    ) -> None:
+        pending = self.recourse_coordinator.pending
+        if pending is None or graph is None:
+            return
+        action_snapshot = JointActionSnapshot.from_graph(graph)
+        graph_vehicle_ids = {edge.vehicle_id for edge in graph.edges}
+        for vehicle_id in graph_vehicle_ids:
+            action = actions.get(vehicle_id)
+            if action is None:
+                continue
+            metadata = action.metadata
+            metadata.transition_id = pending.transition_id
+            metadata.stage_id = int(graph.stage_id)
+            metadata.state_snapshot = state_snapshot
+            metadata.feasible_graph_snapshot = graph
+            metadata.joint_action_snapshot = action_snapshot
+            metadata.residual_state_snapshot = residual_state
+            metadata.acceptance_outcome = (
+                "rejected"
+                if bool(getattr(action, "was_rejected", False))
+                else (
+                    "accepted" if isinstance(action, ServiceAction) else None
+                )
+            )
+            if isinstance(action, ServiceAction):
+                request_id = int(action.request_id)
+                metadata.residual_category = (
+                    residual_state.request_label(request_id)
+                    if residual_state is not None
+                    else None
+                )
+            if aev_stage_graph is not None:
+                metadata.extras["aev_stage_graph"] = aev_stage_graph
+            self._pending_recourse_actions[vehicle_id] = action
+
+    def _finalize_joint_collection(self, rewards: dict[int, float], done: bool):
+        if getattr(self, "evaluatemode", False):
+            return None
+        transition = self.recourse_coordinator.finalize(
+            self, rewards=rewards, done=done
+        )
+        if transition is None:
+            return None
+        for action in self._pending_recourse_actions.values():
+            action.metadata.next_state_snapshot = transition.next_state
+            action.metadata.extras.setdefault(
+                "aev_stage_graph", transition.aev_stage_graph
+            )
+        seen = set()
+        for value_function in (self.value_function, self.value_function_ev):
+            if value_function is None or id(value_function) in seen:
+                continue
+            seen.add(id(value_function))
+            store = getattr(value_function, "store_recourse_transition", None)
+            if callable(store):
+                store(transition)
+        self._pending_recourse_actions = {}
+        return transition
+
     # ------------------------------------------------------------------
     # simulate_motion  (integrated mode)
     # ------------------------------------------------------------------
@@ -5100,6 +5358,14 @@ class NYCEnvironment:
         actions = {}
         self._bayes_step_contexts = {}
         self.decision_mode = "integrated"
+        RecourseTargetBuilder.validate_variant(
+            getattr(self, "recourse_variant", "legacy"), "integrated"
+        )
+        pending_transition = self._begin_joint_collection("integrated")
+        self._active_recourse_stage = 0
+        self._active_stage_state_snapshot = (
+            pending_transition.pre_state if pending_transition is not None else None
+        )
         storeactions = {vid: self.storeactions.get(vid) for vid in self.vehicles}
         storeactions_ev = {vid: self.storeactions_ev.get(vid) for vid in self.vehicles}
 
@@ -5125,16 +5391,31 @@ class NYCEnvironment:
                 available_requests = self._get_available_requests()
                 rebalancing_start = time.time()
                 rebalancing_assignments = self._solve_rebalancing(vehicles_to_rebalance, available_requests)
+                integrated_graph = getattr(
+                    self, "_last_feasible_graph_snapshot", None
+                )
                 rebalancing_time = time.time() - rebalancing_start
                 self.total_rebalancing_calls += 1
 
                 new_a, ch_a = self._process_integrated_assignments(
                     rebalancing_assignments, actions, storeactions, storeactions_ev)
+                if pending_transition is not None:
+                    pending_transition.ev_stage_graph = integrated_graph
+                    pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
+                        integrated_graph
+                    )
+                    self._annotate_stage_actions(
+                        actions,
+                        integrated_graph,
+                        state_snapshot=pending_transition.pre_state,
+                    )
                 self.rebalancing_assignments_per_step.append(new_a)
                 self.rebalancing_whole.append(len(rebalancing_assignments))
 
         fallback_start = time.time()
         self._build_fallback_actions(actions)
+        self._active_stage_state_snapshot = None
+        self._active_recourse_stage = 0
         fallback_time = time.time() - fallback_start
         if current_requests:
             self.update_recent_requests(current_requests)
@@ -5168,6 +5449,15 @@ class NYCEnvironment:
         self._prior_features_for_posterior = None
         self._bayes_step_contexts = {}
         self.decision_mode = "ev_first"
+        recourse_variant = RecourseTargetBuilder.validate_variant(
+            getattr(self, "recourse_variant", "legacy"), "evfirst"
+        )
+        recourse_policy = RecourseTargetBuilder.variant_policy(recourse_variant)
+        pending_transition = self._begin_joint_collection("ev_first")
+        self._active_recourse_stage = 1
+        self._active_stage_state_snapshot = (
+            pending_transition.pre_state if pending_transition is not None else None
+        )
         storeactions = {vid: self.storeactions.get(vid) for vid in self.vehicles}
         storeactions_ev = {vid: self.storeactions_ev.get(vid) for vid in self.vehicles}
 
@@ -5217,6 +5507,9 @@ class NYCEnvironment:
                 }
                 self._current_ev_offered_request_ids = set()
                 rebalancing_ev = self._solve_rebalancing(vehicles_ev, available_requests, onlyev=True)
+                ev_stage_graph = getattr(
+                    self, "_last_feasible_graph_snapshot", None
+                )
                 ev_profile = dict(self._last_rebalancing_profile)
                 ev_new = self._process_ev_only_assignments(rebalancing_ev, actions, storeactions_ev)
                 new_assignments += ev_new
@@ -5244,8 +5537,7 @@ class NYCEnvironment:
                 self.residual_request_count += len(residual_ids)
                 self.unoffered_request_count += len(unoffered_residual_ids)
 
-                recourse_variant = getattr(self, 'recourse_variant', 'legacy')
-                if recourse_variant == 'r1':
+                if not recourse_policy.same_epoch_repair:
                     # R1 keeps rejected requests active for future epochs but
                     # removes them only from the current AEV recourse graph.
                     available_requests = [
@@ -5254,29 +5546,75 @@ class NYCEnvironment:
                         if request.request_id not in rejected_residual_ids
                     ]
 
-                force_structured_only = recourse_variant == 'r2'
-                old_force_structured = None
-                if self.value_function is not None:
-                    old_force_structured = getattr(
-                        self.value_function,
-                        'force_structured_only',
-                        False,
+                residual_labels = {
+                    request_id: (
+                        "rejected"
+                        if request_id in rejected_residual_ids
+                        else (
+                            "unoffered"
+                            if request_id in unoffered_residual_ids
+                            else "other"
+                        )
                     )
-                    self.value_function.force_structured_only = force_structured_only
+                    for request_id in residual_ids
+                }
+                residual_state = StateSnapshotBuilder.build(
+                    self, request_labels=residual_labels
+                )
+                if pending_transition is not None:
+                    pending_transition.residual_state = residual_state
+
+                force_structured_only = recourse_policy.structured_only_follower
+                old_objective_mode = None
+                if self.value_function is not None and hasattr(
+                    self.value_function, "set_planning_objective_mode"
+                ):
+                    old_objective_mode = self.value_function.set_planning_objective_mode(
+                        "structured_only" if force_structured_only else "learned"
+                    )
                 try:
                     self._same_epoch_blocked_request_ids = (
                         set(rejected_residual_ids)
                         if recourse_variant == 'r1'
                         else set()
                     )
+                    self._active_recourse_stage = 2
+                    self._active_stage_state_snapshot = residual_state
+                    self._structured_only_planning = force_structured_only
                     rebalancing_aev = self._solve_rebalancing(
                         vehicles_aev,
                         available_requests,
                     )
                 finally:
                     self._same_epoch_blocked_request_ids = set()
-                    if self.value_function is not None:
-                        self.value_function.force_structured_only = old_force_structured
+                    self._structured_only_planning = False
+                    if (
+                        old_objective_mode is not None
+                        and self.value_function is not None
+                    ):
+                        self.value_function.set_planning_objective_mode(
+                            old_objective_mode
+                        )
+                aev_stage_graph = getattr(
+                    self, "_last_feasible_graph_snapshot", None
+                )
+                feasible_aev_request_ids = {
+                    edge.request_id
+                    for edge in (
+                        aev_stage_graph.edges
+                        if aev_stage_graph is not None
+                        else ()
+                    )
+                    if edge.request_id is not None and edge.vehicle_type == 2
+                }
+                self._ensure_recourse_runtime()
+                for request_id, category in residual_labels.items():
+                    self.request_lifecycle.mark_residual(
+                        request_id,
+                        epoch_id=self._epoch_id(),
+                        category=category,
+                        eligible=request_id in feasible_aev_request_ids,
+                    )
                 aev_profile = dict(self._last_rebalancing_profile)
                 aev_new, aev_ch = self._process_integrated_assignments(
                     rebalancing_aev, actions, storeactions, storeactions_ev)
@@ -5294,11 +5632,27 @@ class NYCEnvironment:
                 )
                 self.rejected_request_served_count += len(served_rejected)
                 self.unoffered_request_served_count += len(served_unoffered)
-                if recourse_variant == 'r4':
-                    self._attach_stage2_recourse_targets(
-                        actions=actions,
-                        selected_assignments=rebalancing_aev,
-                        ev_stage_action_ids=list(rebalancing_ev),
+                if pending_transition is not None:
+                    pending_transition.ev_stage_graph = ev_stage_graph
+                    pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
+                        ev_stage_graph
+                    )
+                    pending_transition.aev_stage_graph = aev_stage_graph
+                    pending_transition.aev_joint_action = JointActionSnapshot.from_graph(
+                        aev_stage_graph
+                    )
+                    self._annotate_stage_actions(
+                        actions,
+                        ev_stage_graph,
+                        state_snapshot=pending_transition.pre_state,
+                        residual_state=residual_state,
+                        aev_stage_graph=aev_stage_graph,
+                    )
+                    self._annotate_stage_actions(
+                        actions,
+                        aev_stage_graph,
+                        state_snapshot=residual_state,
+                        residual_state=residual_state,
                     )
                 new_assignments += aev_new
                 charging_assignments += aev_ch
@@ -5329,6 +5683,8 @@ class NYCEnvironment:
 
         fallback_start = time.time()
         self._build_fallback_actions(actions)
+        self._active_stage_state_snapshot = None
+        self._active_recourse_stage = 0
         fallback_time = time.time() - fallback_start
         if current_requests:
             self.update_recent_requests(current_requests)
@@ -5363,6 +5719,9 @@ class NYCEnvironment:
         self._prior_features_for_posterior = None
         self._bayes_step_contexts = {}
         self.decision_mode = "aev_first"
+        RecourseTargetBuilder.validate_variant(
+            getattr(self, "recourse_variant", "legacy"), "aevfirst"
+        )
         storeactions = {vid: self.storeactions.get(vid) for vid in self.vehicles}
         storeactions_ev = {vid: self.storeactions_ev.get(vid) for vid in self.vehicles}
 
@@ -5478,8 +5837,12 @@ class NYCEnvironment:
         return actions, storeactions, storeactions_ev
 
     def update_recent_requests(self, requests):
-        """Compat stub for request tracking."""
-        pass
+        """Retain immutable recent request ids without duplicating demand counts."""
+        history = getattr(self, "recent_request_history", None)
+        if history is None:
+            self.recent_request_history = deque(maxlen=1000)
+            history = self.recent_request_history
+        history.extend(requests or ())
 
     # ==================================================================
     # Matrix generators (for Gurobi / MinCostMaxFlowGPU)
@@ -5941,7 +6304,10 @@ class NYCEnvironment:
                 request_q = float(
                     getattr(req, 'final_value', getattr(req, 'value', 0.0)) or 0.0
                 )
-                if getattr(self, 'knownreject', False):
+                if (
+                    getattr(self, 'knownreject', False)
+                    and getattr(self, 'recourse_variant', 'legacy') == 'legacy'
+                ):
                     reject_prob = self._calculate_known_rejection_probability(
                         int(vid), req
                     )
@@ -6263,7 +6629,11 @@ class NYCEnvironment:
             _forward(vf, aev_edge_mask)
             ev_net = vf_ev_for_split if vf_ev_for_split is not None else vf
             _forward(ev_net, ev_edge_mask)
-        if getattr(self, 'knownreject', False) and nr > 0:
+        if (
+            getattr(self, 'knownreject', False)
+            and getattr(self, 'recourse_variant', 'legacy') == 'legacy'
+            and nr > 0
+        ):
             request_edge_idx = np.flatnonzero(action_type_ids == 2)
             if request_edge_idx.size > 0:
                 accept_multipliers = np.ones(request_edge_idx.shape, dtype=np.float32)
@@ -6459,7 +6829,8 @@ class NYCEnvironment:
             request.request_id for request in self.rejected_requests
         })
         recourse_requests = len(self.ev_rejected_recovered_same_epoch_ids)
-        lost_requests = max(0, int(self.whole_req_num) - completed)
+        unresolved_requests = max(0, int(self.whole_req_num) - completed)
+        lost_requests = len(self.expired_request_ids)
         service_ratio = completed / self.whole_req_num if self.whole_req_num > 0 else 0
         avg_val = self.request_value_sum / completed if completed > 0 else 0
         rejection_reward_count = int(getattr(self, 'rejection_reward_count', 0))
@@ -6492,6 +6863,9 @@ class NYCEnvironment:
         aev_request_assignments = int(
             getattr(self, 'aev_request_assignment_count', 0)
         )
+        self._ensure_recourse_runtime()
+        self.request_lifecycle.assert_reconciled()
+        lifecycle_metrics = self.request_lifecycle.metrics()
 
         avg_reb = 0
         total_reb = 0
@@ -6698,6 +7072,7 @@ class NYCEnvironment:
             'rejected_requests': rejected_requests,
             'recourse_requests': recourse_requests,
             'lost_requests': lost_requests,
+            'unresolved_requests': unresolved_requests,
             'rejection_reward_total': rejection_reward_total,
             'rejection_reward_count': rejection_reward_count,
             'avg_rejection_reward': avg_rejection_reward,
@@ -6745,6 +7120,33 @@ class NYCEnvironment:
                 if rejected_unique else 0.0
             ),
             'rejected_request_recovered_same_epoch': recovered_same_epoch,
+            'rejected_residual_count': int(
+                lifecycle_metrics['rejected_residual_count']
+            ),
+            'recovery_rate_assignment': float(
+                lifecycle_metrics['recovery_rate_assignment']
+            ),
+            'recovery_rate_pickup': float(
+                lifecycle_metrics['recovery_rate_pickup']
+            ),
+            'recovery_rate_completion': float(
+                lifecycle_metrics['recovery_rate_completion']
+            ),
+            'aev_pickup_after_rejection_count': int(
+                lifecycle_metrics['aev_pickup_after_rejection_count']
+            ),
+            'completion_after_rejection_count': int(
+                lifecycle_metrics['completion_after_rejection_count']
+            ),
+            'unrecovered_rejected_demand': int(
+                lifecycle_metrics['unrecovered_rejected_count']
+            ),
+            'unoffered_residual_count': int(
+                lifecycle_metrics['unoffered_residual_count']
+            ),
+            'not_same_epoch_aev_assignment_count': int(
+                lifecycle_metrics['not_same_epoch_aev_assignment_count']
+            ),
             'rejected_request_unique_count': rejected_unique,
             'rejected_request_lost_count': max(0, rejected_unique - rejected_completed),
             'lost_after_rejection_rate': (
@@ -6753,6 +7155,25 @@ class NYCEnvironment:
             ),
             'mean_recovery_delay_epochs': (
                 float(np.mean(recovery_delays)) if recovery_delays else 0.0
+            ),
+            'median_recovery_delay_epochs': (
+                float(np.median(recovery_delays)) if recovery_delays else 0.0
+            ),
+            'p90_recovery_delay_epochs': (
+                float(np.percentile(recovery_delays, 90))
+                if recovery_delays else 0.0
+            ),
+            'mean_assignment_recovery_delay': float(
+                lifecycle_metrics['mean_assignment_recovery_delay']
+            ),
+            'median_assignment_recovery_delay': float(
+                lifecycle_metrics['median_assignment_recovery_delay']
+            ),
+            'p90_assignment_recovery_delay': float(
+                lifecycle_metrics['p90_assignment_recovery_delay']
+            ),
+            'mean_completion_recovery_delay': float(
+                lifecycle_metrics['mean_completion_recovery_delay']
             ),
             'residual_request_count': residual_count,
             'residual_request_served_count': int(
@@ -6780,6 +7201,13 @@ class NYCEnvironment:
             'ev_vehicles': len(ev_vehicles),
             'aev_vehicles': len(aev_vehicles),
             'whole_req_num': self.whole_req_num,
+            'expired_request_count': len(self.expired_request_ids),
+            'request_lifecycle_accounted_count': (
+                len(self.active_requests) + completed + len(self.expired_request_ids)
+            ),
+            'request_lifecycle_gap': int(self.whole_req_num) - (
+                len(self.active_requests) + completed + len(self.expired_request_ids)
+            ),
             'avg_rebalancing_assignments': avg_reb,
             'total_rebalancing_assignments': total_reb,
             'total_rebalancing_calls': self.total_rebalancing_calls,
@@ -6819,9 +7247,9 @@ class NYCEnvironment:
                 request.request_id for request in self.rejected_requests
             }),
             'recourse_requests': len(self.ev_rejected_recovered_same_epoch_ids),
-            'lost_requests': max(
-                0,
-                int(self.whole_req_num) - len(self.completed_requests),
+            'lost_requests': len(self.expired_request_ids),
+            'unresolved_requests': max(
+                0, int(self.whole_req_num) - len(self.completed_requests)
             ),
             'avg_battery': avg_bat,
             'average_battery': avg_bat,

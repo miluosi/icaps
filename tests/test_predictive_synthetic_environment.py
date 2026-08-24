@@ -477,7 +477,7 @@ def test_synthetic_ev_relocation_is_written_to_masac_replay():
     assert experience["reward"] == -0.25
 
 
-def test_synthetic_ev_rejection_does_not_enter_request_critic_replay():
+def test_synthetic_ev_rejection_enters_request_critic_replay():
     env = _synthetic_ev_replay_environment()
 
     class EVReplay:
@@ -503,7 +503,12 @@ def test_synthetic_ev_rejection_does_not_enter_request_critic_replay():
 
     env._update_q_learning({0: action}, ifev=True)
 
-    assert not replay.experience_buffer
+    assert len(replay.experience_buffer) == 1
+    critic_row = replay.experience_buffer[0]
+    assert critic_row["action_type"] == "assign_7"
+    assert critic_row["was_rejected"] is True
+    assert critic_row["reward"] == -4.0
+    assert critic_row["is_system_done"] is False
     assert len(replay.rejections) == 1
 
 

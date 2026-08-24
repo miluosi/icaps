@@ -1318,13 +1318,23 @@ class GurobiOptimizer:
                     d2 = self._request_trip_distance(request)
                     moving_cost = self._movement_cost(d1 + d2)
                     immediate = req_val + moving_cost
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
                 else:
                     # 使用批量计算的Q值和拒绝感知的调整价值
                     base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
-                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
-                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                    objective_value = (
+                        rejection_adjusted_values.get(
+                            (vehicle_id, request.request_id), base_q_value
+                        )
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else base_q_value
+                    )
+                    objective_terms += objective_value * adp_weight * request_decision[i][j]
                 
 
 
@@ -4282,7 +4292,11 @@ class GurobiOptimizer:
                     d2 = self._request_trip_distance(request)
                     moving_cost = self._movement_cost(d1 + d2)
                     immediate = req_val + moving_cost  # 加上移动成本（负值）
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     objective_terms += immediate * request_decision[i][j]
                 else:
                     # 使用批量计算的Q值和拒绝感知的调整价值
@@ -4292,7 +4306,14 @@ class GurobiOptimizer:
                     if base_q_value > 0:
                         request_list[request.request_id] = (request, base_q_value, pickupdistance)
                     
-                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                    objective_value = (
+                        rejection_adjusted_values.get(
+                            (vehicle_id, request.request_id), base_q_value
+                        )
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else base_q_value
+                    )
+                    objective_terms += objective_value * adp_weight * request_decision[i][j]
             request_list = dict(sorted(request_list.items(), key=lambda x: x[1][1], reverse=True))
             # if len(request_list) > 0 and vehicle['type'] == 1:
             #     print("sorted request list for vehicle",vehicle_id,":",[(req_id, data[0].final_value, data[1], data[2]) for req_id, data in list(request_list.items())[:25]])
@@ -4722,13 +4743,23 @@ class GurobiOptimizer:
                     d2 = self._request_trip_distance(request)
                     moving_cost = self._movement_cost(d1 + d2)
                     immediate = req_val + moving_cost
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
                 else:
                     # 使用批量计算的Q值和拒绝感知的调整价值
                     base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
-                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
-                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                    objective_value = (
+                        rejection_adjusted_values.get(
+                            (vehicle_id, request.request_id), base_q_value
+                        )
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else base_q_value
+                    )
+                    objective_terms += objective_value * adp_weight * request_decision[i][j]
                 
                 # Process charging assignments
             if charging_stations:
@@ -5149,13 +5180,23 @@ class GurobiOptimizer:
                     d2 = self._request_trip_distance(request)
                     moving_cost = self._movement_cost(d1 + d2)
                     immediate = req_val + moving_cost
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
                 else:
                     # 使用批量计算的Q值和拒绝感知的调整价值
                     base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
-                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
-                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                    objective_value = (
+                        rejection_adjusted_values.get(
+                            (vehicle_id, request.request_id), base_q_value
+                        )
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else base_q_value
+                    )
+                    objective_terms += objective_value * adp_weight * request_decision[i][j]
                 
                 # Process charging assignments
             if charging_stations:
@@ -5327,7 +5368,11 @@ class GurobiOptimizer:
                 # Check if EV would reject this request
                 if vehicle['type'] == 1:
                     # Calculate rejection probability
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     # If rejection probability is high (>50%), don't allow assignment
                     valid_assignments[(i, j)] = rejection_prob < 0.5
                 else:
@@ -5482,7 +5527,11 @@ class GurobiOptimizer:
                     d2 = self._request_trip_distance(request)
                     moving_cost = self._movement_cost(d1 + d2)
                     immediate = req_val + moving_cost
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     if adp_weight <= 0:
                         objective_terms += immediate *(1 - rejection_prob)* request_decision[i, j]
                     else:
@@ -5918,7 +5967,7 @@ class GurobiOptimizer:
         def request_score(vehicle_id, request):
             score = float(getattr(request, 'final_value', getattr(request, 'value', 0.0)))
             vehicle = self.env.vehicles[vehicle_id]
-            if getattr(self.env, 'knownreject', False) and vehicle['type'] == 1:
+            if self._should_apply_rejection_adjustment(vehicle_id):
                 reject_probability = self.env._calculate_known_rejection_probability(
                     vehicle_id, request)
                 score *= min(1.0, max(0.0, 1.0 - float(reject_probability)))
@@ -7601,7 +7650,11 @@ class GurobiOptimizer:
             for j, request in enumerate(available_requests):
                 # Check if EV would reject this request
                 if vehicle['type'] == 1:
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    rejection_prob = (
+                        self.env._calculate_rejection_probability(vehicle_id, request)
+                        if self._should_apply_rejection_adjustment(vehicle_id)
+                        else 0.0
+                    )
                     valid_assignments[(i, j)] = rejection_prob < 0.5
                 else:
                     # AEV never rejects
@@ -7751,7 +7804,11 @@ class GurobiOptimizer:
                             assignments[vehicle_id] = request
                             # Calculate contribution to objective (immediate reward + state value)
                             immediate_reward = getattr(request, 'final_value', getattr(request, 'value', 0.0))
-                            rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                            rejection_prob = (
+                                self.env._calculate_rejection_probability(vehicle_id, request)
+                                if self._should_apply_rejection_adjustment(vehicle_id)
+                                else 0.0
+                            )
                             if hasattr(self.env, 'evaluate_service_option_state'):
                                 try:
                                     state_value = self.env.evaluate_service_option_state(vehicle_id, request)
@@ -8054,6 +8111,20 @@ class GurobiOptimizer:
         
         # 限制最大拒绝概率为90%
         return min(0.9, rejection_prob)
+
+    def _should_apply_rejection_adjustment(self, vehicle_id) -> bool:
+        """Use the legacy known-rejection correction exactly once.
+
+        R0--R4 learners model observed rejection and downstream recovery in
+        their critic targets, so multiplying their solver score by another
+        acceptance probability would double count that effect.
+        """
+        vehicle = getattr(self.env, "vehicles", {}).get(vehicle_id, {})
+        return bool(
+            getattr(self.env, "knownreject", False)
+            and int(vehicle.get("type", 1)) == 1
+            and str(getattr(self.env, "recourse_variant", "legacy")) == "legacy"
+        )
 
     def _calculate_rejection_aware_value(self, vehicle_id, request, base_q_value, rejection_prob=None):
         """

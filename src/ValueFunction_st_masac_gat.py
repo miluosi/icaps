@@ -25,6 +25,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from src.recourse.replay import PrioritizedJointReplayBuffer
+from src.recourse.target_builder import RecourseTargetBuilder
+from src.recourse.types import (
+    FeasibleEdgeSnapshot,
+    FeasibleGraphSnapshot,
+    RecourseTransition,
+    SystemSnapshot,
+)
+
 
 class _MLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 128, output_dim: int = 1):
@@ -269,6 +278,10 @@ class PyTorchChargingValueFunction:
             self.graph_encoder.topk_neighbour_context.requires_grad_(False)
             self.graph_encoder.neighbour_norm.requires_grad_(False)
         self.mixer = _Mixer(self.hidden_dim).to(self.device)
+        self.target_graph_encoder = copy.deepcopy(self.graph_encoder).to(self.device)
+        self.target_mixer = copy.deepcopy(self.mixer).to(self.device)
+        self.target_graph_encoder.requires_grad_(False)
+        self.target_mixer.requires_grad_(False)
         self.network = _MLP(self.edge_dim, hidden_dim=128).to(self.device)
         self.critic2 = _MLP(self.edge_dim, hidden_dim=128).to(self.device)
         self.target_network = copy.deepcopy(self.network).to(self.device)
@@ -290,6 +303,16 @@ class PyTorchChargingValueFunction:
         self.loss_fn = nn.SmoothL1Loss()
         self.queue_loss_fn = nn.MSELoss()
         self.experience_buffer = deque(maxlen=int(replay_buffer_size))
+        self.rejection_buffer = deque(maxlen=int(replay_buffer_size))
+        self.joint_replay_buffer = PrioritizedJointReplayBuffer(
+            capacity=max(1, int(replay_buffer_size) // 5)
+        )
+        self.target_builder = RecourseTargetBuilder()
+        self.planning_objective_mode = "learned"
+        self.state_variant = "joint_state_shared_critic"
+        self.learner_variant = getattr(
+            self, "learner_variant", "optimization_anchored_residual"
+        )
         self.queue_experience_buffer = deque(maxlen=int(replay_buffer_size))
         self.training_losses: list[float] = []
         self.normalized_td_losses: list[float] = []
@@ -306,6 +329,15 @@ class PyTorchChargingValueFunction:
         self.debug_name = "ADP"
         self._graph_cache_key = None
         self._graph_cache = None
+        self._target_graph_cache_key = None
+        self._target_graph_cache = None
+        self._replay_collection_context = None
+        # The actor is not part of the deployed MCMF policy when eta_pi=0.
+        # Keep it diagnostic-only instead of allowing its gradients to change
+        # the shared graph encoder used by assignment.
+        if self.eta_pi == 0.0:
+            self.lambda_actor = 0.0
+            self.lambda_alpha = 0.0
         print(
             f"✓ ST-ADP-MASAC-GAT value function initialized: beta_max={self.beta_max}, "
             f"eta_pi={self.eta_pi}, residual_clip={self.residual_clip_rho}*std(g), "
@@ -837,7 +869,9 @@ class PyTorchChargingValueFunction:
     # Resource graph snapshot
     # ------------------------------------------------------------------
 
-    def _graph_locations(self) -> list[int]:
+    def _graph_locations(self, snapshot: SystemSnapshot | None = None) -> list[int]:
+        if snapshot is not None:
+            return list(snapshot.zone_ids)
         if self.env is None:
             return list(range(max(1, self.grid_size * self.grid_size)))
         zones = list(getattr(self.env, "aux_zone_ids", []) or getattr(self.env, "relocation_target_ids", []) or [])
@@ -845,15 +879,34 @@ class PyTorchChargingValueFunction:
             zones = sorted(getattr(self.env, "zone_coords", {}).keys())
         return [int(z) for z in zones[: max(1, len(zones))]]
 
-    def _build_graph_node_features(self) -> tuple[torch.Tensor, dict[int, int], dict[int, int], int]:
-        zones = self._graph_locations()
+    def _build_graph_node_features(
+        self,
+        snapshot: SystemSnapshot | None = None,
+    ) -> tuple[torch.Tensor, dict[int, int], dict[int, int], int]:
+        zones = self._graph_locations(snapshot)
         zone_to_row = {int(z): idx for idx, z in enumerate(zones)}
         rows: list[list[float]] = []
-        current_time = float(getattr(self.env, "current_time", 0.0) if self.env is not None else 0.0)
+        current_time = (
+            float(snapshot.current_time)
+            if snapshot is not None
+            else float(getattr(self.env, "current_time", 0.0) if self.env is not None else 0.0)
+        )
         time_norm = self._time_norm(current_time)
         hour_angle = time_norm * 2.0 * math.pi
-        active_requests = list(getattr(self.env, "active_requests", {}).values()) if self.env is not None else []
-        vehicles = getattr(self.env, "vehicles", {}) if self.env is not None else {}
+        if snapshot is not None:
+            active_requests = list(snapshot.requests)
+            vehicles = {
+                vehicle.vehicle_id: {
+                    "type": vehicle.vehicle_type,
+                    "location": vehicle.location,
+                    "battery": vehicle.battery,
+                    "is_online": vehicle.online,
+                }
+                for vehicle in snapshot.vehicles
+            }
+        else:
+            active_requests = list(getattr(self.env, "active_requests", {}).values()) if self.env is not None else []
+            vehicles = getattr(self.env, "vehicles", {}) if self.env is not None else {}
 
         demand = {z: 0.0 for z in zones}
         for req in active_requests:
@@ -908,12 +961,29 @@ class PyTorchChargingValueFunction:
             ])
 
         station_to_row: dict[int, int] = {}
-        stations = getattr(getattr(self.env, "charging_manager", None), "stations", {}) if self.env is not None else {}
+        if snapshot is not None:
+            stations = {station.station_id: station for station in snapshot.stations}
+        else:
+            stations = getattr(getattr(self.env, "charging_manager", None), "stations", {}) if self.env is not None else {}
         for sid, station in sorted(stations.items()):
             station_to_row[int(sid)] = len(rows)
-            capacity = float(getattr(station, "max_capacity", 1) or 1)
-            current = float(len(getattr(station, "current_vehicles", []) or []))
-            queue = float(len(getattr(station, "charging_queue_notarrived", []) or []))
+            capacity = float(
+                getattr(station, "capacity", getattr(station, "max_capacity", 1)) or 1
+            )
+            current = float(
+                getattr(
+                    station,
+                    "occupied",
+                    len(getattr(station, "current_vehicles", []) or []),
+                )
+            )
+            queue = float(
+                getattr(
+                    station,
+                    "inbound",
+                    len(getattr(station, "charging_queue_notarrived", []) or []),
+                )
+            )
             loc = int(getattr(station, "location", 0))
             near_demand = demand.get(loc, 0.0)
             rows.append([
@@ -957,20 +1027,32 @@ class PyTorchChargingValueFunction:
         tensor = torch.tensor(rows, dtype=torch.float32, device=self.device)
         return tensor, zone_to_row, station_to_row, global_row
 
-    def _graph_context(self):
+    def _graph_context(
+        self,
+        snapshot: SystemSnapshot | None = None,
+        *,
+        target: bool = False,
+    ):
         key = (
+            "snapshot",
+            hash(snapshot),
+        ) if snapshot is not None else (
+            "live",
             id(self.env),
             int(getattr(self.env, "current_time", 0) if self.env is not None else 0),
             len(getattr(self.env, "active_requests", {}) if self.env is not None else {}),
         )
-        if self._graph_cache_key == key and self._graph_cache is not None:
-            return self._graph_cache
-        node_features, zone_to_row, station_to_row, global_row = self._build_graph_node_features()
-        embeddings = self.graph_encoder(node_features)
+        cache_key_name = "_target_graph_cache_key" if target else "_graph_cache_key"
+        cache_name = "_target_graph_cache" if target else "_graph_cache"
+        if getattr(self, cache_key_name) == key and getattr(self, cache_name) is not None:
+            return getattr(self, cache_name)
+        node_features, zone_to_row, station_to_row, global_row = self._build_graph_node_features(snapshot)
+        encoder = self.target_graph_encoder if target else self.graph_encoder
+        mixer = self.target_mixer if target else self.mixer
+        embeddings = encoder(node_features)
         pooled = embeddings.mean(dim=0)
-        w_ev, w_aev, baseline = self.mixer(pooled)
-        self._graph_cache_key = key
-        self._graph_cache = {
+        w_ev, w_aev, baseline = mixer(pooled)
+        cache = {
             "embeddings": embeddings,
             "zone_to_row": zone_to_row,
             "station_to_row": station_to_row,
@@ -979,8 +1061,15 @@ class PyTorchChargingValueFunction:
             "w_ev": w_ev,
             "w_aev": w_aev,
             "baseline": baseline,
+            "vehicle_type_by_id": (
+                {vehicle.vehicle_id: vehicle.vehicle_type for vehicle in snapshot.vehicles}
+                if snapshot is not None
+                else {}
+            ),
         }
-        return self._graph_cache
+        setattr(self, cache_key_name, key)
+        setattr(self, cache_name, cache)
+        return cache
 
     def _graph_row_for_location(self, graph: dict, location: Any) -> int:
         loc = int(location or 0)
@@ -1092,8 +1181,13 @@ class PyTorchChargingValueFunction:
         target_station_ids=None,
         queue_wait_features=None,
         vehicle_neighbour_candidates: dict[int, list[dict]] | None = None,
+        graph_snapshot: SystemSnapshot | None = None,
+        target_context: bool = False,
+        vehicle_types=None,
+        post_demand_features=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        graph = self._graph_context()
+        del post_demand_features
+        graph = self._graph_context(graph_snapshot, target=target_context)
         source_embeddings = self._vehicle_source_embeddings(
             graph,
             vehicle_ids,
@@ -1116,7 +1210,15 @@ class PyTorchChargingValueFunction:
         rows = []
         type_weights = []
         for i in range(len(vehicle_ids)):
-            vehicle_type = self._vehicle_type(int(vehicle_ids[i]))
+            if vehicle_types is not None:
+                vehicle_type = int(vehicle_types[i])
+            else:
+                vehicle_type = int(
+                    graph["vehicle_type_by_id"].get(
+                        int(vehicle_ids[i]),
+                        self._vehicle_type(int(vehicle_ids[i])),
+                    )
+                )
             state = self._state_features(
                 location=int(vehicle_locations[i]),
                 current_time=float(current_times[i]),
@@ -1251,6 +1353,14 @@ class PyTorchChargingValueFunction:
             ],
             dtype=np.float32,
         )
+        if self.planning_objective_mode == "structured_only":
+            self._last_adp_score_stats = {
+                "mode": "structured_only",
+                "g_mean": float(np.mean(g)),
+                "beta": 0.0,
+                "score_mean": float(np.mean(g)),
+            }
+            return g.astype(np.float32).tolist()
         with torch.no_grad():
             edge_t, type_w, _ = self._edge_tensor_from_arrays(
                 vehicle_ids=vehicle_ids,
@@ -1648,8 +1758,60 @@ class PyTorchChargingValueFunction:
     # Replay storage
     # ------------------------------------------------------------------
 
+    def set_replay_collection_context(self, action: Any | None) -> None:
+        """Bind immutable action metadata for the next storage call."""
+
+        self._replay_collection_context = action
+
+    def store_recourse_transition(self, transition: RecourseTransition) -> None:
+        self.joint_replay_buffer.add(transition)
+
+    def set_planning_objective_mode(self, mode: str) -> str:
+        if mode not in {"learned", "structured_only"}:
+            raise ValueError(f"invalid planning objective mode: {mode}")
+        previous = self.planning_objective_mode
+        self.planning_objective_mode = mode
+        return previous
+
     def store_experience(self, **kwargs):
-        experience = dict(kwargs)
+        experience = copy.deepcopy(dict(kwargs))
+        action = self._replay_collection_context
+        metadata = getattr(action, "metadata", None)
+        if metadata is not None:
+            experience.setdefault("transition_id", metadata.transition_id)
+            experience.setdefault("stage_id", int(metadata.stage_id))
+            experience.setdefault("acceptance_outcome", metadata.acceptance_outcome)
+            experience.setdefault("residual_category", metadata.residual_category)
+            experience.setdefault("state_snapshot", metadata.state_snapshot)
+            experience.setdefault(
+                "feasible_graph_snapshot", metadata.feasible_graph_snapshot
+            )
+            experience.setdefault(
+                "residual_state_snapshot", metadata.residual_state_snapshot
+            )
+            experience.setdefault("next_state_snapshot", metadata.next_state_snapshot)
+            experience.setdefault("joint_action_snapshot", metadata.joint_action_snapshot)
+            for key, value in metadata.extras.items():
+                experience.setdefault(key, value)
+            next_metadata = getattr(getattr(action, "next_action", None), "metadata", None)
+            if next_metadata is not None:
+                experience.setdefault(
+                    "next_feasible_graph_snapshot",
+                    next_metadata.feasible_graph_snapshot,
+                )
+                experience.setdefault(
+                    "next_state_snapshot", next_metadata.state_snapshot
+                )
+        experience.setdefault("schema_version", 1)
+        experience.setdefault("mode", getattr(self.env, "decision_mode", "integrated"))
+        experience.setdefault(
+            "recourse_variant", getattr(self.env, "recourse_variant", "legacy")
+        )
+        experience.setdefault("state_variant", self.state_variant)
+        experience.setdefault("learner_variant", self.learner_variant)
+        experience.setdefault(
+            "solver_backend", getattr(self.env, "mcmf_backend", "unknown")
+        )
         action_type = experience.get("action_type", "idle")
         experience["action_type_id"] = self._action_id(action_type)
         if experience["action_type_id"] == 3 and experience.get("target_station_id") is None:
@@ -1683,12 +1845,23 @@ class PyTorchChargingValueFunction:
             float(experience.get("post_action_distance", 0.0) or 0.0),
         )
         self.experience_buffer.append(experience)
+        self._replay_collection_context = None
 
     def store_rejection_experience(self, *args, **kwargs):
-        return None
+        del args
+        sample = copy.deepcopy(dict(kwargs))
+        sample["was_rejected"] = True
+        sample["rejection_label"] = 1.0
+        self.rejection_buffer.append(sample)
+        return sample
 
     def store_acceptance_experience(self, *args, **kwargs):
-        return None
+        del args
+        sample = copy.deepcopy(dict(kwargs))
+        sample["was_rejected"] = False
+        sample["rejection_label"] = 0.0
+        self.rejection_buffer.append(sample)
+        return sample
 
     # ------------------------------------------------------------------
     # Training helpers
@@ -1739,7 +1912,15 @@ class PyTorchChargingValueFunction:
             })
         return neighbours
 
-    def _edge_tensor_from_experience(self, exp: dict, *, next_state: bool = False, candidate: dict | None = None):
+    def _edge_tensor_from_experience(
+        self,
+        exp: dict,
+        *,
+        next_state: bool = False,
+        candidate: dict | None = None,
+        target_context: bool = False,
+        state_snapshot: SystemSnapshot | None = None,
+    ):
         if candidate is None:
             action_id = int(exp.get("action_type_id", self._action_id(exp.get("action_type", "idle"))))
             action_type = exp.get("action_type", "idle")
@@ -1826,7 +2007,31 @@ class PyTorchChargingValueFunction:
         if target_station_id is None:
             target_station_id = self._station_id_from_action_type(action_type)
         queue_wait_feature = self._queue_wait_feature_from_experience(exp, candidate)
+        feature_source = exp if candidate is None else candidate
+        post_demand_feature = feature_source.get(
+            "post_demand_feature", exp.get("post_demand_feature")
+        )
         vehicle_id = int(exp.get("vehicle_id", -1))
+        if state_snapshot is None:
+            state_snapshot = exp.get(
+                "next_state_snapshot" if next_state else "state_snapshot"
+            )
+        if isinstance(state_snapshot, SystemSnapshot):
+            vehicle_type_for_mask = int(exp.get("vehicle_type", self._vehicle_type(vehicle_id)))
+            state_snapshot = state_snapshot.masked(
+                str(exp.get("state_variant", self.state_variant)),
+                vehicle_type=vehicle_type_for_mask,
+            )
+            vehicle_type = next(
+                (
+                    vehicle.vehicle_type
+                    for vehicle in state_snapshot.vehicles
+                    if vehicle.vehicle_id == vehicle_id
+                ),
+                vehicle_type_for_mask,
+            )
+        else:
+            vehicle_type = int(exp.get("vehicle_type", self._vehicle_type(vehicle_id)))
         edge_t, type_w, _ = self._edge_tensor_from_arrays(
             vehicle_ids=np.asarray([vehicle_id]),
             vehicle_locations=np.asarray([vehicle_location]),
@@ -1844,6 +2049,14 @@ class PyTorchChargingValueFunction:
             target_station_ids=np.asarray([target_station_id if target_station_id is not None else -1], dtype=np.int64),
             queue_wait_features=np.asarray([queue_wait_feature], dtype=np.float32),
             vehicle_neighbour_candidates={vehicle_id: list(neighbour_candidates)},
+            graph_snapshot=state_snapshot,
+            target_context=target_context,
+            vehicle_types=np.asarray([vehicle_type], dtype=np.int64),
+            post_demand_features=(
+                None
+                if post_demand_feature is None
+                else np.asarray([float(post_demand_feature)], dtype=np.float32)
+            ),
         )
         g = self._myopic_score(
             action_id,
@@ -1853,6 +2066,97 @@ class PyTorchChargingValueFunction:
         )
         return edge_t, type_w, g
 
+    def _graph_edge_scores(
+        self,
+        graph: FeasibleGraphSnapshot,
+        *,
+        target_context: bool,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """Return full selection scores and residual evaluation scores."""
+
+        full_scores: dict[str, float] = {}
+        residual_scores: dict[str, float] = {}
+        critic1 = self.target_network if target_context else self.network
+        critic2 = self.target_critic2 if target_context else self.critic2
+        for edge in graph.edges:
+            vehicle = next(
+                item for item in graph.state.vehicles if item.vehicle_id == edge.vehicle_id
+            )
+            exp = {
+                "vehicle_id": edge.vehicle_id,
+                "vehicle_type": edge.vehicle_type,
+                "action_type": edge.action_id,
+                "action_type_id": int(edge.action_type),
+                "vehicle_location": vehicle.location,
+                "target_location": edge.target_location,
+                "post_action_location": edge.post_action_location,
+                "current_time": graph.state.current_time,
+                "battery_level": vehicle.battery,
+                "vehicle_idle_time": vehicle.idle_time,
+                "other_vehicles": sum(item.online for item in graph.state.vehicles) - 1,
+                "num_requests": len(graph.state.requests),
+                "request_value": edge.request_value,
+                "target_distance": edge.target_distance,
+                "post_action_distance": edge.post_action_distance,
+                "post_action_duration": edge.post_action_duration,
+                "target_station_id": edge.station_id,
+                "queue_features": edge.queue_features,
+                "post_demand_feature": edge.post_demand_feature,
+                "state_snapshot": graph.state,
+                "state_variant": self.state_variant,
+            }
+            edge_tensor, type_weight, _ = self._edge_tensor_from_experience(
+                exp,
+                target_context=target_context,
+                state_snapshot=graph.state,
+            )
+            q1 = critic1(edge_tensor)
+            q2 = critic2(edge_tensor)
+            residual = (
+                torch.minimum(q1, q2) * type_weight
+                if target_context
+                else self._selection_residual(q1, q2, type_weight)
+            )
+            residual_value = float(residual.squeeze().detach().cpu().item())
+            residual_scores[edge.edge_id] = residual_value
+            if self.planning_objective_mode == "structured_only":
+                full_scores[edge.edge_id] = float(edge.structured_score)
+            elif getattr(self, "direct_q", False):
+                full_scores[edge.edge_id] = residual_value
+            else:
+                full_scores[edge.edge_id] = float(
+                    edge.structured_score + self._beta() * residual_value
+                )
+        return full_scores, residual_scores
+
+    def _solver_consistent_residual_value(
+        self,
+        graph: FeasibleGraphSnapshot | None,
+        *,
+        structured_only: bool = False,
+    ) -> tuple[torch.Tensor, tuple[str, ...]]:
+        if graph is None or not graph.edges:
+            return torch.zeros((), dtype=torch.float32, device=self.device), ()
+        with torch.no_grad():
+            online_full, _ = self._graph_edge_scores(graph, target_context=False)
+            _, target_residual = self._graph_edge_scores(graph, target_context=True)
+            components = self.target_builder.double_q_target(
+                graph,
+                online_scores=online_full,
+                target_scores=(
+                    {edge.edge_id: edge.structured_score for edge in graph.edges}
+                    if structured_only
+                    else target_residual
+                ),
+                structured_only=structured_only,
+            )
+        value = torch.tensor(
+            components.target_evaluation_value,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return value, components.selected_edge_ids
+
     def _next_soft_values(self, batch: list[dict]) -> torch.Tensor:
         values = []
         actor_losses = []
@@ -1861,8 +2165,30 @@ class PyTorchChargingValueFunction:
             target_net = self.target_network
             target_net2 = self.target_critic2
         for exp in batch:
+            stage_id = int(exp.get("stage_id", 0) or 0)
+            recourse_variant = str(exp.get("recourse_variant", "legacy"))
+            if stage_id == 1 and recourse_variant == "r4":
+                follower_graph = exp.get("aev_stage_graph")
+                follower_value, _ = self._solver_consistent_residual_value(
+                    follower_graph
+                )
+                joint_action = exp.get("joint_action_snapshot")
+                leader_edges = len(
+                    getattr(joint_action, "selected_edge_ids", ()) or ()
+                )
+                values.append(follower_value / float(max(1, leader_edges)))
+                continue
             if exp.get("is_system_done", False) or exp.get("is_vehicle_done", False):
                 values.append(torch.zeros((), dtype=torch.float32, device=self.device))
+                continue
+            next_graph = exp.get("next_feasible_graph_snapshot")
+            if isinstance(next_graph, FeasibleGraphSnapshot):
+                joint_value, selected = self._solver_consistent_residual_value(
+                    next_graph
+                )
+                # Edge replay is retained for backwards compatibility.  The
+                # primary joint loss below consumes the undivided value.
+                values.append(joint_value / float(max(1, len(selected))))
                 continue
             candidates = exp.get("next_candidate_actions") or []
             if not candidates:
@@ -1933,13 +2259,176 @@ class PyTorchChargingValueFunction:
             })
             return normalized_loss
 
+    def _selected_residual_tensor(
+        self,
+        graph: FeasibleGraphSnapshot,
+        selected_edge_ids: tuple[str, ...],
+    ) -> torch.Tensor:
+        self._graph_cache_key = None
+        self._graph_cache = None
+        selected = set(selected_edge_ids)
+        values = []
+        for edge in graph.edges:
+            if edge.edge_id not in selected:
+                continue
+            vehicle = next(
+                item for item in graph.state.vehicles if item.vehicle_id == edge.vehicle_id
+            )
+            exp = {
+                "vehicle_id": edge.vehicle_id,
+                "vehicle_type": edge.vehicle_type,
+                "action_type": edge.action_id,
+                "action_type_id": int(edge.action_type),
+                "vehicle_location": vehicle.location,
+                "target_location": edge.target_location,
+                "post_action_location": edge.post_action_location,
+                "current_time": graph.state.current_time,
+                "battery_level": vehicle.battery,
+                "vehicle_idle_time": vehicle.idle_time,
+                "other_vehicles": sum(item.online for item in graph.state.vehicles) - 1,
+                "num_requests": len(graph.state.requests),
+                "request_value": edge.request_value,
+                "target_distance": edge.target_distance,
+                "post_action_distance": edge.post_action_distance,
+                "post_action_duration": edge.post_action_duration,
+                "target_station_id": edge.station_id,
+                "queue_features": edge.queue_features,
+                "post_demand_feature": edge.post_demand_feature,
+                "state_snapshot": graph.state,
+                "state_variant": self.state_variant,
+            }
+            edge_tensor, type_weight, _ = self._edge_tensor_from_experience(
+                exp, state_snapshot=graph.state
+            )
+            values.append(
+                torch.minimum(self.network(edge_tensor), self.critic2(edge_tensor))
+                * type_weight
+            )
+        if not values:
+            return torch.zeros((), dtype=torch.float32, device=self.device)
+        return torch.cat(values).sum()
+
+    def _next_transition_graph(
+        self,
+        transition: RecourseTransition,
+        *,
+        fleet: str,
+    ) -> FeasibleGraphSnapshot | None:
+        for candidate in self.joint_replay_buffer:
+            if (
+                candidate.episode_id == transition.episode_id
+                and candidate.day_id == transition.day_id
+                and candidate.epoch_id == transition.epoch_id + 1
+            ):
+                if candidate.mode == "integrated":
+                    return candidate.ev_stage_graph
+                return (
+                    candidate.ev_stage_graph
+                    if fleet == "ev"
+                    else candidate.aev_stage_graph
+                )
+        return None
+
+    def _train_joint_step(self, batch_size: int, *, ifEV: bool) -> float:
+        if len(self.joint_replay_buffer) == 0:
+            return 0.0
+        sample = self.joint_replay_buffer.sample(min(batch_size, len(self.joint_replay_buffer)))
+        losses = []
+        td_errors = []
+        used_indices = []
+        for transition, replay_index, importance_weight in zip(
+            sample.transitions, sample.indices, sample.weights
+        ):
+            graph = None
+            action = None
+            reward = 0.0
+            fleet = "ev" if ifEV else "aev"
+            if transition.mode == "integrated":
+                # S0 uses one shared type-conditioned critic/mixer for the
+                # complete joint action.  The EV-specific updater must not
+                # duplicate that system target.
+                if ifEV:
+                    continue
+                graph = transition.ev_stage_graph
+                action = transition.ev_joint_action
+                reward = transition.reward_system
+            elif transition.mode == "ev_first":
+                if ifEV:
+                    graph = transition.ev_stage_graph
+                    action = transition.ev_joint_action
+                    reward = transition.reward_ev
+                else:
+                    graph = transition.aev_stage_graph
+                    action = transition.aev_joint_action
+                    reward = transition.reward_aev
+            else:
+                continue
+            if graph is None or action is None or not action.selected_edge_ids:
+                continue
+            prediction = self._selected_residual_tensor(
+                graph, action.selected_edge_ids
+            )
+            structured_value = float(action.structured_value)
+            if getattr(self, "direct_q", False):
+                immediate_target = float(reward)
+            else:
+                immediate_target = float(reward) - structured_value
+
+            bootstrap_value = 0.0
+            if (
+                transition.mode == "ev_first"
+                and ifEV
+                and transition.recourse_variant == "r4"
+            ):
+                # The follower action is inside the current epoch.  A terminal
+                # next state removes only the temporal bootstrap; it must not
+                # remove the already-observed same-epoch repair value.
+                follower_value, _ = self._solver_consistent_residual_value(
+                    transition.aev_stage_graph
+                )
+                bootstrap_value = float(follower_value.item())
+            elif not transition.done:
+                next_graph = self._next_transition_graph(
+                    transition, fleet=fleet
+                )
+                next_value, _ = self._solver_consistent_residual_value(next_graph)
+                bootstrap_value = float(next_value.item()) * (
+                    self.gamma ** float(transition.elapsed_epochs)
+                )
+            target_value = immediate_target + bootstrap_value
+            target = torch.tensor(target_value, dtype=torch.float32, device=self.device)
+            td_error = target.detach() - prediction.detach()
+            weighted_loss = F.smooth_l1_loss(prediction, target.detach())
+            losses.append(float(importance_weight) * weighted_loss)
+            td_errors.append(float(abs(td_error.item())))
+            used_indices.append(int(replay_index))
+        if not losses:
+            return 0.0
+        loss = torch.stack(losses).mean()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in self.graph_encoder.parameters() if parameter.requires_grad]
+            + list(self.mixer.parameters())
+            + list(self.network.parameters())
+            + list(self.critic2.parameters()),
+            max_norm=10.0,
+        )
+        self.optimizer.step()
+        self._soft_update(self.network, self.target_network, self.tau)
+        self._soft_update(self.critic2, self.target_critic2, self.tau)
+        self._soft_update(self.graph_encoder, self.target_graph_encoder, self.tau)
+        self._soft_update(self.mixer, self.target_mixer, self.tau)
+        self.joint_replay_buffer.update_priorities(used_indices, td_errors)
+        return float(loss.detach().item())
+
     def train_step(self, batch_size: int = 64, tau: float | None = None, ifEV: bool = False) -> float:
-        del ifEV
         if len(self.experience_buffer) < max(8, batch_size // 2):
             queue_only_loss = self.train_queue_predictor(batch_size=batch_size)
+            joint_loss = self._train_joint_step(batch_size, ifEV=ifEV)
             if queue_only_loss > 0:
                 self.training_losses.append(float(self.queue_loss_weight) * queue_only_loss)
-            return float(self.queue_loss_weight) * queue_only_loss
+            return float(self.queue_loss_weight) * queue_only_loss + joint_loss
         self._graph_cache_key = None
         self._graph_cache = None
         batch = random.sample(list(self.experience_buffer), min(batch_size, len(self.experience_buffer)))
@@ -1958,7 +2447,22 @@ class PyTorchChargingValueFunction:
             g_values.append(float(g))
             rewards.append(float(exp.get("reward", 0.0)) - float(g))
             durs.append(float(exp.get("dur_time", 1.0)))
-            masks.append(0.0 if (exp.get("is_system_done", False) or exp.get("is_vehicle_done", False)) else 1.0)
+            is_stage_coupled = (
+                int(exp.get("stage_id", 0) or 0) == 1
+                and str(exp.get("recourse_variant", "legacy")) == "r4"
+            )
+            masks.append(
+                1.0
+                if is_stage_coupled
+                else (
+                    0.0
+                    if (
+                        exp.get("is_system_done", False)
+                        or exp.get("is_vehicle_done", False)
+                    )
+                    else 1.0
+                )
+            )
 
         edges = torch.stack(edge_rows)
         weights = torch.stack(type_ws)
@@ -1970,7 +2474,18 @@ class PyTorchChargingValueFunction:
         q1 = self.network(edges) * weights
         q2 = self.critic2(edges) * weights
         next_v = self._next_soft_values(batch)
-        target = residual_rewards + (self.gamma ** durs_t) * next_v * masks_t
+        bootstrap_discounts = []
+        for exp, duration in zip(batch, durs):
+            if int(exp.get("stage_id", 0) or 0) == 1 and str(
+                exp.get("recourse_variant", "legacy")
+            ) == "r4":
+                bootstrap_discounts.append(1.0)
+            else:
+                bootstrap_discounts.append(self.gamma ** float(duration))
+        discount_t = torch.tensor(
+            bootstrap_discounts, dtype=torch.float32, device=self.device
+        ).unsqueeze(1)
+        target = residual_rewards + discount_t * next_v * masks_t
         critic_loss = self.loss_fn(q1, target.detach()) + self.loss_fn(q2, target.detach())
         actor_loss = getattr(self, "_last_actor_loss_tensor", torch.zeros((), dtype=torch.float32, device=self.device))
         alpha_term = getattr(self, "_last_alpha_term_tensor", torch.zeros((), dtype=torch.float32, device=self.device))
@@ -2006,6 +2521,8 @@ class PyTorchChargingValueFunction:
             self.log_alpha.clamp_(math.log(1e-4), math.log(10.0))
         self._soft_update(self.network, self.target_network, tau)
         self._soft_update(self.critic2, self.target_critic2, tau)
+        self._soft_update(self.graph_encoder, self.target_graph_encoder, tau)
+        self._soft_update(self.mixer, self.target_mixer, tau)
 
         objective_value = float(loss.item())
         loss_value = float(critic_loss.detach().item())
@@ -2046,7 +2563,10 @@ class PyTorchChargingValueFunction:
                 f"res_target_mean={target.mean().item():.3f}",
                 flush=True,
             )
-        return loss_value
+        joint_loss = self._train_joint_step(batch_size, ifEV=ifEV)
+        if self.q_values_history:
+            self.q_values_history[-1]["joint_loss"] = joint_loss
+        return loss_value + joint_loss
 
     @staticmethod
     def _soft_update(source: nn.Module, target: nn.Module, tau: float) -> None:
@@ -2063,7 +2583,9 @@ class PyTorchChargingValueFunction:
             "critic2_state_dict": self.critic2.state_dict(),
             "target_critic2_state_dict": self.target_critic2.state_dict(),
             "graph_encoder_state_dict": self.graph_encoder.state_dict(),
+            "target_graph_encoder_state_dict": self.target_graph_encoder.state_dict(),
             "mixer_state_dict": self.mixer.state_dict(),
+            "target_mixer_state_dict": self.target_mixer.state_dict(),
             "actor_state_dict": self.actor.state_dict(),
             "queue_predictor_state_dict": self.queue_predictor.state_dict(),
             "queue_optimizer_state_dict": self.queue_optimizer.state_dict(),
@@ -2081,6 +2603,10 @@ class PyTorchChargingValueFunction:
             "beta_max": self.beta_max,
             "eta_pi": self.eta_pi,
             "residual_clip_rho": self.residual_clip_rho,
+            "joint_replay_schema_version": 1,
+            "joint_replay_state_dict": self.joint_replay_buffer.state_dict(),
+            "state_variant": self.state_variant,
+            "learner_variant": self.learner_variant,
         }
 
     def load_extra_checkpoint_state(self, state: dict[str, Any]) -> None:
@@ -2092,8 +2618,22 @@ class PyTorchChargingValueFunction:
             self.target_critic2.load_state_dict(state["target_critic2_state_dict"], strict=False)
         if "graph_encoder_state_dict" in state:
             self.graph_encoder.load_state_dict(state["graph_encoder_state_dict"], strict=False)
+        if "target_graph_encoder_state_dict" in state:
+            self.target_graph_encoder.load_state_dict(
+                state["target_graph_encoder_state_dict"], strict=False
+            )
+        else:
+            self.target_graph_encoder.load_state_dict(
+                self.graph_encoder.state_dict(), strict=False
+            )
         if "mixer_state_dict" in state:
             self.mixer.load_state_dict(state["mixer_state_dict"], strict=False)
+        if "target_mixer_state_dict" in state:
+            self.target_mixer.load_state_dict(
+                state["target_mixer_state_dict"], strict=False
+            )
+        else:
+            self.target_mixer.load_state_dict(self.mixer.state_dict(), strict=False)
         if "actor_state_dict" in state:
             self.actor.load_state_dict(state["actor_state_dict"], strict=False)
         if "queue_predictor_state_dict" in state:
@@ -2114,6 +2654,10 @@ class PyTorchChargingValueFunction:
             if not isinstance(value, torch.Tensor):
                 value = torch.tensor(value, dtype=torch.float32)
             self.log_alpha.data.copy_(value.to(self.device).reshape(()))
+        self.state_variant = str(state.get("state_variant", self.state_variant))
+        joint_replay_state = state.get("joint_replay_state_dict")
+        if joint_replay_state is not None:
+            self.joint_replay_buffer.load_state_dict(joint_replay_state)
 
     def add_to_logs(self, *args, **kwargs):
         return None

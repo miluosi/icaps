@@ -760,7 +760,16 @@ class ADPTrainer:
                 return False
             
             print(f"📂 加载checkpoint: {checkpoint_path}", flush=True)
-            checkpoint = torch.load(checkpoint_path, map_location=value_function.device)
+            try:
+                checkpoint = torch.load(
+                    checkpoint_path,
+                    map_location=value_function.device,
+                    weights_only=False,
+                )
+            except TypeError:
+                checkpoint = torch.load(
+                    checkpoint_path, map_location=value_function.device
+                )
             
             # 选择要加载的state_dict
             # if 'target_network_state_dict' in checkpoint:
@@ -961,6 +970,11 @@ class ADPTrainer:
         disable_post_demand_predictor: bool = False,
         checkpoint_scenario_suffix: str = "",
         load_checkpoint_assign_tag: str | None = "gurobi",
+        recourse_variant: str = "legacy",
+        rejection_logit_shift: float = 0.0,
+        common_random_numbers: bool = False,
+        state_variant: str = "joint_state_separate_critics",
+        learner_variant: str = "legacy",
     ):
         """完整迁移的集成测试（含神经网络训练与梯度更新）。"""
 
@@ -975,6 +989,16 @@ class ADPTrainer:
         self.logger.info(f"   Mode: {transportation_mode.upper()}")
         self.logger.info(f"   Demand: {'INTENSE' if use_intense_requests else 'RANDOM'}")
         self.logger.info(f"   ADP: {adpvalue}")
+        if recourse_variant != "legacy" and transportation_mode != "evfirst":
+            raise ValueError("R0--R4 recourse variants require transportation_mode='evfirst'")
+        valid_state_variants = {
+            "joint_state_shared_critic",
+            "joint_state_separate_critics",
+            "fleet_local_separate_critics",
+            "fleet_local_shared_critic",
+        }
+        if state_variant not in valid_state_variants:
+            raise ValueError(f"unknown state variant: {state_variant}")
         if useauction:
             usemcmf = True
 
@@ -1108,6 +1132,13 @@ class ADPTrainer:
             synthetic_demand_profile=synthetic_demand_profile,
             synthetic_demand_scale=synthetic_demand_scale,
         )
+        env.configure_recourse_experiment(
+            recourse_variant,
+            rejection_logit_shift=rejection_logit_shift,
+            common_random_numbers=common_random_numbers,
+        )
+        env.state_variant = str(state_variant)
+        env.learner_variant = str(learner_variant)
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
         env.useauction = bool(useauction or getattr(env, 'ifsolveauctioncuda', False))
@@ -1195,6 +1226,17 @@ class ADPTrainer:
                 and hasattr(value_function_ev, 'disable_follower_zone_distribution_predictor')
             ):
                 value_function_ev.disable_follower_zone_distribution_predictor()
+            if str(state_variant) in {
+                "joint_state_shared_critic",
+                "fleet_local_shared_critic",
+            } and not ifloadgingValueFunction:
+                value_function_ev = value_function
+            for current_value_function in {
+                id(value_function): value_function,
+                id(value_function_ev): value_function_ev,
+            }.values():
+                current_value_function.state_variant = str(state_variant)
+                current_value_function.learner_variant = str(learner_variant)
             env.set_value_function(value_function)
             env.set_value_function_ev(value_function_ev)
             log_progress(f"EV value function initialized in {time.time() - ev_value_function_init_start:.2f}s")

@@ -825,11 +825,13 @@ class NYCTrainer:
         post_demand_q_weight: float = 0.0,
         post_demand_head_lr_multiplier: float = 10.0,
         masac_target_entropy_ratio: float = 0.9,
-        residual_target_policy: str = "cached_mcmf",
+        residual_target_policy: str = "joint_projection",
         predictor_variant: str = "p3",
         recourse_variant: str = "legacy",
         rejection_logit_shift: float = 0.0,
         common_random_numbers: bool = False,
+        state_variant: str = "joint_state_separate_critics",
+        learner_variant: str = "legacy",
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -902,6 +904,8 @@ class NYCTrainer:
         env.auction_max_rounds = auction_max_rounds
         env.auction_top_k = auction_top_k
         env.evaluatemode = not trainnetwork
+        env.state_variant = str(state_variant)
+        env.learner_variant = str(learner_variant)
 
         effective_zone_distribution_mode = self._resolve_zone_distribution_mode(zone_distribution_mode)
         print(f"Path transformer self-attention: {'enabled' if iftransformer else 'disabled'}")
@@ -971,6 +975,17 @@ class NYCTrainer:
                 value_function_kwargs["predictor_variant"] = str(predictor_variant)
             value_function = value_function_class(**value_function_kwargs)
             value_function_ev = value_function_class(**value_function_kwargs)
+            if str(state_variant) in {
+                "joint_state_shared_critic",
+                "fleet_local_shared_critic",
+            } and not ifloadcheckpoint:
+                value_function_ev = value_function
+            for current_value_function in {
+                id(value_function): value_function,
+                id(value_function_ev): value_function_ev,
+            }.values():
+                current_value_function.state_variant = str(state_variant)
+                current_value_function.learner_variant = str(learner_variant)
             value_function.debug_name = "AEV"
             value_function_ev.debug_name = "EV"
             env.set_value_function(value_function)

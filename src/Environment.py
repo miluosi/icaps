@@ -13,6 +13,7 @@ import gurobipy as gp  # type: ignore
 from gurobipy import GRB  # type: ignore
 import re
 import random
+import hashlib
 import numpy as np
 import math
 from .charging_station import ChargingStationManager, ChargingStation
@@ -20,6 +21,11 @@ from .Action import Action, ChargingAction, ServiceAction, IdleAction
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import positive_wait_metrics
 from src.qvalue_precision import qvalue_rounding_diagnostics, round_qvalue_matrix
+from src.recourse.coordinator import RecourseCoordinator
+from src.recourse.lifecycle import RequestLifecycleTracker
+from src.recourse.state_snapshot import StateSnapshotBuilder
+from src.recourse.target_builder import RecourseTargetBuilder
+from src.recourse.types import JointActionSnapshot, RequestSnapshot
 import time
 class Environment(metaclass=ABCMeta):
     """Defines a class for simulating the Environment for the RL agent"""
@@ -574,6 +580,18 @@ class ChargingIntegratedEnvironment(Environment):
         self.generated_requests_last_step = 0
         self.ifreject = ifreject
         self.ifdropoff = ifdropoff
+        self.recourse_variant = "legacy"
+        self.rejection_logit_shift = 0.0
+        self.common_random_numbers = False
+        self.state_variant = "joint_state_shared_critic"
+        self.learner_variant = "optimization_anchored_residual"
+        self.request_lifecycle = RequestLifecycleTracker()
+        self.recourse_coordinator = RecourseCoordinator(
+            lifecycle=self.request_lifecycle
+        )
+        self._last_offer_realizations = {}
+        self._pending_recourse_actions = {}
+        self._same_epoch_blocked_request_ids = set()
         self.decision_mode = "integrated"  # "integrated" or "sequential"
         self.decision_mode_set = {"integrated", "aev_first","ev_first"}
         # Initialize charging station manager
@@ -614,6 +632,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.ev_rejected_recovered_same_epoch_ids = set()
         self.ev_rejected_rescued_by_aev_ids = set()
         self.ev_rejected_completed_by_ev_ids = set()
+        self.expired_request_ids = set()
         self.hotspot_locations = []
         self.initialise_environment()
         print(self.hotspot_locations)
@@ -2346,6 +2365,146 @@ class ChargingIntegratedEnvironment(Environment):
         )
         return max(0.0, final_fare - regular_fare)
 
+    def configure_recourse_experiment(
+        self,
+        variant: str = "legacy",
+        *,
+        rejection_logit_shift: float = 0.0,
+        common_random_numbers: bool = False,
+    ) -> None:
+        """Configure the shared R0--R4 contract for synthetic experiments."""
+        variant = str(variant or "legacy").strip().lower()
+        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4"}:
+            raise ValueError(
+                "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
+            )
+        shift = float(rejection_logit_shift)
+        if not math.isfinite(shift):
+            raise ValueError("rejection_logit_shift must be finite")
+        self.recourse_variant = variant
+        self.rejection_logit_shift = shift
+        self.common_random_numbers = bool(common_random_numbers)
+
+    def _ensure_recourse_runtime(self) -> None:
+        if not hasattr(self, "request_lifecycle"):
+            self.request_lifecycle = RequestLifecycleTracker()
+        if not hasattr(self, "recourse_coordinator"):
+            self.recourse_coordinator = RecourseCoordinator(
+                lifecycle=self.request_lifecycle
+            )
+        if not hasattr(self, "_last_offer_realizations"):
+            self._last_offer_realizations = {}
+        if not hasattr(self, "_pending_recourse_actions"):
+            self._pending_recourse_actions = {}
+        if not hasattr(self, "_current_ev_stage_request_ids"):
+            self._current_ev_stage_request_ids = set()
+        if not hasattr(self, "_current_ev_offered_request_ids"):
+            self._current_ev_offered_request_ids = set()
+
+    def _epoch_id(self) -> int:
+        return StateSnapshotBuilder.epoch_id(self)
+
+    def _acceptance_uniform(self, vehicle_id: int, request) -> float:
+        if not bool(getattr(self, "common_random_numbers", False)):
+            return random.random()
+        self._ensure_recourse_runtime()
+        request_id = int(getattr(request, "request_id"))
+        epoch_id = self._epoch_id()
+        attempt_index = self.request_lifecycle.next_attempt_index(
+            epoch_id, int(vehicle_id), request_id
+        )
+        key = (
+            f"{int(getattr(self, 'initial_random_seed', 0) or 0)}|"
+            f"{int(getattr(self, 'episode_start_day', 0) or 0)}|{epoch_id}|"
+            f"{int(vehicle_id)}|{request_id}|{attempt_index}"
+        ).encode("utf-8")
+        digest = hashlib.blake2b(key, digest_size=8).digest()
+        integer = int.from_bytes(digest, byteorder="big", signed=False)
+        return (integer + 0.5) / float(2**64)
+
+    def _begin_joint_collection(self, mode: str):
+        self._ensure_recourse_runtime()
+        self._pending_recourse_actions = {}
+        if getattr(self, "evaluatemode", False):
+            return None
+        if self.recourse_coordinator.pending is not None:
+            return self.recourse_coordinator.pending
+        solver_backend = (
+            "auction"
+            if getattr(self, "useauction", False)
+            else (
+                f"mcmf:{getattr(self, 'mcmf_backend', 'unknown')}"
+                if getattr(self, "usemcmf", False)
+                else ("gurobi" if self.assignmentgurobi else "heuristic")
+            )
+        )
+        return self.recourse_coordinator.begin(
+            self,
+            mode=mode,
+            recourse_variant=getattr(self, "recourse_variant", "legacy"),
+            state_variant=getattr(
+                self, "state_variant", "joint_state_shared_critic"
+            ),
+            learner_variant=getattr(
+                self, "learner_variant", "optimization_anchored_residual"
+            ),
+            solver_backend=solver_backend,
+        )
+
+    def _annotate_recourse_actions(self, actions) -> None:
+        pending = getattr(self.recourse_coordinator, "pending", None)
+        if pending is None:
+            return
+        for vehicle_id, action in actions.items():
+            if action is None:
+                continue
+            metadata = getattr(action, "metadata", None)
+            if metadata is None:
+                continue
+            vehicle_type = int(self.vehicles.get(vehicle_id, {}).get("type", 1))
+            metadata.transition_id = pending.transition_id
+            metadata.stage_id = 1 if vehicle_type == 1 else 2
+            metadata.state_snapshot = (
+                pending.pre_state if vehicle_type == 1 else pending.residual_state
+            )
+            if isinstance(action, ServiceAction):
+                request_id = int(action.request_id)
+                if metadata.request_snapshot is None:
+                    request = self.active_requests.get(request_id)
+                    if request is not None:
+                        metadata.request_snapshot = RequestSnapshot.from_request(request)
+                metadata.acceptance_outcome = (
+                    "rejected"
+                    if bool(getattr(action, "was_rejected", False))
+                    else "accepted"
+                )
+                if pending.residual_state is not None:
+                    metadata.residual_category = pending.residual_state.request_label(
+                        request_id
+                    )
+            self._pending_recourse_actions[int(vehicle_id)] = action
+
+    def _finalize_joint_collection(self, rewards: dict[int, float], done: bool):
+        if getattr(self, "evaluatemode", False):
+            return None
+        transition = self.recourse_coordinator.finalize(
+            self, rewards=rewards, done=done
+        )
+        if transition is None:
+            return None
+        for action in self._pending_recourse_actions.values():
+            action.metadata.next_state_snapshot = transition.next_state
+        seen = set()
+        for value_function in (self.value_function, self.value_function_ev):
+            if value_function is None or id(value_function) in seen:
+                continue
+            seen.add(id(value_function))
+            store = getattr(value_function, "store_recourse_transition", None)
+            if callable(store):
+                store(transition)
+        self._pending_recourse_actions = {}
+        return transition
+
     def _ev_acceptance_probability(self, vehicle_id, request=None, distance=None):
         """Empirical binary-logit acceptance probability for a synthetic EV.
 
@@ -2379,6 +2538,7 @@ class ChargingIntegratedEnvironment(Environment):
             * float(distance)
             + float(getattr(self, 'ev_acceptance_beta_surge', 0.101))
             * float(surge_bonus)
+            + float(getattr(self, 'rejection_logit_shift', 0.0))
         )
         return min(1.0, max(0.0, self._sigmoid(utility)))
 
@@ -2405,8 +2565,32 @@ class ChargingIntegratedEnvironment(Environment):
     
     def _should_reject_request(self, vehicle_id, request):
         """Determine if a vehicle should reject a request"""
+        variant_policy = RecourseTargetBuilder.variant_policy(
+            getattr(self, "recourse_variant", "legacy")
+        )
+        if not self.ifreject or not variant_policy.rejection_enabled:
+            rejected = False
+            acceptance_probability = 1.0
+            acceptance_uniform = 1.0
+            self._last_offer_realizations[
+                (self._epoch_id(), int(vehicle_id), int(request.request_id))
+            ] = {
+                "acceptance_probability": acceptance_probability,
+                "uniform": acceptance_uniform,
+                "rejected": rejected,
+            }
+            return rejected
         rejection_prob = self._calculate_rejection_probabilityreal(vehicle_id, request)
-        return random.random() < rejection_prob
+        acceptance_uniform = self._acceptance_uniform(vehicle_id, request)
+        rejected = acceptance_uniform < rejection_prob
+        self._last_offer_realizations[
+            (self._epoch_id(), int(vehicle_id), int(request.request_id))
+        ] = {
+            "acceptance_probability": 1.0 - float(rejection_prob),
+            "uniform": float(acceptance_uniform),
+            "rejected": bool(rejected),
+        }
+        return rejected
     
 
     def _get_maximum_service_time(self):
@@ -2448,7 +2632,7 @@ class ChargingIntegratedEnvironment(Environment):
             for vehicle in self.vehicles.values()
             if vehicle.get('type') == 2 and vehicle.get('is_online', True)
         )
-        return {
+        stats = {
             'time': self.current_time,
             'active_requests': active_requests,
             'pending_active_requests': pending_active_requests,
@@ -2458,6 +2642,7 @@ class ChargingIntegratedEnvironment(Environment):
             'total_aev': total_aev,
             'feasible': idle_aev >= required_idle_aev,
         }
+        return stats
 
 
     def _enforce_aev_test_capacity_limit(self):
@@ -2754,11 +2939,17 @@ class ChargingIntegratedEnvironment(Environment):
         if vehicle is None or int(vehicle.get('type', 1)) != 2:
             return False
         rejected_at = self.ev_rejection_times.get(request_id)
-        if rejected_at is None or float(rejected_at) != float(self.current_time):
+        if rejected_at is None or int(rejected_at) != self._epoch_id():
             return False
         recourse_ids = self.ev_rejected_recovered_same_epoch_ids
         is_new = request_id not in recourse_ids
         recourse_ids.add(request_id)
+        self._ensure_recourse_runtime()
+        self.request_lifecycle.record_aev_assignment(
+            int(request_id),
+            vehicle_id=int(vehicle_id),
+            epoch_id=self._epoch_id(),
+        )
         return is_new
 
     def _assign_request_to_vehicle(self, vehicle_id, request_id):
@@ -2788,7 +2979,40 @@ class ChargingIntegratedEnvironment(Environment):
             # Vehicle must be completely free (both assigned_request AND passenger_onboard must be None)
             if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
                 # Check if the vehicle rejects the request
-                if self._should_reject_request(vehicle_id, request):
+                was_rejected = self._should_reject_request(vehicle_id, request)
+                if int(vehicle.get('type', 1)) == 1:
+                    self._ensure_recourse_runtime()
+                    self._current_ev_offered_request_ids.add(int(request_id))
+                    epoch_id = self._epoch_id()
+                    realization = self._last_offer_realizations.get(
+                        (epoch_id, int(vehicle_id), int(request_id)),
+                        {
+                            "acceptance_probability": 0.0 if was_rejected else 1.0,
+                            "uniform": 0.0 if was_rejected else 1.0,
+                        },
+                    )
+                    pending = self.recourse_coordinator.pending
+                    transition_id = (
+                        pending.transition_id
+                        if pending is not None
+                        else f"synthetic-eval:{epoch_id}"
+                    )
+                    self.request_lifecycle.record_offer(
+                        transition_id=transition_id,
+                        epoch_id=epoch_id,
+                        request=request,
+                        ev_id=int(vehicle_id),
+                        vehicle=vehicle,
+                        acceptance_probability=float(
+                            realization["acceptance_probability"]
+                        ),
+                        acceptance_uniform=float(realization["uniform"]),
+                        accepted=not bool(was_rejected),
+                        rejection_reason=(
+                            "driver_reject" if was_rejected else None
+                        ),
+                    )
+                if was_rejected:
                     vehicle['rejected_requests'] += 1
                     self._record_ev_rejection(vehicle_id)
                     vehicle['assigned_request'] = request_id
@@ -2797,7 +3021,13 @@ class ChargingIntegratedEnvironment(Environment):
                         request.ev_rejection_count = getattr(request, 'ev_rejection_count', 0) + 1
                         request.was_ev_rejected = True
                         self.ev_rejected_request_ids.add(request_id)
-                        self.ev_rejection_times[request_id] = float(self.current_time)
+                        self.ev_rejection_times[request_id] = self._epoch_id()
+                        self.request_lifecycle.mark_residual(
+                            int(request_id),
+                            epoch_id=self._epoch_id(),
+                            category="rejected",
+                            eligible=False,
+                        )
                     
                     # 清除idle相关状态（即使拒绝，也要标记车辆不再stationary）
                     vehicle['idle_target'] = None
@@ -2830,6 +3060,12 @@ class ChargingIntegratedEnvironment(Environment):
                 request.assigned_time = self.current_time
                 self._record_ev_acceptance(vehicle_id)
                 self._record_same_epoch_recourse_if_applicable(vehicle_id, request_id)
+                if int(vehicle.get('type', 1)) == 2:
+                    self.request_lifecycle.record_aev_assignment(
+                        int(request_id),
+                        vehicle_id=int(vehicle_id),
+                        epoch_id=self._epoch_id(),
+                    )
                 if vehicle['type'] == 1:
                     self._clear_ev_charge_trigger(vehicle_id)
                 
@@ -3135,6 +3371,12 @@ class ChargingIntegratedEnvironment(Environment):
                 if not already_picked_up:
                     vehicle['passenger_onboard'] = vehicle['assigned_request']
                     request.pickup_time = self.current_time
+                    self._ensure_recourse_runtime()
+                    self.request_lifecycle.record_pickup(
+                        int(request_id),
+                        vehicle_id=int(vehicle_id),
+                        epoch_id=self._epoch_id(),
+                    )
                     vehicle['assigned_request'] = None
                     if self.current_time % 25 == 0 or self.current_time > request.pickup_deadline:
                         expired_status = "EXPIRED" if self.current_time > request.pickup_deadline else ""
@@ -3229,7 +3471,8 @@ class ChargingIntegratedEnvironment(Environment):
             # Check if vehicle is at dropoff location
             if vehicle_coords == dropoff_coords:
                 # Complete the request
-                completed_request = self.active_requests.pop(vehicle['passenger_onboard'])
+                completed_request_id = int(vehicle['passenger_onboard'])
+                completed_request = self.active_requests.pop(completed_request_id)
                 completed_request.completed_time = self.current_time
                 completed_request.completed_by_vehicle_type = self.vehicles[vehicle_id]['type']
                 vehicle['whether_finishrequest'] = True
@@ -3247,6 +3490,11 @@ class ChargingIntegratedEnvironment(Environment):
                     if completed_request.request_id in self.ev_rejected_request_ids:
                         self.ev_rejected_rescued_by_aev_ids.add(completed_request.request_id)
                 self.request_value_sum += completed_request.final_value
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_completion(
+                    completed_request_id,
+                    epoch_id=self._epoch_id(),
+                )
                 
                 earnings = completed_request.final_value
                 vehicle['service_earnings'] += earnings
@@ -3512,6 +3760,9 @@ class ChargingIntegratedEnvironment(Environment):
         # 更新环境状态
         self._update_environment()
         batterypenaltyv = self._check_dead_battery_vehicles()
+        done = self.current_time >= self.episode_length
+        self.done = done
+        self._finalize_joint_collection(rewards, done)
 
 
         saved_prior = self._prior_features_for_posterior
@@ -3572,8 +3823,6 @@ class ChargingIntegratedEnvironment(Environment):
         self._record_charging_usage()
 
         # 检查是否结束
-        done = self.current_time >= self.episode_length
-
         ev_idle_mean = float(np.mean(self.ev_idle_durations)) if getattr(self, 'ev_idle_durations', None) else 0.0
         ev_idle_count = int(len(self.ev_idle_durations)) if getattr(self, 'ev_idle_durations', None) else 0
         ev_in_penalty = int(sum(1 for vid in self.vehicles.keys() if self._in_ev_penalty(vid)))
@@ -3637,7 +3886,15 @@ class ChargingIntegratedEnvironment(Environment):
             if self.vehicles[vehicle_id]['passenger_onboard'] is not None:
                 assigned_requests.append(self.vehicles[vehicle_id]['passenger_onboard'])
         available_requests = list(self.active_requests.values())
-        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+        blocked_requests = set(
+            getattr(self, '_same_epoch_blocked_request_ids', set())
+        )
+        available_requests = [
+            req
+            for req in available_requests
+            if req.request_id not in assigned_requests
+            and req.request_id not in blocked_requests
+        ]
         # Persist the exact request-column order for every downstream solver.
         # The heuristic path receives the same matrix as Gurobi and must be
         # able to map its columns back to request/station identifiers.
@@ -4329,7 +4586,14 @@ class ChargingIntegratedEnvironment(Environment):
             if self.vehicles[vehicle_id]['passenger_onboard'] is not None:
                 assigned_requests.append(self.vehicles[vehicle_id]['passenger_onboard'])
         available_requests = list(self.active_requests.values())
-        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+        available_requests = [
+            req
+            for req in available_requests
+            if req.request_id not in assigned_requests
+            and req.request_id not in set(
+                getattr(self, '_same_epoch_blocked_request_ids', set())
+            )
+        ]
         
         
         request_num = len(available_requests)
@@ -4352,7 +4616,10 @@ class ChargingIntegratedEnvironment(Environment):
                         pickup_distance + trip_distance
                     )
                     if vehicle['type'] == 1:
-                        if self.knownreject:
+                        if (
+                            self.knownreject
+                            and getattr(self, 'recourse_variant', 'legacy') == 'legacy'
+                        ):
                             acceptance_probability = 1.0 - (
                                 self._calculate_rejection_probability(
                                     vehicle_id, request
@@ -4624,7 +4891,14 @@ class ChargingIntegratedEnvironment(Environment):
             if self.vehicles[vehicle_id]['passenger_onboard'] is not None:
                 assigned_requests.append(self.vehicles[vehicle_id]['passenger_onboard'])
         available_requests = list(self.active_requests.values())
-        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+        available_requests = [
+            req
+            for req in available_requests
+            if req.request_id not in assigned_requests
+            and req.request_id not in set(
+                getattr(self, '_same_epoch_blocked_request_ids', set())
+            )
+        ]
         
         if (self.value_function is not None or self.value_function_ev is not None) and num_requests > 0:
             batch_inputs_aev = []
@@ -4719,7 +4993,10 @@ class ChargingIntegratedEnvironment(Environment):
                     self._ev_request_q_source_reported = True
                 for idx, q_value in enumerate(q_values):
                     i, j = indices_ev[idx]
-                    if self.knownreject:
+                    if (
+                        self.knownreject
+                        and getattr(self, 'recourse_variant', 'legacy') == 'legacy'
+                    ):
                         request = available_requests[j]
                         rejection_pro = self._calculate_rejection_probability(
                             vehicles_to_rebalance[i], request
@@ -5011,7 +5288,14 @@ class ChargingIntegratedEnvironment(Environment):
             if self.vehicles[vehicle_id]['passenger_onboard'] is not None:
                 assigned_requests.append(self.vehicles[vehicle_id]['passenger_onboard'])
         available_requests = list(self.active_requests.values())
-        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+        available_requests = [
+            req
+            for req in available_requests
+            if req.request_id not in assigned_requests
+            and req.request_id not in set(
+                getattr(self, '_same_epoch_blocked_request_ids', set())
+            )
+        ]
         
         if self.value_function and num_requests > 0:
             batch_inputs_aev = []
@@ -5270,6 +5554,10 @@ class ChargingIntegratedEnvironment(Environment):
         # Integrated mode has no leader/follower split.
         self.decision_mode = "integrated"
         self._leader_is_ev = None
+        RecourseTargetBuilder.validate_variant(
+            getattr(self, "recourse_variant", "legacy"), "integrated"
+        )
+        pending_transition = self._begin_joint_collection("integrated")
 
         # Initialize actions dictionary for all vehicles
         actions = {}
@@ -5284,7 +5572,7 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None and self._should_consider_ev_charging(vehicle_id):
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and (random.random() < p_charge) or vehicle['battery']<=0.2:
+                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
                     r = random.random()
                     acc = 0.0
@@ -5330,15 +5618,17 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle_id for vehicle_id in vehicles_to_rebalance
                 if not self._is_vehicle_committed_to_charging(vehicle_id)
             ]
-            for vehicle_id in vehicles_to_rebalance:
-                if self.vehicles[vehicle_id]['assigned_request'] is not None  and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['passenger_onboard'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['charging_station'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['target_location'] is not None and vehicle_id in vehicles_to_rebalance and not self._is_ev(vehicle_id):
-                    vehicles_to_rebalance.remove(vehicle_id)
+            vehicles_to_rebalance = [
+                vehicle_id
+                for vehicle_id in vehicles_to_rebalance
+                if self.vehicles[vehicle_id]['assigned_request'] is None
+                and self.vehicles[vehicle_id]['passenger_onboard'] is None
+                and self.vehicles[vehicle_id]['charging_station'] is None
+                and (
+                    self.vehicles[vehicle_id]['target_location'] is None
+                    or self._is_ev(vehicle_id)
+                )
+            ]
             vehicles_to_rebalance = [
                 vehicle_id for vehicle_id in vehicles_to_rebalance
                 if not self._is_vehicle_committed_to_charging(vehicle_id)
@@ -5363,7 +5653,14 @@ class ChargingIntegratedEnvironment(Environment):
                     if self.vehicles[vehicle_id]['passenger_onboard'] is not None:
                         assigned_requests.append(self.vehicles[vehicle_id]['passenger_onboard'])
                 available_requests = list(self.active_requests.values())
-                available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+                available_requests = [
+                    req
+                    for req in available_requests
+                    if req.request_id not in assigned_requests
+                    and req.request_id not in set(
+                        getattr(self, '_same_epoch_blocked_request_ids', set())
+                    )
+                ]
                 if self.gurobi_network or self.usemcmf:
                     vehicle_action_matrix, num_requests, num_stations, num_zones = self.generate_whole_matrix(vehicles_to_rebalance, rebalance_num=len(vehicles_to_rebalance))
                     if self.adp_value>0 and self.value_function is not None:
@@ -5406,6 +5703,35 @@ class ChargingIntegratedEnvironment(Environment):
                                
                 
                 
+                integrated_graph = None
+                if pending_transition is not None:
+                    structured_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
+                        vehicles_to_rebalance
+                    )
+                    integrated_graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                        self,
+                        vehicles_to_rebalance,
+                        vehicle_action_matrix,
+                        batch_q_value,
+                        structured_q_value,
+                        num_requests=num_requests,
+                        num_stations=num_stations,
+                        num_zones=num_zones,
+                        stage_id=0,
+                        solver_backend=pending_transition.solver_backend,
+                        state=pending_transition.pre_state,
+                    )
+                    selected_edges = StateSnapshotBuilder.selected_edge_ids(
+                        integrated_graph, rebalancing_assignments
+                    )
+                    RecourseTargetBuilder.verify_feasible(
+                        integrated_graph, selected_edges
+                    )
+                    pending_transition.ev_stage_graph = integrated_graph
+                    pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
+                        integrated_graph, selected_edges
+                    )
+
                 new_assignments = 0
                 re_assignments_len = len(rebalancing_assignments)
                 charging_assignments = 0
@@ -5481,7 +5807,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.vehicles[vehicle_id]['penalty_timer'] = 0  # Clear any penalty timer on new assignment
                                 self.vehicles[vehicle_id]['idle_target'] = None  # Clear idle target on new assignment
                                 from src.Action import ServiceAction
-                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                                actions[vehicle_id] = ServiceAction([target_request], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
                                 request_final_value = self.active_requests[target_request.request_id].final_value
                                 actions[vehicle_id].request_value = request_final_value
                                 if self.vehicles[vehicle_id]['type'] == 1:
@@ -5557,7 +5883,7 @@ class ChargingIntegratedEnvironment(Environment):
                                         target_coords = vehicle['coordinates']  # Stay put if battery is too low
                                     vehicle['idle_target'] = target_coords
                                     current_coords = vehicle['coordinates']
-                                    actions[vehicle_id] = ServiceAction([], rejected_request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                                    actions[vehicle_id] = ServiceAction([target_request], rejected_request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
                                     actions[vehicle_id].was_rejected = True
                                     actions[vehicle_id].rejection_reason = 'driver_reject'
                                     rej_distance = self._manhattan_distance_loc(vehicle_location, self.active_requests[rejected_request_id].pickup)
@@ -5878,6 +6204,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         
         
+        self._annotate_recourse_actions(actions)
         return actions, storeactions, storeactions_ev
 
     def simulate_motion_evfirst(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True):
@@ -5885,6 +6212,12 @@ class ChargingIntegratedEnvironment(Environment):
         if agents is None:
             agents = []
         self.decision_mode = "ev_first"
+        recourse_variant = RecourseTargetBuilder.validate_variant(
+            getattr(self, "recourse_variant", "legacy"), "evfirst"
+        )
+        recourse_policy = RecourseTargetBuilder.variant_policy(recourse_variant)
+        pending_transition = self._begin_joint_collection("ev_first")
+        self._same_epoch_blocked_request_ids = set()
         actions = {}
         follower_t_prediction = self.refresh_bayes_state_distribution()
         self._prior_features_for_posterior = None
@@ -5901,7 +6234,7 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None and self._should_consider_ev_charging(vehicle_id):
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and (random.random() < p_charge) or vehicle['battery']<=0.2:
+                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
                     r = random.random()
                     acc = 0.0
@@ -5950,15 +6283,17 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle_id for vehicle_id in vehicles_to_rebalance
                 if not self._is_vehicle_committed_to_charging(vehicle_id)
             ]
-            for vehicle_id in vehicles_to_rebalance:
-                if self.vehicles[vehicle_id]['assigned_request'] is not None  and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['passenger_onboard'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['charging_station'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['target_location'] is not None and vehicle_id in vehicles_to_rebalance and not self._is_ev(vehicle_id):
-                    vehicles_to_rebalance.remove(vehicle_id)
+            vehicles_to_rebalance = [
+                vehicle_id
+                for vehicle_id in vehicles_to_rebalance
+                if self.vehicles[vehicle_id]['assigned_request'] is None
+                and self.vehicles[vehicle_id]['passenger_onboard'] is None
+                and self.vehicles[vehicle_id]['charging_station'] is None
+                and (
+                    self.vehicles[vehicle_id]['target_location'] is None
+                    or self._is_ev(vehicle_id)
+                )
+            ]
             vehicles_to_rebalance = [
                 vehicle_id for vehicle_id in vehicles_to_rebalance
                 if not self._is_vehicle_committed_to_charging(vehicle_id)
@@ -6004,6 +6339,16 @@ class ChargingIntegratedEnvironment(Environment):
 
                 ev_matrix_start = time.time() if debug_rebalance else None
                 vehicle_action_matrix, num_requests, num_stations, num_zones = self.generate_whole_matrix(vehicles_to_rebalance_ev, rebalance_num=len(vehicles_to_rebalance_ev),onlyev=True)
+                ev_stage_request_columns = list(
+                    getattr(self, "_last_matrix_request_ids", ())
+                )[:num_requests]
+                self._current_ev_stage_request_ids = {
+                    int(request_id)
+                    for column, request_id in enumerate(ev_stage_request_columns)
+                    if vehicle_action_matrix.shape[0] > 0
+                    and bool(np.any(vehicle_action_matrix[:, column] > 0))
+                }
+                self._current_ev_offered_request_ids = set()
                 if debug_rebalance:
                     print(
                         f"[evfirst][t=0] EV matrix ready in {time.time() - ev_matrix_start:.2f}s shape={vehicle_action_matrix.shape}",
@@ -6016,6 +6361,25 @@ class ChargingIntegratedEnvironment(Environment):
                     batch_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
                         vehicles_to_rebalance_ev, onlyev=True
                     )
+                ev_stage_graph = None
+                if pending_transition is not None:
+                    structured_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
+                        vehicles_to_rebalance_ev, onlyev=True
+                    )
+                    ev_stage_graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                        self,
+                        vehicles_to_rebalance_ev,
+                        vehicle_action_matrix,
+                        batch_q_value,
+                        structured_q_value,
+                        num_requests=num_requests,
+                        num_stations=num_stations,
+                        num_zones=num_zones,
+                        stage_id=1,
+                        solver_backend=pending_transition.solver_backend,
+                        state=pending_transition.pre_state,
+                    )
+                    pending_transition.ev_stage_graph = ev_stage_graph
                 if debug_rebalance:
                     print(
                         f"[evfirst][t=0] EV q-value ready in {time.time() - ev_q_start:.2f}s shape={batch_q_value.shape}",
@@ -6045,6 +6409,16 @@ class ChargingIntegratedEnvironment(Environment):
                         f"[evfirst][t=0] EV optimization ready in {time.time() - ev_opt_start:.2f}s assignments={len(rebalancing_assignments_ev)}",
                         flush=True,
                     )
+                if pending_transition is not None and ev_stage_graph is not None:
+                    selected_ev_edges = StateSnapshotBuilder.selected_edge_ids(
+                        ev_stage_graph, rebalancing_assignments_ev
+                    )
+                    RecourseTargetBuilder.verify_feasible(
+                        ev_stage_graph, selected_ev_edges
+                    )
+                    pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
+                        ev_stage_graph, selected_ev_edges
+                    )
                                 
                 rejected_ev_requests = []
                 for vehicle_id, target_request in rebalancing_assignments_ev.items():
@@ -6060,7 +6434,7 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle['penalty_timer'] = 0  # Clear any penalty timer on new assignment
                             vehicle['idle_target'] = None  # Clear idle target on new assignment
                             from src.Action import ServiceAction
-                            actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                            actions[vehicle_id] = ServiceAction([target_request], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
                             request_final_value = self.active_requests[target_request.request_id].final_value
                             actions[vehicle_id].request_value = request_final_value
                             if vehicle['type'] == 1:
@@ -6104,7 +6478,7 @@ class ChargingIntegratedEnvironment(Environment):
                                     target_coords = vehicle['coordinates']
                                 vehicle['idle_target'] = target_coords
                                 current_coords = vehicle['coordinates']
-                                actions[vehicle_id] = ServiceAction([], rejected_request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                                actions[vehicle_id] = ServiceAction([target_request], rejected_request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
                                 actions[vehicle_id].was_rejected = True
                                 actions[vehicle_id].rejection_reason = 'driver_reject'
                                 rej_distance = self._manhattan_distance_loc(vehicle_location, self.active_requests[rejected_request_id].pickup)
@@ -6224,6 +6598,40 @@ class ChargingIntegratedEnvironment(Environment):
                 # Filter out both assigned AND expired requests
                 available_requests = [req for req in current_active_requests 
                                     if req.request_id not in assigned_request ]
+                epoch_id = self._epoch_id()
+                rejected_residual_ids = {
+                    int(request_id)
+                    for (offer_epoch, _vehicle_id, request_id), realization
+                    in self._last_offer_realizations.items()
+                    if int(offer_epoch) == epoch_id
+                    and bool(realization.get("rejected", False))
+                }
+                for request in available_requests:
+                    request_id = int(request.request_id)
+                    category = "other"
+                    if request_id in rejected_residual_ids:
+                        category = "rejected"
+                    elif (
+                        request_id in self._current_ev_stage_request_ids
+                        and request_id not in self._current_ev_offered_request_ids
+                    ):
+                        category = "unoffered"
+                    self.request_lifecycle.mark_residual(
+                        request_id,
+                        epoch_id=epoch_id,
+                        category=category,
+                        eligible=False,
+                    )
+                if not recourse_policy.same_epoch_repair:
+                    self._same_epoch_blocked_request_ids = set(
+                        rejected_residual_ids
+                    )
+                    available_requests = [
+                        request
+                        for request in available_requests
+                        if int(request.request_id)
+                        not in self._same_epoch_blocked_request_ids
+                    ]
                 if debug_rebalance:
                     print(
                         f"[evfirst][t=0] AEV phase start: vehicles={len(vehicles_to_rebalance_aev)}, requests={len(available_requests)}",
@@ -6232,16 +6640,85 @@ class ChargingIntegratedEnvironment(Environment):
 
                 aev_matrix_start = time.time() if debug_rebalance else None
                 vehicle_action_matrix, num_requests, num_stations, num_zones = self.generate_whole_matrix(vehicles_to_rebalance_aev, rebalance_num=len(vehicles_to_rebalance_aev))
+                eligible_request_ids = {
+                    int(request_id)
+                    for column, request_id in enumerate(
+                        list(getattr(self, "_last_matrix_request_ids", ()))[:num_requests]
+                    )
+                    if vehicle_action_matrix.shape[0] > 0
+                    and bool(np.any(vehicle_action_matrix[:, column] > 0))
+                }
+                for request in current_active_requests:
+                    request_id = int(request.request_id)
+                    if request_id in assigned_request:
+                        continue
+                    category = "other"
+                    if request_id in rejected_residual_ids:
+                        category = "rejected"
+                    elif (
+                        request_id in self._current_ev_stage_request_ids
+                        and request_id not in self._current_ev_offered_request_ids
+                    ):
+                        category = "unoffered"
+                    self.request_lifecycle.mark_residual(
+                        request_id,
+                        epoch_id=epoch_id,
+                        category=category,
+                        eligible=request_id in eligible_request_ids,
+                    )
+                residual_labels = {
+                    int(request.request_id): (
+                        "rejected"
+                        if int(request.request_id) in rejected_residual_ids
+                        else (
+                            "unoffered"
+                            if int(request.request_id)
+                            in self._current_ev_stage_request_ids
+                            and int(request.request_id)
+                            not in self._current_ev_offered_request_ids
+                            else "other"
+                        )
+                    )
+                    for request in current_active_requests
+                    if int(request.request_id) not in assigned_request
+                }
+                if pending_transition is not None:
+                    pending_transition.residual_state = StateSnapshotBuilder.build(
+                        self, request_labels=residual_labels
+                    )
                 if debug_rebalance:
                     print(
                         f"[evfirst][t=0] AEV matrix ready in {time.time() - aev_matrix_start:.2f}s shape={vehicle_action_matrix.shape}",
                         flush=True,
                     )
                 aev_q_start = time.time() if debug_rebalance else None
-                if self.adp_value>0 and self.value_function is not None:
+                if (
+                    not recourse_policy.structured_only_follower
+                    and self.adp_value > 0
+                    and self.value_function is not None
+                ):
                     batch_q_value = self.generate_vehicle_qvalue(vehicles_to_rebalance_aev)
                 else:
                     batch_q_value = self.generate_vehicle_qvalue_withoutqnetwork(vehicles_to_rebalance_aev)
+                aev_stage_graph = None
+                if pending_transition is not None:
+                    structured_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
+                        vehicles_to_rebalance_aev
+                    )
+                    aev_stage_graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                        self,
+                        vehicles_to_rebalance_aev,
+                        vehicle_action_matrix,
+                        batch_q_value,
+                        structured_q_value,
+                        num_requests=num_requests,
+                        num_stations=num_stations,
+                        num_zones=num_zones,
+                        stage_id=2,
+                        solver_backend=pending_transition.solver_backend,
+                        state=pending_transition.residual_state,
+                    )
+                    pending_transition.aev_stage_graph = aev_stage_graph
                 if debug_rebalance:
                     print(
                         f"[evfirst][t=0] AEV q-value ready in {time.time() - aev_q_start:.2f}s shape={batch_q_value.shape}",
@@ -6276,6 +6753,16 @@ class ChargingIntegratedEnvironment(Environment):
                     print(
                         f"[evfirst][t=0] AEV optimization ready in {time.time() - aev_opt_start:.2f}s assignments={len(rebalancing_assignments_aev)}",
                         flush=True,
+                    )
+                if pending_transition is not None and aev_stage_graph is not None:
+                    selected_aev_edges = StateSnapshotBuilder.selected_edge_ids(
+                        aev_stage_graph, rebalancing_assignments_aev
+                    )
+                    RecourseTargetBuilder.verify_feasible(
+                        aev_stage_graph, selected_aev_edges
+                    )
+                    pending_transition.aev_joint_action = JointActionSnapshot.from_graph(
+                        aev_stage_graph, selected_aev_edges
                     )
 
                 # for vehicle_id in vehicles_to_rebalance_aev:
@@ -6338,7 +6825,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 vehicle['idle_target'] = None  # Clear idle target on new assignment
                                 # Generate service action
                                 from src.Action import ServiceAction
-                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                                actions[vehicle_id] = ServiceAction([target_request], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
                                 request_final_value = self.active_requests[target_request.request_id].final_value
                                 actions[vehicle_id].request_value = request_final_value
                                 if vehicle['type'] == 1:
@@ -6623,6 +7110,8 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Mark leader type so step() can avoid prior_features pollution
         self._leader_is_ev = True  # evfirst: EV is leader, AEV is follower
+        self._annotate_recourse_actions(actions)
+        self._same_epoch_blocked_request_ids = set()
         return actions, storeactions, storeactions_ev
 
 
@@ -6637,6 +7126,10 @@ class ChargingIntegratedEnvironment(Environment):
         if agents is None:
             agents = []
         self.decision_mode = "aev_first"
+        RecourseTargetBuilder.validate_variant(
+            getattr(self, "recourse_variant", "legacy"), "aevfirst"
+        )
+        self._begin_joint_collection("aev_first")
         actions = {}
         follower_t_prediction = self.refresh_bayes_state_distribution()
         self._prior_features_for_posterior = None
@@ -6653,7 +7146,7 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None and self._should_consider_ev_charging(vehicle_id):
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and (random.random() < p_charge) or vehicle['battery']<=0.2:
+                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
                     r = random.random()
                     acc = 0.0
@@ -6701,15 +7194,17 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle_id for vehicle_id in vehicles_to_rebalance
                 if not self._is_vehicle_committed_to_charging(vehicle_id)
             ]
-            for vehicle_id in vehicles_to_rebalance:
-                if self.vehicles[vehicle_id]['assigned_request'] is not None  and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['passenger_onboard'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['charging_station'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['target_location'] is not None and vehicle_id in vehicles_to_rebalance and not self._is_ev(vehicle_id):
-                    vehicles_to_rebalance.remove(vehicle_id)
+            vehicles_to_rebalance = [
+                vehicle_id
+                for vehicle_id in vehicles_to_rebalance
+                if self.vehicles[vehicle_id]['assigned_request'] is None
+                and self.vehicles[vehicle_id]['passenger_onboard'] is None
+                and self.vehicles[vehicle_id]['charging_station'] is None
+                and (
+                    self.vehicles[vehicle_id]['target_location'] is None
+                    or self._is_ev(vehicle_id)
+                )
+            ]
             for vehicle_id in vehicles_to_rebalance:
                 vehicle = self.vehicles[vehicle_id]
                 # print(f" {vehicle_id}  Status - Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
@@ -6823,7 +7318,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 vehicle['idle_target'] = None  # Clear idle target on new assignment
                                 # Generate service action
                                 from src.Action import ServiceAction
-                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                                actions[vehicle_id] = ServiceAction([target_request], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
                                 request_final_value = self.active_requests[target_request.request_id].final_value
                                 actions[vehicle_id].request_value = request_final_value
                                 if vehicle['type'] == 1:
@@ -7047,7 +7542,7 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle['penalty_timer'] = 0  # Clear any penalty timer on new assignment
                             vehicle['idle_target'] = None  # Clear idle target on new assignment
                             from src.Action import ServiceAction
-                            actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                            actions[vehicle_id] = ServiceAction([target_request], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
                             request_final_value = self.active_requests[target_request.request_id].final_value
                             actions[vehicle_id].request_value = request_final_value
                             if vehicle['type'] == 1:
@@ -7092,7 +7587,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 from src.Action import IdleAction
                                 vehicle['idle_target'] = target_coords
                                 current_coords = vehicle['coordinates']
-                                actions[vehicle_id] = ServiceAction([], rejected_request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                                actions[vehicle_id] = ServiceAction([target_request], rejected_request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
                                 actions[vehicle_id].was_rejected = True
                                 actions[vehicle_id].rejection_reason = 'driver_reject'
                                 target_coords = self.active_requests[rejected_request_id].pickup
@@ -7255,6 +7750,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Mark leader type so step() can avoid prior_features pollution
         self._leader_is_ev = False  # aevfirst: AEV is leader, EV is follower
+        self._annotate_recourse_actions(actions)
         return actions, storeactions, storeactions_ev
 
 
@@ -7466,6 +7962,16 @@ class ChargingIntegratedEnvironment(Environment):
             # Skip None actions to prevent AttributeError
             if action is None:
                 continue
+            selected_value_function = (
+                self.value_function_ev
+                if int(self.vehicles[vehicle_id].get('type', 1)) == 1
+                else self.value_function
+            )
+            bind_context = getattr(
+                selected_value_function, 'set_replay_collection_context', None
+            )
+            if callable(bind_context):
+                bind_context(action)
             batterynow = self.vehicles[vehicle_id]['battery']
             # Use pre-action as decision state
             current_location = action.vehicle_loc
@@ -7754,9 +8260,8 @@ class ChargingIntegratedEnvironment(Environment):
                 )
                 was_rejected = bool(getattr(action, 'was_rejected', False))
 
-                # Match NYC: behavioural rejection data do not become critic
-                # transitions.  The former2/queue MASAC rejection hook is a
-                # no-op, while models with a rejection head may consume it.
+                # Rejection is an observed outcome of the selected service
+                # action, so it trains both the rejection head and the critic.
                 if was_rejected:
                     rejection_hook = getattr(
                         self.value_function_ev,
@@ -7790,6 +8295,75 @@ class ChargingIntegratedEnvironment(Environment):
                                 None,
                             ),
                         )
+                    request_snapshot = getattr(
+                        getattr(action, 'metadata', None),
+                        'request_snapshot',
+                        None,
+                    )
+                    request_value = float(
+                        getattr(
+                            request_snapshot,
+                            'final_value',
+                            getattr(action, 'request_value', 0.0),
+                        )
+                        or 0.0
+                    )
+                    reject_target = int(
+                        getattr(action, 'target_location', current_location)
+                    )
+                    rejection_reward = float(
+                        getattr(action, 'dur_reward', 0.0) or 0.0
+                    )
+                    if rejection_reward == 0.0:
+                        rejection_reward = -float(
+                            getattr(self, 'rejection_penalty_base', 1.0)
+                        )
+                    next_action = getattr(action, 'next_action', None)
+                    if isinstance(next_action, ServiceAction):
+                        next_action_type = 'assign'
+                    elif isinstance(next_action, ChargingAction):
+                        next_action_type = 'charge'
+                    else:
+                        next_action_type = 'idle'
+                    _store_experience_with_masac_candidates(
+                        self.value_function_ev,
+                        vehicle_id=vehicle_id,
+                        action_type=f"assign_{action.request_id}",
+                        vehicle_location=int(current_location),
+                        target_location=reject_target,
+                        current_time=action_start_time,
+                        reward=rejection_reward,
+                        next_vehicle_location=int(veh_curloc),
+                        next_target_location=int(veh_curloc),
+                        battery_level=float(current_battery),
+                        next_battery_level=float(batterynow),
+                        other_vehicles=sum(
+                            vehicle['assigned_request'] is not None
+                            for vehicle in self.vehicles.values()
+                        ),
+                        num_requests=len(self.active_requests),
+                        request_value=request_value,
+                        next_action_type=next_action_type,
+                        next_request_value=float(
+                            getattr(next_action, 'next_value', 0.0) or 0.0
+                        ),
+                        dur_time=action_dur_time,
+                        post_action_location=int(veh_curloc),
+                        post_action_distance=0.0,
+                        post_action_duration=0.0,
+                        post_action_zoneid=int(
+                            self.get_zone_embedding_id(int(veh_curloc))
+                        ),
+                        is_system_done=bool(getattr(self, 'done', False)),
+                        vehicle_idle_time=float(
+                            getattr(action, 'idle_time', 0.0) or 0.0
+                        ),
+                        next_vehicle_idle_time=float(
+                            self.vehicles[vehicle_id].get('idle_timer', 0.0)
+                            or 0.0
+                        ),
+                        was_rejected=True,
+                    )
                     continue
 
                 if next_action is None and not dropout_after_action:
@@ -9120,6 +9694,9 @@ class ChargingIntegratedEnvironment(Environment):
             if not request_being_served:
                 request = self.active_requests[request_id]
                 #self.rejected_requests.append(request)
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_expiry(int(request_id))
+                self.expired_request_ids.add(int(request_id))
                 del self.active_requests[request_id]
         
         if expired_being_served > 0 and self.current_time % 50 == 0:
@@ -9135,6 +9712,14 @@ class ChargingIntegratedEnvironment(Environment):
     def reset(self):
         """重置环境"""
         self.current_time = 0
+        self._ensure_recourse_runtime()
+        self.request_lifecycle.reset()
+        self.recourse_coordinator.pending = None
+        self._pending_recourse_actions = {}
+        self._same_epoch_blocked_request_ids = set()
+        self._last_offer_realizations = {}
+        self._current_ev_stage_request_ids = set()
+        self._current_ev_offered_request_ids = set()
         if self.randomize_episode_start_day:
             self.episode_start_day = random.randint(0, self.days_per_week - 1)
         # Reset request system
@@ -9206,6 +9791,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.ev_rejected_recovered_same_epoch_ids = set()
         self.ev_rejected_rescued_by_aev_ids = set()
         self.ev_rejected_completed_by_ev_ids = set()
+        self.expired_request_ids = set()
         if self.iftest_aev:
             self.set_aev_larger_env()
         self._setup_vehicles()
@@ -9271,7 +9857,8 @@ class ChargingIntegratedEnvironment(Environment):
             request.request_id for request in self.rejected_requests
         })
         recourse_requests = len(self.ev_rejected_recovered_same_epoch_ids)
-        lost_requests = max(0, int(self.whole_req_num) - completed_orders)
+        unresolved_requests = max(0, int(self.whole_req_num) - completed_orders)
+        lost_requests = len(self.expired_request_ids)
         service_ratio = completed_orders/self.whole_req_num if self.whole_req_num > 0 else 0
         avg_request_value1 = self.request_value_sum/completed_orders if completed_orders > 0 else 0
         avg_ev_request_value = self.request_value_sum_ev / completed_ev_orders if completed_ev_orders > 0 else 0
@@ -9371,7 +9958,7 @@ class ChargingIntegratedEnvironment(Environment):
         total_capacity_steps = len(self.aev_capacity_history)
         aev_capacity_feasible_rate = feasible_steps / total_capacity_steps if total_capacity_steps > 0 else 1.0
 
-        return {
+        stats = {
             'episode_time': self.current_time,
             'episode_days_covered': self._current_day_index() + 1,
             'episode_start_weekday': self.episode_start_day,
@@ -9383,6 +9970,7 @@ class ChargingIntegratedEnvironment(Environment):
             'rejected_requests': rejected_requests,
             'recourse_requests': recourse_requests,
             'lost_requests': lost_requests,
+            'unresolved_requests': unresolved_requests,
             'ev_accept': total_ev_request,
             'completed_orders': completed_orders,
             'completed_ev_orders': completed_ev_orders,
@@ -9483,7 +10071,18 @@ class ChargingIntegratedEnvironment(Environment):
             'generated_requests_last_step': int(self.generated_requests_last_step),
             'generated_requests_by_phase': dict(self.generated_requests_by_phase),
             'total_generated_requests': int(self.whole_req_num),
+            'expired_request_count': len(self.expired_request_ids),
+            'request_lifecycle_accounted_count': (
+                active_orders + completed_orders + len(self.expired_request_ids)
+            ),
+            'request_lifecycle_gap': int(self.whole_req_num) - (
+                active_orders + completed_orders + len(self.expired_request_ids)
+            ),
         }
+        self._ensure_recourse_runtime()
+        self.request_lifecycle.assert_reconciled()
+        stats.update(self.request_lifecycle.metrics())
+        return stats
 
     def get_stats(self):
         """Get environment statistics including request fulfillment and vehicle types"""
@@ -9520,9 +10119,9 @@ class ChargingIntegratedEnvironment(Environment):
                 request.request_id for request in self.rejected_requests
             }),
             'recourse_requests': len(self.ev_rejected_recovered_same_epoch_ids),
-            'lost_requests': max(
-                0,
-                int(self.whole_req_num) - len(self.completed_requests),
+            'lost_requests': len(self.expired_request_ids),
+            'unresolved_requests': max(
+                0, int(self.whole_req_num) - len(self.completed_requests)
             ),
             'ev_count': len(ev_vehicles),
             'aev_count': len(aev_vehicles),
@@ -9629,7 +10228,7 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None:
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and (random.random() < p_charge) or vehicle['battery']<=0.2:
+                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
                     r = random.random()
                     acc = 0.0
@@ -9674,15 +10273,17 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle_id for vehicle_id in vehicles_to_rebalance
                 if not self._is_vehicle_committed_to_charging(vehicle_id)
             ]
-            for vehicle_id in vehicles_to_rebalance:
-                if self.vehicles[vehicle_id]['assigned_request'] is not None  and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['passenger_onboard'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['charging_station'] is not None and vehicle_id in vehicles_to_rebalance:
-                    vehicles_to_rebalance.remove(vehicle_id)
-                if self.vehicles[vehicle_id]['target_location'] is not None and vehicle_id in vehicles_to_rebalance and not self._is_ev(vehicle_id):
-                    vehicles_to_rebalance.remove(vehicle_id)
+            vehicles_to_rebalance = [
+                vehicle_id
+                for vehicle_id in vehicles_to_rebalance
+                if self.vehicles[vehicle_id]['assigned_request'] is None
+                and self.vehicles[vehicle_id]['passenger_onboard'] is None
+                and self.vehicles[vehicle_id]['charging_station'] is None
+                and (
+                    self.vehicles[vehicle_id]['target_location'] is None
+                    or self._is_ev(vehicle_id)
+                )
+            ]
         
         
         
@@ -9705,7 +10306,14 @@ class ChargingIntegratedEnvironment(Environment):
             if self.vehicles[vehicle_id]['passenger_onboard'] is not None:
                 assigned_requests.append(self.vehicles[vehicle_id]['passenger_onboard'])
         available_requests = list(self.active_requests.values())
-        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+        available_requests = [
+            req
+            for req in available_requests
+            if req.request_id not in assigned_requests
+            and req.request_id not in set(
+                getattr(self, '_same_epoch_blocked_request_ids', set())
+            )
+        ]
         station_list = list(self.charging_manager.stations.values()) if hasattr(self, 'charging_manager') else []
         
 

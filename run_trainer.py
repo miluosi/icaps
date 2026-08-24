@@ -4,10 +4,13 @@ Mirrors test_integrated_charging main workflow but uses the trainer encapsulatio
 """
 import argparse
 import os
+from pathlib import Path
 
 import src.ADPtrainer as adp_trainer_module
 from src.ADPtrainer import ADPTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.recourse.manifest import write_experiment_manifest
 from src.synthetic_scenario import (
     DEFAULT_AEV_INITIAL_BATTERY_SCALE,
     DEFAULT_CHARGE_DURATION,
@@ -104,6 +107,35 @@ def parse_args():
     parser.add_argument("--critical-charging-battery", type=float, default=DEFAULT_CRITICAL_CHARGING_BATTERY, help="AEV SoC below which waiting is infeasible")
     parser.add_argument("--random-seed", type=int, default=64, help="Random seed for training")
     parser.add_argument(
+        "--recourse-variant",
+        choices=["legacy", "r0", "r1", "r2", "r3", "r4"],
+        default="legacy",
+        help="EV-first rejection/recourse ablation",
+    )
+    parser.add_argument(
+        "--rejection-logit-shift",
+        type=float,
+        default=0.0,
+        help="Additive shift to EV acceptance utility",
+    )
+    parser.add_argument(
+        "--common-random-numbers",
+        action="store_true",
+        help="Use deterministic offer-keyed acceptance draws",
+    )
+    parser.add_argument(
+        "--state-variant",
+        choices=STATE_VARIANTS,
+        default="joint_state_separate_critics",
+        help="State visibility and critic-sharing ablation",
+    )
+    parser.add_argument(
+        "--learner-variant",
+        choices=LEARNER_VARIANTS,
+        default="legacy",
+        help="Integrated learner target family",
+    )
+    parser.add_argument(
         "--distribution-mode",
         type=str,
         default="st_masac_gat_queue_demand_gurobi",
@@ -111,6 +143,8 @@ def parse_args():
             "bayes", "time-only", "none",
             "st_masac_gat_post_demand_direct",
             "st_masac_gat_queue_demand_gurobi",
+            "optimization_anchored_residual",
+            "integrated_directq",
         ],
         help="ICAPS core value-function mode",
     )
@@ -156,9 +190,27 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.recourse_variant != "legacy" and (
+        args.all_modes
+        or any(mode != "evfirst" for mode in args.transportation_mode)
+    ):
+        raise ValueError(
+            "R0--R4 recourse variants require --transportation-mode evfirst"
+        )
     if args.useauction:
         args.usemcmf = True
-    zone_distribution_mode = args.distribution_mode or "none"
+    zone_distribution_mode = (
+        args.learner_variant
+        if args.learner_variant != "legacy"
+        else (args.distribution_mode or "none")
+    )
+    if args.learner_variant == "integrated_directq" and (
+        args.all_modes
+        or any(mode != "integrated" for mode in args.transportation_mode)
+    ):
+        raise ValueError(
+            "integrated_directq requires --transportation-mode integrated"
+        )
     if zone_distribution_mode == "elbo":
         from src.ValueFunction_pytorch_elbo import PyTorchChargingValueFunction as ELBOPyTorchChargingValueFunction
         adp_trainer_module.PyTorchChargingValueFunction = ELBOPyTorchChargingValueFunction
@@ -182,6 +234,12 @@ def main():
     }:
         from src.ValueFunction_st_masac_gat_post_demand_direct import PyTorchChargingValueFunction as MASACPostDemandDirectValueFunction
         adp_trainer_module.PyTorchChargingValueFunction = MASACPostDemandDirectValueFunction
+    elif zone_distribution_mode == "optimization_anchored_residual":
+        from src.ValueFunction_optimization_anchored_residual import PyTorchChargingValueFunction as OptimizationAnchoredValueFunction
+        adp_trainer_module.PyTorchChargingValueFunction = OptimizationAnchoredValueFunction
+    elif zone_distribution_mode == "integrated_directq":
+        from src.ValueFunction_integrated_directq import PyTorchChargingValueFunction as IntegratedDirectQValueFunction
+        adp_trainer_module.PyTorchChargingValueFunction = IntegratedDirectQValueFunction
     elif zone_distribution_mode == "standard_masac_gat_total_q":
         from src.ValueFunction_standard_masac_gat_total_q import PyTorchChargingValueFunction as StandardMASACTotalQValueFunction
         adp_trainer_module.PyTorchChargingValueFunction = StandardMASACTotalQValueFunction
@@ -222,6 +280,13 @@ def main():
         grid_size=args.grid_size,
         synthetic_demand_profile=args.synthetic_demand_profile,
         synthetic_demand_scale=args.synthetic_demand_scale,
+    )
+    recourse_namespace = (
+        f"rec-{args.recourse_variant}_state-{args.state_variant}_"
+        f"learner-{args.learner_variant}_shift-{args.rejection_logit_shift:g}"
+    )
+    checkpoint_scenario_suffix = "_".join(
+        part for part in (checkpoint_scenario_suffix, recourse_namespace) if part
     )
     print(f"checkpoint_scenario_suffix={checkpoint_scenario_suffix or '<legacy>'}")
     print(
@@ -290,7 +355,15 @@ def main():
                 checkpoint_selection=(
                     args.resume_checkpoint_selection if args.resume else None
                 ),
+                load_checkpoint_assign_tag=(
+                    "gurobi" if args.assignment_gurobi else "heu"
+                ),
                 checkpoint_scenario_suffix=checkpoint_scenario_suffix,
+                recourse_variant=args.recourse_variant,
+                rejection_logit_shift=args.rejection_logit_shift,
+                common_random_numbers=args.common_random_numbers,
+                state_variant=args.state_variant,
+                learner_variant=args.learner_variant,
             )
 
             # Summary output
@@ -323,6 +396,22 @@ def main():
                 print(f"Stats saved to: {results['excel_path']}")
             if results.get("spatial_image_path"):
                 print(f"Spatial plot saved to: {results['spatial_image_path']}")
+            if results.get("excel_path"):
+                manifest_arguments = dict(vars(args))
+                manifest_arguments.update({
+                    "transportation_mode": mode,
+                    "resolved_distribution_mode": zone_distribution_mode,
+                    "checkpoint_scenario_suffix": checkpoint_scenario_suffix,
+                })
+                manifest_path = Path(results["excel_path"]).with_suffix(
+                    ".manifest.json"
+                )
+                write_experiment_manifest(
+                    manifest_path,
+                    arguments=manifest_arguments,
+                    results=results,
+                )
+                print(f"Manifest saved to: {manifest_path}")
 
 
 if __name__ == "__main__":

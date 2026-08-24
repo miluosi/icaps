@@ -23,48 +23,17 @@ from src.NYCEnvironment import NYCEnvironment
 from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
+from src.value_function_registry import (
+    VALUE_FUNCTION_CHOICES,
+    get_value_function_class,
+    validate_value_function_registry,
+)
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.recourse.manifest import write_experiment_manifest
 
 
 def _get_value_function_class(distribution_mode: str):
-    if distribution_mode == "masac_baseline":
-        from src.ValueFunction_masac_baseline import PyTorchChargingValueFunction
-    elif distribution_mode == "st_masac_gat_former2":
-        from src.ValueFunction_st_masac_gat_former2 import PyTorchChargingValueFunction
-    elif distribution_mode in {
-        "st_masac_gat_former2_queue_feature",
-        "st_masac_gat_former2_queue_feature_greedy_alpha",
-        "st_masac_gat_former2_queue_feature_fixed_alpha",
-    }:
-        from src.ValueFunction_st_masac_gat_former2_queue_feature import PyTorchChargingValueFunction
-    elif distribution_mode == "st_masac_gat_post_demand":
-        from src.ValueFunction_st_masac_gat_post_demand import PyTorchChargingValueFunction
-    elif distribution_mode == "st_masac_gat_post_demand_direct":
-        from src.ValueFunction_st_masac_gat_post_demand_direct import PyTorchChargingValueFunction
-    elif distribution_mode == "standard_masac_gat_total_q":
-        from src.ValueFunction_standard_masac_gat_total_q import PyTorchChargingValueFunction
-    elif distribution_mode == "optimization_anchored_residual":
-        from src.ValueFunction_optimization_anchored_residual import PyTorchChargingValueFunction
-    elif distribution_mode in {
-        "standard_masac_gat",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
-        from src.ValueFunction_standard_masac_gat import PyTorchChargingValueFunction
-    elif distribution_mode in {
-        "st_masac_gat",
-        "st_masac_gat_frozen",
-        "st_masac_gat_neighbour_frozen",
-    }:
-        from src.ValueFunction_st_masac_gat import PyTorchChargingValueFunction
-    elif distribution_mode in {"neuradp", "adp_critic", "sac"}:
-        from src.ValueFunction_neuradp import PyTorchChargingValueFunction
-    elif distribution_mode == "elbo":
-        from src.ValueFunction_pytorch_elbo import PyTorchChargingValueFunction
-    elif distribution_mode in {"bayes_simple", "bayes_simple_pretrain", "pretrain_zonepredictor"}:
-        from src.ValueFunction_pytorch_bayessimple import PyTorchChargingValueFunction
-    else:
-        from src.ValueFunction_pytorch_bayes import PyTorchChargingValueFunction
-    return PyTorchChargingValueFunction
+    return get_value_function_class(distribution_mode)
 
 
 def parse_args():
@@ -234,15 +203,7 @@ def parse_args():
         "--distribution-mode",
         type=str,
         default=None,
-        choices=[
-            "bayes",
-            "st_masac_gat",
-            "st_masac_gat_post_demand",
-            "st_masac_gat_post_demand_direct",
-            "st_masac_gat_frozen",
-            "st_masac_gat_neighbour_frozen",
-            "none",
-        ],
+        choices=VALUE_FUNCTION_CHOICES,
         help="ICAPS core NYC value-function mode",
     )
     parser.add_argument(
@@ -271,12 +232,12 @@ def parse_args():
     )
     parser.add_argument(
         "--residual-target-policy",
-        choices=["cached_mcmf"],
-        default="cached_mcmf",
+        choices=["joint_projection"],
+        default="joint_projection",
         help=(
             "Target-action policy for optimization_anchored_residual: "
-            "cached_mcmf evaluates the feasible joint action selected by the "
-            "outer-loop rollout MCMF policy"
+            "joint_projection selects online target actions through the "
+            "serialized feasible graph and evaluates them with target critics"
         ),
     )
     parser.add_argument(
@@ -309,6 +270,18 @@ def parse_args():
         "--common-random-numbers",
         action="store_true",
         help="Use deterministic offer-keyed acceptance uniforms for paired experiments",
+    )
+    parser.add_argument(
+        "--state-variant",
+        choices=STATE_VARIANTS,
+        default="joint_state_separate_critics",
+        help="State visibility and critic-sharing ablation",
+    )
+    parser.add_argument(
+        "--learner-variant",
+        choices=LEARNER_VARIANTS,
+        default="legacy",
+        help="Integrated learner target family",
     )
     parser.add_argument(
         "--pretrained-zone-dir",
@@ -858,11 +831,13 @@ def run_nyc_training(
     post_demand_q_weight: float = 0.0,
     post_demand_head_lr_multiplier: float = 10.0,
     masac_target_entropy_ratio: float = 0.9,
-    residual_target_policy: str = "cached_mcmf",
+    residual_target_policy: str = "joint_projection",
     predictor_variant: str = "p3",
     recourse_variant: str = "legacy",
     rejection_logit_shift: float = 0.0,
     common_random_numbers: bool = False,
+    state_variant: str = "joint_state_separate_critics",
+    learner_variant: str = "legacy",
 ):
     """Compatibility wrapper that delegates NYC training to src.NYCtrainer.NYCTrainer."""
 
@@ -943,11 +918,23 @@ def run_nyc_training(
         recourse_variant=recourse_variant,
         rejection_logit_shift=rejection_logit_shift,
         common_random_numbers=common_random_numbers,
+        state_variant=state_variant,
+        learner_variant=learner_variant,
     )
 
 
 def main():
     args = apply_paper_parameter_preset(parse_args())
+    validate_value_function_registry()
+    if args.recourse_variant != "legacy":
+        invalid_modes = [
+            mode for mode in args.transportation_mode if mode != "evfirst"
+        ]
+        if invalid_modes or args.all_modes:
+            raise ValueError(
+                f"recourse variant {args.recourse_variant} is defined only for "
+                "--transportation-mode evfirst"
+            )
     if args.useauction:
         args.usemcmf = True
     if args.station_capacity_scale is None:
@@ -964,7 +951,25 @@ def main():
             f"{inferred_end_year_month} derived from date range and episodes={args.episodes}"
         )
     args.end_year_month = inferred_end_year_month
-    zone_distribution_mode = args.distribution_mode or "none"
+    zone_distribution_mode = (
+        args.learner_variant
+        if args.learner_variant != "legacy"
+        else (args.distribution_mode or "none")
+    )
+    if args.learner_variant == "integrated_directq" and (
+        args.all_modes
+        or any(mode != "integrated" for mode in args.transportation_mode)
+    ):
+        raise ValueError(
+            "integrated_directq requires --transportation-mode integrated"
+        )
+    experiment_namespace = (
+        f"rec-{args.recourse_variant}_state-{args.state_variant}_"
+        f"learner-{args.learner_variant}_shift-{args.rejection_logit_shift:g}"
+    )
+    args.checkpoint_suffix = "_".join(
+        part for part in (args.checkpoint_suffix, experiment_namespace) if part
+    )
     parquet_desc = args.parquet_path or f"{args.start_year_month}..{args.end_year_month}"
     demand_desc = "yellow+hvfhv_nonshared" if args.full_demand else "yellow_only"
 
@@ -1226,6 +1231,8 @@ def main():
             recourse_variant=args.recourse_variant,
             rejection_logit_shift=args.rejection_logit_shift,
             common_random_numbers=args.common_random_numbers,
+            state_variant=args.state_variant,
+            learner_variant=args.learner_variant,
         )
 
         print(f"\nFinished: {len(results.get('episode_rewards', []))} episodes")
@@ -1250,6 +1257,21 @@ def main():
             )
         if results.get('excel_path'):
             print(f"Stats: {results['excel_path']}")
+            manifest_arguments = dict(vars(args))
+            manifest_arguments["resolved_distribution_mode"] = zone_distribution_mode
+            manifest_path = Path(results["excel_path"]).with_suffix(
+                ".manifest.json"
+            )
+            parquet_paths = getattr(env, "parquet_path", ())
+            if isinstance(parquet_paths, (str, Path)):
+                parquet_paths = [parquet_paths]
+            write_experiment_manifest(
+                manifest_path,
+                arguments=manifest_arguments,
+                results=results,
+                data_paths=parquet_paths or (),
+            )
+            print(f"Manifest: {manifest_path}")
 
 
 if __name__ == "__main__":

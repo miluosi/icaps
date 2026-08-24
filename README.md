@@ -4,7 +4,7 @@ This repository is a compact reproducibility package for an ICAPS study of mixed
 
 The decision problem jointly covers online request assignment, empty-vehicle relocation, state-of-charge feasibility, charging-station capacity and queues, and alternative decision orders for partially controllable and fully controllable vehicles.
 
-This is a standalone project. It does not depend on `/Users/seinzhou/Desktop/adp_trainer`, and it intentionally excludes historical results, checkpoints, logs, notebooks, obsolete Python entry points, and unrelated model variants.
+This is a standalone project. It does not depend on a sibling checkout, and it intentionally excludes historical results, checkpoints, logs, notebooks, obsolete Python entry points, and unrelated model variants.
 
 ## Method overview
 
@@ -136,7 +136,8 @@ See `docs/PROJECT_MANIFEST.md` for the inclusion policy and `docs/MATHEMATICAL_M
 Python 3.11 or 3.12 is recommended.
 
 ```bash
-cd /Users/seinzhou/Desktop/icaps
+git clone <repository-url> icaps
+cd icaps
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -159,6 +160,26 @@ make smoke-adp-heu
 - `smoke-adp-heu` crosses the 64-step replay warm-up and executes real value-network updates from heuristic-assignment transitions.
 
 These commands validate the complete software path; they are not paper-scale experiments.
+
+## Recourse experiments
+
+EV-first runs expose the audit-defined `R0`--`R4` variants. Recourse variants are rejected for integrated and AEV-first execution because those modes do not have the EV-leader/AEV-follower semantics.
+
+```bash
+python run_trainer.py \
+  --episodes 5 \
+  --num-vehicles 20 \
+  --num-ev 10 \
+  --transportation-mode evfirst \
+  --recourse-variant r4 \
+  --learner-variant optimization_anchored_residual \
+  --state-variant joint_state_shared_critic \
+  --common-random-numbers \
+  --assignment-heuristic \
+  --no-mcmf
+```
+
+The corresponding NYC flags are identical. `R0` disables behavioral rejection; `R1` blocks same-epoch repair; `R2` uses only structured follower scores; `R3` learns the follower without coupling its value into the EV target; and `R4` uses the target follower value in the EV leader target. Checkpoint namespaces include the recourse, state, learner, and rejection-stress settings. Each completed CLI run writes a `*.manifest.json` beside its statistics workbook with the resolved arguments, commit, data hashes, replay schema, metric definitions, seed/day rows, and uncertainty summaries. See `config/recourse_experiment.example.json` for the complete configuration template.
 
 ## Synthetic training
 

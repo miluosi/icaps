@@ -1,0 +1,51 @@
+{
+  "experiment": {
+    "name": "nyc_evfirst_r4_joint_state",
+    "commit_sha": "record-at-run-time",
+    "seeds": [11, 23, 37, 53, 71],
+    "train_dates": ["2025-12-01", "2025-12-14"],
+    "test_dates": ["2025-12-15", "2025-12-21"]
+  },
+  "policy": {
+    "transportation_mode": "evfirst",
+    "recourse_variant": "r4",
+    "learner_variant": "optimization_anchored_residual",
+    "state_variant": "joint_state_shared_critic",
+    "planner_backend": "exact_mcmf",
+    "target_planner_backend": "exact_mcmf",
+    "rejection_logit_shift": 0.0,
+    "common_random_numbers": true
+  },
+  "replay": {
+    "schema_version": 1,
+    "capacity_joint": 100000,
+    "capacity_edge": 500000,
+    "sampler": "td_priority_with_rejection_recourse_bonus",
+    "rejection_bonus": 1.0,
+    "recourse_bonus": 1.0,
+    "priority_alpha": 0.6,
+    "importance_beta_start": 0.4,
+    "importance_beta_end": 1.0
+  },
+  "training": {
+    "gamma": 0.95,
+    "within_epoch_gamma": 1.0,
+    "target_tau": 0.005,
+    "batch_size": 256,
+    "gradient_clip_norm": 10.0,
+    "huber_kappa": 1.0,
+    "target_update": "polyak_each_step"
+  },
+  "reporting": {
+    "confidence_interval": 0.95,
+    "paired_by_common_random_numbers": true,
+    "required_artifacts": [
+      "resolved_config",
+      "git_commit",
+      "data_hashes",
+      "replay_schema_version",
+      "checkpoint_hashes",
+      "metric_definitions"
+    ]
+  }
+}

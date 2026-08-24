@@ -253,3 +253,63 @@ $$
 $$
 
 论文比较至少同时报告累计收益、完成订单、服务率、EV/AEV 分组结果、等待时间、拒单/掉线结果以及每个 assignment backend 的运行时间。
+
+## 8. 同一决策时刻内的 recourse
+
+`evfirst` 在一个整数 epoch 内包含两个阶段。EV leader 先从联合可行域
+$\mathcal F_t^{(1)}$ 选择 $A_t^{(1)}$，随后实现每次 offer 的接受结果
+$z_{v,r,t}\in\{0,1\}$。拒单、未出价以及其他剩余请求分别标记为
+`rejected`、`unoffered` 和 `other`，由此构造不可变 residual state
+$s_t^{\mathrm{res}}$。AEV follower 再求解：
+
+$$
+A_t^{(2)}\in\arg\max_{A\in\mathcal F_t^{(2)}(s_t^{\mathrm{res}})}
+\sum_{e\in A}\Psi_e^{(2)}.
+$$
+
+同一 epoch 的 recourse 只由整数 `epoch_id` 判断。AEV assignment、实际 pickup 和最终 completion 是三个独立的恢复结果；pickup/completion 不能反向改变“同轮 assignment recovery”的定义。
+
+每轮训练保存一个不可变联合 transition：
+
+$$
+\mathcal T_t=
+(s_t,G_t^{(1)},A_t^{(1)},z_t,s_t^{\mathrm{res}},
+G_t^{(2)},A_t^{(2)},r_t^{\mathrm{EV}},r_t^{\mathrm{AEV}},s_{t+1}).
+$$
+
+其中 $G_t^{(1)}$ 与 $G_t^{(2)}$ 保存当时的全部可行边、结构化分数、采集分数和资源容量。历史 replay 的编码和 target projection 只能读取这些快照，不能读取当前模拟器的可变图。
+
+## 9. R0--R4 与 solver-consistent target
+
+- `R0`：无 EV 拒单；
+- `R1`：有拒单，但被拒请求不能进入同轮 AEV follower 可行域；
+- `R2`：允许恢复，follower 只使用结构化分数 $g$；
+- `R3`：follower 使用学习分数，但 EV leader target 不包含 follower value；
+- `R4`：follower 使用学习分数，且 EV leader target 与同轮 follower value 耦合。
+
+R4 的 leader target 为：
+
+$$
+y_t^{(1)}=r_t^{\mathrm{EV}}+\gamma_{\mathrm{within}}\,
+V_{\bar\theta}^{(2)}(s_t^{\mathrm{res}}),
+\qquad \gamma_{\mathrm{within}}=1.
+$$
+
+拒单是已观察到的阶段结果，而不是 terminal mask，因此不会把同轮 follower continuation 置零。R3 使用普通的下一 epoch bootstrap，R2 的 follower target 对 residual-network 参数不敏感。
+
+target 动作采用 double-Q 语义：online critic 在序列化可行图上通过与执行相同的联合资源约束选择动作，target critic 只评估已选联合动作：
+
+$$
+\widehat A=\Pi_{\mathcal F(G)}(Q_\theta),
+\qquad
+V_{\bar\theta}(G)=\sum_{e\in\widehat A}Q_{\bar\theta}(e).
+$$
+
+这里的投影同时执行每车至多一项、请求互斥和充电站容量约束。
+
+## 10. Integrated learner 与状态消融
+
+Integrated execution 使用单个联合 replay target，系统收益严格满足
+$r_t^{\mathrm{sys}}=r_t^{\mathrm{EV}}+r_t^{\mathrm{AEV}}$。可选 learner 为 myopic legacy、`integrated_directq` 和 `optimization_anchored_residual`。
+
+状态消融由同一个原始 `SystemSnapshot` 的确定性 mask 得到：joint-state 变体保留两类车状态，fleet-local 变体只把另一类车的字段清零。`shared_critic` 与 `separate_critics` 只控制参数共享；可行动作图、transition ID 和采集到的原始状态保持不变。
