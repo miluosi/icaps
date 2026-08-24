@@ -2586,6 +2586,10 @@ class NYCEnvironment:
         self.recourse_variant = variant
         self.rejection_logit_shift = shift
         self.common_random_numbers = bool(common_random_numbers)
+        if not hasattr(self, "recourse_run_id"):
+            self.recourse_run_id = (
+                f"nyc-seed-{int(getattr(self, '_recourse_experiment_seed', 0) or 0)}"
+            )
 
     def _ensure_recourse_runtime(self) -> None:
         if not hasattr(self, "request_lifecycle"):
@@ -2617,6 +2621,10 @@ class NYCEnvironment:
         )
         key = (
             f"{int(getattr(self, '_recourse_experiment_seed', 0))}|"
+            f"{getattr(self, 'recourse_run_id', '')}|"
+            f"{int(getattr(self, 'cumulative_episode_index', day_index) or 0)}|"
+            f"{int(getattr(self, 'request_generation_seed', 0) or 0)}|"
+            f"{int(getattr(self, 'vehicle_initialization_seed', 0) or 0)}|"
             f"{day_index}|{epoch_id}|{int(vehicle_id)}|{request_id}|"
             f"{attempt_index}"
         ).encode("utf-8")
@@ -2971,7 +2979,10 @@ class NYCEnvironment:
             return False
         self._ensure_recourse_runtime()
         self.request_lifecycle.record_aev_assignment(
-            int(request_id), vehicle_id=int(vehicle_id), epoch_id=epoch_id
+            int(request_id),
+            vehicle_id=int(vehicle_id),
+            epoch_id=epoch_id,
+            vehicle_type=int(vehicle.get('type', 2)),
         )
         recourse_ids = self.ev_rejected_recovered_same_epoch_ids
         is_new = request_id not in recourse_ids
@@ -3073,6 +3084,14 @@ class NYCEnvironment:
                     vehicle['assigned_request'] = None
                     return False
             vehicle['passenger_onboard'] = vehicle['assigned_request']
+            if vehicle['passenger_onboard'] in self.ev_rejected_request_ids:
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_pickup(
+                    int(vehicle['passenger_onboard']),
+                    vehicle_id=int(vehicle_id),
+                    epoch_id=self._epoch_id(),
+                    vehicle_type=int(vehicle.get('type', 1)),
+                )
             if (
                 vehicle.get('type') == 2
                 and vehicle['passenger_onboard'] in self.ev_rejected_request_ids
@@ -3081,12 +3100,6 @@ class NYCEnvironment:
             ):
                 rejected_request_id = vehicle['passenger_onboard']
                 self.ev_rejected_picked_up_by_aev_ids.add(rejected_request_id)
-                self._ensure_recourse_runtime()
-                self.request_lifecycle.record_pickup(
-                    rejected_request_id,
-                    vehicle_id=int(vehicle_id),
-                    epoch_id=self._epoch_id(),
-                )
                 rejected_at = float(
                     self.ev_rejection_times.get(
                         rejected_request_id,
@@ -3131,7 +3144,10 @@ class NYCEnvironment:
                 self.ev_rejected_completed_ids.add(completed.request_id)
                 self._ensure_recourse_runtime()
                 self.request_lifecycle.record_completion(
-                    completed.request_id, epoch_id=self._epoch_id()
+                    completed.request_id,
+                    epoch_id=self._epoch_id(),
+                    vehicle_id=int(vehicle_id),
+                    vehicle_type=int(vehicle.get('type', 1)),
                 )
             if vehicle['type'] == 1:
                 self.completed_requests_ev.append(completed)
@@ -5331,6 +5347,25 @@ class NYCEnvironment:
         )
         if transition is None:
             return None
+        if self.value_function is not None and self.value_function_ev is not None:
+            for value_function in {
+                id(self.value_function): self.value_function,
+                id(self.value_function_ev): self.value_function_ev,
+            }.values():
+                router = getattr(value_function, "set_joint_critic_router", None)
+                if callable(router):
+                    router(
+                        ev_value_function=self.value_function_ev,
+                        aev_value_function=self.value_function,
+                    )
+            follower_setter = getattr(
+                self.value_function_ev, "set_follower_target_provider", None
+            )
+            follower_provider = getattr(
+                self.value_function, "target_components_for_graph", None
+            )
+            if callable(follower_setter) and callable(follower_provider):
+                follower_setter(follower_provider)
         for action in self._pending_recourse_actions.values():
             action.metadata.next_state_snapshot = transition.next_state
             action.metadata.extras.setdefault(
@@ -5959,19 +5994,10 @@ class NYCEnvironment:
         return mat
 
     def generate_vehicle_wait(self, vehicle_ids, rebalance_num=0):
+        """Return the real stationary/outside action for every row."""
 
-        carindex = self.findchargerange_c(rebalance_num)
-        vehicle_wait = np.zeros((len(vehicle_ids), 1))
-        
-        for i, vehicle_id in enumerate(vehicle_ids):
-            if self.vehicles[vehicle_id]['type'] == 1:
-                vehicle_wait[i][0] = 1  
-            else:
-                if carindex[vehicle_id] <= 0:
-                    vehicle_wait[i][0] = 1  # 附近没有充电容量，可以等待
-                else:
-                    vehicle_wait[i][0] = 0  # 附近有充电容量，不应该等待
-        return vehicle_wait
+        del rebalance_num
+        return np.ones((len(vehicle_ids), 1), dtype=np.float32)
 
     def _active_gat_neighbour_number(self) -> int:
         neighbour_numbers = []
@@ -7131,6 +7157,24 @@ class NYCEnvironment:
             ),
             'recovery_rate_completion': float(
                 lifecycle_metrics['recovery_rate_completion']
+            ),
+            'eligible_rejected_residual_count': int(
+                lifecycle_metrics['eligible_rejected_residual_count']
+            ),
+            'conditional_recovery_rate_assignment': float(
+                lifecycle_metrics['conditional_recovery_rate_assignment']
+            ),
+            'conditional_recovery_rate_pickup': float(
+                lifecycle_metrics['conditional_recovery_rate_pickup']
+            ),
+            'conditional_recovery_rate_completion': float(
+                lifecycle_metrics['conditional_recovery_rate_completion']
+            ),
+            'later_aev_rescue_count': int(
+                lifecycle_metrics['later_aev_rescue_count']
+            ),
+            'later_ev_completion_count': int(
+                lifecycle_metrics['later_ev_completion_count']
             ),
             'aev_pickup_after_rejection_count': int(
                 lifecycle_metrics['aev_pickup_after_rejection_count']

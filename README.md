@@ -61,7 +61,7 @@ A_t^{\star}
 \Psi_{k,a,t}.
 $$
 
-The feasible set enforces at most one action per vehicle, at most one vehicle per request, charging capacity, queue admission limits, and battery feasibility. Exact ILP, exact MCMF, auction, and heuristic backends operate on the same edge-score interface.
+The feasible set enforces exactly one real action (including WAIT/continuation) per represented vehicle, at most one vehicle per request, charging capacity, queue admission limits, and battery feasibility. Exact ILP, exact MCMF, auction, and heuristic backends operate on the same edge-score interface.
 
 ## Strategy semantics
 
@@ -179,7 +179,7 @@ python run_trainer.py \
   --no-mcmf
 ```
 
-The corresponding NYC flags are identical. `R0` disables behavioral rejection; `R1` blocks same-epoch repair; `R2` uses only structured follower scores; `R3` learns the follower without coupling its value into the EV target; and `R4` uses the target follower value in the EV leader target. Checkpoint namespaces include the recourse, state, learner, and rejection-stress settings. Each completed CLI run writes a `*.manifest.json` beside its statistics workbook with the resolved arguments, commit, data hashes, replay schema, metric definitions, seed/day rows, and uncertainty summaries. See `config/recourse_experiment.example.json` for the complete configuration template.
+The corresponding NYC flags are identical. `R0` disables behavioral rejection; `R1` blocks same-epoch repair; `R2` uses only structured follower scores; `R3` learns the follower without coupling its value into the EV target; and `R4` uses the full structured-plus-correction AEV target value in the EV leader target. Checkpoint namespaces include the recourse, state, learner, and rejection-stress settings. `--checkpoint-replay {none,recent,full}` controls replay persistence (`recent` stores the newest 5,000 transitions by default). Replay/checkpoint files use Python pickle through `torch.save`/`pickle`; load only artifacts created by a trusted local run. Each completed CLI run writes a `*.manifest.json` beside its statistics workbook with the resolved arguments, commit, data/checkpoint hashes, effective model and replay hyperparameters, seed-clustered uncertainty, and runtime metadata. `config/recourse_experiment.example.json` is a documentation template, not a runner input; the CLI arguments and generated manifest are the executable and resolved configuration sources.
 
 ## Synthetic training
 

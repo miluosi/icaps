@@ -17,7 +17,7 @@
     "common_random_numbers": true
   },
   "replay": {
-    "schema_version": 1,
+    "schema_version": 2,
     "capacity_joint": 100000,
     "capacity_edge": 500000,
     "sampler": "td_priority_with_rejection_recourse_bonus",
@@ -25,7 +25,9 @@
     "recourse_bonus": 1.0,
     "priority_alpha": 0.6,
     "importance_beta_start": 0.4,
-    "importance_beta_end": 1.0
+    "importance_beta_end": 1.0,
+    "checkpoint_replay": "recent",
+    "checkpoint_replay_recent": 5000
   },
   "training": {
     "gamma": 0.95,

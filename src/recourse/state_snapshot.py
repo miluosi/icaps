@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any, Mapping
-import uuid
 
 import numpy as np
 
@@ -38,33 +37,63 @@ class StateSnapshotBuilder:
             VehicleSnapshot.from_vehicle(vehicle_id, vehicle)
             for vehicle_id, vehicle in sorted(getattr(env, "vehicles", {}).items())
         )
-        requests = tuple(
-            RequestSnapshot.from_request(request)
-            for _, request in sorted(
-                getattr(env, "active_requests", {}).items(),
-                key=lambda item: int(item[0]),
-            )
-        )
-        station_rows = []
-        stations = getattr(getattr(env, "charging_manager", None), "stations", {})
-        for station_id, station in sorted(stations.items()):
-            station_rows.append(
-                StationSnapshot(
-                    station_id=int(station_id),
-                    location=int(getattr(station, "location", 0)),
-                    capacity=int(getattr(station, "max_capacity", 0) or 0),
-                    occupied=len(getattr(station, "current_vehicles", ()) or ()),
-                    inbound=len(
-                        getattr(station, "charging_queue_notarrived", ()) or ()
-                    ),
-                    queued=len(getattr(station, "charging_queue", ()) or ()),
-                )
-            )
-        zones = list(
+        zone_candidates = list(
             getattr(env, "aux_zone_ids", ())
             or getattr(env, "relocation_target_ids", ())
             or sorted(getattr(env, "zone_coords", {}).keys())
         )
+        requests = []
+        for _, request in sorted(
+            getattr(env, "active_requests", {}).items(),
+            key=lambda item: int(item[0]),
+        ):
+            snapshot = RequestSnapshot.from_request(request)
+            requests.append(
+                replace(
+                    snapshot,
+                    pickup_zone_id=_zone_for_location(
+                        env, snapshot.pickup, zone_candidates
+                    ),
+                )
+            )
+        station_rows = []
+        stations = getattr(getattr(env, "charging_manager", None), "stations", {})
+        for station_id, station in sorted(stations.items()):
+            occupied = len(getattr(station, "current_vehicles", ()) or ())
+            inbound = len(
+                getattr(station, "charging_queue_notarrived", ()) or ()
+            )
+            queued = len(getattr(station, "charging_queue", ()) or ())
+            physical_capacity = int(
+                getattr(station, "max_capacity", 0) or 0
+            )
+            queue_capacity = max(
+                0, int(getattr(env, "station_queue_capacity", 0) or 0)
+            )
+            reserve_inbound = bool(
+                getattr(env, "reserve_inbound_charging_capacity", False)
+            )
+            reserved = occupied + (
+                inbound + queued if reserve_inbound else 0
+            )
+            remaining = max(
+                0, physical_capacity + queue_capacity - reserved
+            )
+            station_rows.append(
+                StationSnapshot(
+                    station_id=int(station_id),
+                    location=int(getattr(station, "location", 0)),
+                    capacity=physical_capacity,
+                    occupied=occupied,
+                    inbound=inbound,
+                    queued=queued,
+                    physical_capacity=physical_capacity,
+                    queue_admission_capacity=queue_capacity,
+                    reserve_inbound_capacity=reserve_inbound,
+                    remaining_admission_capacity=remaining,
+                )
+            )
+        zones = zone_candidates
         if not zones:
             zones = list(range(max(1, int(getattr(env, "NUM_LOCATIONS", 1)))))
         day_id = ""
@@ -83,7 +112,7 @@ class StateSnapshotBuilder:
             current_time=float(getattr(env, "current_time", 0.0)),
             zone_ids=tuple(int(zone) for zone in zones),
             vehicles=vehicles,
-            requests=requests,
+            requests=tuple(requests),
             stations=tuple(station_rows),
             request_labels=tuple(
                 sorted((int(key), str(value)) for key, value in (request_labels or {}).items())
@@ -119,6 +148,17 @@ class StateSnapshotBuilder:
         for row, vehicle_id in enumerate(vehicle_ids):
             vehicle = vehicle_map[int(vehicle_id)]
             feasible_columns = np.flatnonzero(np.asarray(action_matrix[row]) > 0)
+            if vehicle.vehicle_type == 1 and num_stations + num_zones > 0:
+                final_column = int(action_matrix.shape[1]) - 1
+                feasible_columns = np.asarray(
+                    [
+                        column
+                        for column in feasible_columns
+                        if int(column) < num_requests
+                        or int(column) == final_column
+                    ],
+                    dtype=np.int64,
+                )
             for column in feasible_columns:
                 column = int(column)
                 request_id = None
@@ -135,6 +175,9 @@ class StateSnapshotBuilder:
                 target_zoneid = 0
                 post_zoneid = 0
                 queue_features: tuple[float, ...] = ()
+                edge_metadata: tuple[
+                    tuple[str, float | int | str | bool | None], ...
+                ] = ()
 
                 if column < num_requests:
                     if column >= len(request_ids) or request_ids[column] not in request_map:
@@ -153,7 +196,13 @@ class StateSnapshotBuilder:
                         else _distance(env, request.pickup, request.dropoff)
                     )
                     post_distance = target_distance + float(trip_distance)
-                    post_duration = request.travel_time
+                    pickup_duration = _travel_time(
+                        env, vehicle.location, request.pickup
+                    )
+                    trip_duration = _travel_time(
+                        env, request.pickup, request.dropoff
+                    )
+                    post_duration = pickup_duration + trip_duration
                     resource_type = "request"
                     resource_id = request_id
                 elif column < num_requests + num_stations:
@@ -170,12 +219,16 @@ class StateSnapshotBuilder:
                     post_location = station.location
                     target_distance = _distance(env, vehicle.location, station.location)
                     post_distance = target_distance
-                    post_duration = float(getattr(env, "charge_duration", 1.0))
+                    station_travel_duration = _travel_time(
+                        env, vehicle.location, station.location
+                    )
+                    post_duration = station_travel_duration + float(
+                        getattr(env, "charge_duration", 1.0)
+                    )
                     resource_type = "station"
                     resource_id = station_id
-                    resource_capacity = max(
-                        0,
-                        station.capacity - station.occupied - station.inbound,
+                    resource_capacity = int(
+                        station.remaining_admission_capacity
                     )
                 elif column < num_requests + num_stations + num_zones:
                     local_column = column - num_requests - num_stations
@@ -188,9 +241,27 @@ class StateSnapshotBuilder:
                     target_distance = _distance(env, vehicle.location, target_location)
                     post_distance = target_distance
                     post_duration = _travel_time(env, vehicle.location, target_location)
+                    edge_metadata = (("zone_index", local_column),)
                 else:
-                    action_type = ActionType.WAIT
-                    action_id = "wait"
+                    if vehicle.vehicle_type == 1:
+                        target_location = int(
+                            getattr(env, "_ev_default_relocation_targets", {}).get(
+                                int(vehicle_id), vehicle.location
+                            )
+                        )
+                        post_location = target_location
+                        target_distance = _distance(
+                            env, vehicle.location, target_location
+                        )
+                        post_distance = target_distance
+                        post_duration = _travel_time(
+                            env, vehicle.location, target_location
+                        )
+                        action_type = ActionType.RELOCATE
+                        action_id = f"reloc_{target_location}"
+                    else:
+                        action_type = ActionType.WAIT
+                        action_id = "wait"
 
                 zone_fn = getattr(env, "get_zone_embedding_id", None)
                 if callable(zone_fn):
@@ -218,7 +289,7 @@ class StateSnapshotBuilder:
                                 vehicle_location=vehicle.location,
                                 current_time=state.current_time,
                                 num_requests=float(len(state.requests)),
-                                travel_duration=post_duration,
+                                travel_duration=station_travel_duration,
                             )
                         )
                     except (TypeError, ValueError, RuntimeError):
@@ -247,8 +318,17 @@ class StateSnapshotBuilder:
                         target_zoneid=target_zoneid,
                         post_action_zoneid=post_zoneid,
                         queue_features=queue_features,
+                        metadata=edge_metadata,
                     )
                 )
+        cls._append_continuing_edges(
+            env,
+            state,
+            edges,
+            matrix_vehicle_ids={int(vehicle_id) for vehicle_id in vehicle_ids},
+            stage_id=int(stage_id),
+        )
+
         # Post-demand predictors use mutable active-request counts.  Evaluate
         # them once at collection and persist the scalar on every edge so a
         # replayed graph never consults the later live environment.
@@ -264,13 +344,21 @@ class StateSnapshotBuilder:
         for value_function, indices in predictor_groups.values():
             predictor = value_function.predict_post_action_demand
             try:
+                serialized_zones = list(state.zone_ids)
+                edge_zones = {
+                    index: _zone_for_location(
+                        env,
+                        edges[index].post_action_location,
+                        serialized_zones,
+                    )
+                    for index in indices
+                }
                 zone_demand = {
                     zone_id: sum(
-                        int(request.pickup == zone_id) for request in state.requests
+                        int(request.pickup_zone_id == zone_id)
+                        for request in state.requests
                     )
-                    for zone_id in {
-                        edges[index].post_action_location for index in indices
-                    }
+                    for zone_id in set(edge_zones.values())
                 }
                 predictions = predictor(
                     current_times=[state.current_time for _ in indices],
@@ -282,7 +370,7 @@ class StateSnapshotBuilder:
                     ],
                     num_requests=[float(len(state.requests)) for _ in indices],
                     current_zone_demands=[
-                        float(zone_demand[edges[index].post_action_location])
+                        float(zone_demand[edge_zones[index]])
                         for index in indices
                     ],
                     snapshot_available=[1.0 for _ in indices],
@@ -296,8 +384,15 @@ class StateSnapshotBuilder:
                 # the explicit ``None`` marker; they are never silently fed a
                 # value calculated from a future mutable state.
                 pass
+        pending = getattr(
+            getattr(env, "recourse_coordinator", None), "pending", None
+        )
+        base_graph_id = (
+            getattr(pending, "transition_id", None)
+            or f"{getattr(env, 'recourse_run_id', 'run')}:{state.epoch_id}"
+        )
         return FeasibleGraphSnapshot(
-            graph_id=str(uuid.uuid4()),
+            graph_id=f"{base_graph_id}:graph:{int(stage_id)}",
             epoch_id=state.epoch_id,
             stage_id=int(stage_id),
             solver_backend=str(solver_backend),
@@ -315,6 +410,7 @@ class StateSnapshotBuilder:
             target_request_id = getattr(target, "request_id", None)
             target_station_id = None
             target_location = None
+            target_zone_index = None
             text = str(target)
             if isinstance(target, str) and target.startswith("charge_"):
                 try:
@@ -323,7 +419,12 @@ class StateSnapshotBuilder:
                     pass
             if isinstance(target, str) and target.startswith("idle_at_"):
                 try:
-                    target_location = int(target.split("_", 2)[2])
+                    target_zone_index = int(target.split("_", 2)[2])
+                except ValueError:
+                    pass
+            if isinstance(target, str) and target.startswith("reloc_to_"):
+                try:
+                    target_location = int(target.rsplit("_", 1)[1])
                 except ValueError:
                     pass
             candidates = [edge for edge in graph.edges if edge.vehicle_id == int(vehicle_id)]
@@ -336,6 +437,14 @@ class StateSnapshotBuilder:
                     match = edge
                     break
                 if (
+                    target_zone_index is not None
+                    and edge.action_type == ActionType.RELOCATE
+                    and dict(edge.metadata).get("zone_index")
+                    == target_zone_index
+                ):
+                    match = edge
+                    break
+                if (
                     target_location is not None
                     and edge.action_type == ActionType.RELOCATE
                     and edge.target_location == target_location
@@ -345,20 +454,97 @@ class StateSnapshotBuilder:
                 if target is None and edge.action_type == ActionType.WAIT:
                     match = edge
                     break
-                if isinstance(target, str) and target in {"waiting", "reloc"} and edge.action_type == ActionType.WAIT:
+                if isinstance(target, str) and target == "waiting" and edge.action_type == ActionType.WAIT:
                     match = edge
                     break
-            if match is None and candidates:
-                # The execution code sometimes turns a generic relocation token
-                # into a concrete target after solving.  Its outside-option edge
-                # is still the correct selected graph edge.
-                match = next(
-                    (edge for edge in candidates if edge.action_type == ActionType.WAIT),
-                    None,
+                if isinstance(target, str) and target == "reloc" and edge.action_type == ActionType.RELOCATE:
+                    match = edge
+                    break
+            if match is None:
+                raise AssertionError(
+                    f"executed assignment for vehicle {vehicle_id} cannot be "
+                    f"mapped to its serialized graph edge: {target!r}"
                 )
-            if match is not None:
-                selected.append(match.edge_id)
+            selected.append(match.edge_id)
+        for edge in graph.edges:
+            if bool(dict(edge.metadata).get("continuing", False)):
+                selected.append(edge.edge_id)
         return tuple(selected)
+
+    @staticmethod
+    def _append_continuing_edges(
+        env: Any,
+        state: SystemSnapshot,
+        edges: list[FeasibleEdgeSnapshot],
+        *,
+        matrix_vehicle_ids: set[int],
+        stage_id: int,
+    ) -> None:
+        mode = str(dict(state.exogenous_context).get("decision_mode", "integrated"))
+        if mode == "integrated":
+            fleet_types = {1, 2}
+        elif mode in {"evfirst", "ev_first"}:
+            fleet_types = {1} if stage_id == 1 else {2}
+        elif mode in {"aevfirst", "aev_first"}:
+            fleet_types = {2} if stage_id == 1 else {1}
+        else:
+            fleet_types = {1, 2}
+        for vehicle in state.vehicles:
+            if (
+                not vehicle.online
+                or vehicle.vehicle_type not in fleet_types
+                or vehicle.vehicle_id in matrix_vehicle_ids
+            ):
+                continue
+            request_id = (
+                vehicle.assigned_request
+                if vehicle.assigned_request is not None
+                else vehicle.passenger_onboard
+            )
+            station_id = (
+                vehicle.charging_station
+                if vehicle.charging_station is not None
+                else vehicle.charging_target
+            )
+            target = (
+                vehicle.target_location
+                if vehicle.target_location is not None
+                else vehicle.location
+            )
+            if request_id is not None:
+                action_type = ActionType.SERVICE
+                action_id = f"assign_{request_id}:continue"
+            elif station_id is not None:
+                action_type = ActionType.CHARGE
+                action_id = f"charge_{station_id}:continue"
+            elif vehicle.target_location is not None:
+                action_type = ActionType.RELOCATE
+                action_id = f"reloc_{target}:continue"
+            else:
+                action_type = ActionType.WAIT
+                action_id = "continue_wait"
+            distance = _distance(env, vehicle.location, target)
+            edges.append(
+                FeasibleEdgeSnapshot(
+                    edge_id=(
+                        f"{stage_id}:{vehicle.vehicle_id}:continue:{action_id}"
+                    ),
+                    vehicle_id=vehicle.vehicle_id,
+                    vehicle_type=vehicle.vehicle_type,
+                    action_type=action_type,
+                    action_id=action_id,
+                    target_location=int(target),
+                    post_action_location=int(target),
+                    request_id=request_id,
+                    station_id=station_id,
+                    structured_score=0.0,
+                    collection_score=0.0,
+                    target_distance=float(distance),
+                    post_action_distance=float(distance),
+                    post_action_duration=1.0,
+                    metadata=(("continuing", True),),
+                )
+            )
 
 
 def _distance(env: Any, origin: int, destination: int) -> float:
@@ -373,6 +559,29 @@ def _distance(env: Any, origin: int, destination: int) -> float:
     ox, oy = int(origin) % grid_size, int(origin) // grid_size
     dx, dy = int(destination) % grid_size, int(destination) // grid_size
     return float(abs(ox - dx) + abs(oy - dy))
+
+
+def _zone_for_location(
+    env: Any,
+    location: int,
+    zone_candidates: list[int],
+) -> int:
+    location = int(location)
+    if location in zone_candidates:
+        return location
+    for name in ("get_zone_id", "get_distribution_zone_index"):
+        fn = getattr(env, name, None)
+        if not callable(fn):
+            continue
+        try:
+            zone = int(fn(location))
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        if zone in zone_candidates:
+            return zone
+        if 0 <= zone < len(zone_candidates):
+            return int(zone_candidates[zone])
+    return location
 
 
 def _value_function_for_vehicle(env: Any, vehicle_type: int) -> Any | None:

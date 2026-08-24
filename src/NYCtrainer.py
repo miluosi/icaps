@@ -11,6 +11,7 @@ import torch
 from src.ADPtrainer import ADPTrainer
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import aggregate_wait_metrics
+from src.recourse.critics import enforce_critic_identity, uses_shared_critic
 
 
 class NYCTrainer:
@@ -765,6 +766,8 @@ class NYCTrainer:
         use_intense_requests: bool,
         assignmentgurobi: bool,
         batch_size: int,
+        checkpoint_replay: str = "recent",
+        checkpoint_replay_recent: int = 5_000,
         num_vehicles: int,
         num_ev: int,
         heuristic_battery_threshold: float,
@@ -906,6 +909,7 @@ class NYCTrainer:
         env.evaluatemode = not trainnetwork
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
+        shared_critic = uses_shared_critic(state_variant)
 
         effective_zone_distribution_mode = self._resolve_zone_distribution_mode(zone_distribution_mode)
         print(f"Path transformer self-attention: {'enabled' if iftransformer else 'disabled'}")
@@ -975,17 +979,29 @@ class NYCTrainer:
                 value_function_kwargs["predictor_variant"] = str(predictor_variant)
             value_function = value_function_class(**value_function_kwargs)
             value_function_ev = value_function_class(**value_function_kwargs)
-            if str(state_variant) in {
-                "joint_state_shared_critic",
-                "fleet_local_shared_critic",
-            } and not ifloadcheckpoint:
-                value_function_ev = value_function
+            value_function, value_function_ev = enforce_critic_identity(
+                value_function,
+                value_function_ev,
+                state_variant=state_variant,
+            )
             for current_value_function in {
                 id(value_function): value_function,
                 id(value_function_ev): value_function_ev,
             }.values():
                 current_value_function.state_variant = str(state_variant)
                 current_value_function.learner_variant = str(learner_variant)
+                current_value_function.recourse_variant = str(recourse_variant)
+                if hasattr(current_value_function, "joint_replay_buffer"):
+                    if checkpoint_replay not in {"none", "recent", "full"}:
+                        raise ValueError(
+                            "checkpoint_replay must be none, recent, or full"
+                        )
+                    current_value_function.checkpoint_replay = str(
+                        checkpoint_replay
+                    )
+                    current_value_function.checkpoint_replay_recent = max(
+                        1, int(checkpoint_replay_recent)
+                    )
             value_function.debug_name = "AEV"
             value_function_ev.debug_name = "EV"
             env.set_value_function(value_function)
@@ -1041,16 +1057,29 @@ class NYCTrainer:
             prefer_best_checkpoint = checkpoint_selection == "best_reward"
             prefer_best_loss_checkpoint = checkpoint_selection == "best_loss"
             print(f"   Checkpoint selection: {checkpoint_selection}")
-            ev_ckpt = self._trainer_helper.find_latest_checkpoint(
-                evfile,
-                prefer_best=prefer_best_checkpoint,
-                prefer_best_loss=prefer_best_loss_checkpoint,
-            )
-            aev_ckpt = self._trainer_helper.find_latest_checkpoint(
-                aevfile,
-                prefer_best=prefer_best_checkpoint,
-                prefer_best_loss=prefer_best_loss_checkpoint,
-            )
+            if prefer_best_loss_checkpoint:
+                ev_ckpt = self._trainer_helper.find_latest_checkpoint(
+                    evfile, prefer_best_loss=True
+                )
+                aev_ckpt = self._trainer_helper.find_latest_checkpoint(
+                    aevfile, prefer_best_loss=True
+                )
+                if ev_ckpt and aev_ckpt:
+                    ev_identity = self._trainer_helper._checkpoint_identity(ev_ckpt)
+                    aev_identity = self._trainer_helper._checkpoint_identity(aev_ckpt)
+                    if (
+                        ev_identity.get("episode") != aev_identity.get("episode")
+                        or ev_identity.get("pair_id") != aev_identity.get("pair_id")
+                    ):
+                        raise ValueError(
+                            "NYC best-loss EV/AEV checkpoints are not a paired save"
+                        )
+            else:
+                ev_ckpt, aev_ckpt = self._trainer_helper.find_checkpoint_pair(
+                    evfile,
+                    aevfile,
+                    prefer_best=prefer_best_checkpoint,
+                )
             print(f"   AEV checkpoint: {aev_ckpt or 'Not Found'}")
             print(f"   EV  checkpoint: {ev_ckpt or 'Not Found'}")
             missing_checkpoints = []
@@ -1067,9 +1096,24 @@ class NYCTrainer:
                     raise FileNotFoundError(message)
                 print(f"⚠ {message}; continuing with newly initialized network(s).")
             if aev_ckpt:
-                self._trainer_helper.load_checkpoint(value_function, aev_ckpt)
-            if ev_ckpt:
-                self._trainer_helper.load_checkpoint(value_function_ev, ev_ckpt)
+                if not self._trainer_helper.load_checkpoint(
+                    value_function, aev_ckpt
+                ):
+                    raise RuntimeError(
+                        "NYC AEV checkpoint load failed configuration validation"
+                    )
+            if ev_ckpt and not shared_critic:
+                if not self._trainer_helper.load_checkpoint(
+                    value_function_ev, ev_ckpt
+                ):
+                    raise RuntimeError(
+                        "NYC EV checkpoint load failed configuration validation"
+                    )
+            elif ev_ckpt and shared_critic:
+                print(
+                    "Shared-critic variant: loaded the verified canonical AEV "
+                    "checkpoint once"
+                )
 
         if effective_zone_distribution_mode == "bayes_simple_pretrain" and value_function is not None:
             self._configure_pretrained_zone_distributors(
@@ -1158,6 +1202,8 @@ class NYCTrainer:
         global_step = 0
         combined_best_loss = float("inf")
         for episode in range(num_episodes):
+            env.cumulative_episode_index = int(episode)
+            env.recourse_run_id = f"nyc-seed-{int(random_seed)}"
             episode_start = time.time()
             episode_seed = 32 + episode
             env.set_request_generation_seed(episode_seed)

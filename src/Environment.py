@@ -2384,6 +2384,10 @@ class ChargingIntegratedEnvironment(Environment):
         self.recourse_variant = variant
         self.rejection_logit_shift = shift
         self.common_random_numbers = bool(common_random_numbers)
+        if not hasattr(self, "recourse_run_id"):
+            self.recourse_run_id = (
+                f"synthetic-seed-{int(getattr(self, 'initial_random_seed', 0) or 0)}"
+            )
 
     def _ensure_recourse_runtime(self) -> None:
         if not hasattr(self, "request_lifecycle"):
@@ -2415,7 +2419,12 @@ class ChargingIntegratedEnvironment(Environment):
         )
         key = (
             f"{int(getattr(self, 'initial_random_seed', 0) or 0)}|"
-            f"{int(getattr(self, 'episode_start_day', 0) or 0)}|{epoch_id}|"
+            f"{getattr(self, 'recourse_run_id', '')}|"
+            f"{int(getattr(self, 'cumulative_episode_index', 0) or 0)}|"
+            f"{int(getattr(self, 'episode_start_day', 0) or 0)}|"
+            f"{int(getattr(self, 'request_generation_seed', 0) or 0)}|"
+            f"{int(getattr(self, 'vehicle_initialization_seed', 0) or 0)}|"
+            f"{epoch_id}|"
             f"{int(vehicle_id)}|{request_id}|{attempt_index}"
         ).encode("utf-8")
         digest = hashlib.blake2b(key, digest_size=8).digest()
@@ -2492,6 +2501,25 @@ class ChargingIntegratedEnvironment(Environment):
         )
         if transition is None:
             return None
+        if self.value_function is not None and self.value_function_ev is not None:
+            for value_function in {
+                id(self.value_function): self.value_function,
+                id(self.value_function_ev): self.value_function_ev,
+            }.values():
+                router = getattr(value_function, "set_joint_critic_router", None)
+                if callable(router):
+                    router(
+                        ev_value_function=self.value_function_ev,
+                        aev_value_function=self.value_function,
+                    )
+            follower_setter = getattr(
+                self.value_function_ev, "set_follower_target_provider", None
+            )
+            follower_provider = getattr(
+                self.value_function, "target_components_for_graph", None
+            )
+            if callable(follower_setter) and callable(follower_provider):
+                follower_setter(follower_provider)
         for action in self._pending_recourse_actions.values():
             action.metadata.next_state_snapshot = transition.next_state
         seen = set()
@@ -2949,6 +2977,7 @@ class ChargingIntegratedEnvironment(Environment):
             int(request_id),
             vehicle_id=int(vehicle_id),
             epoch_id=self._epoch_id(),
+            vehicle_type=int(vehicle.get('type', 2)),
         )
         return is_new
 
@@ -3065,6 +3094,7 @@ class ChargingIntegratedEnvironment(Environment):
                         int(request_id),
                         vehicle_id=int(vehicle_id),
                         epoch_id=self._epoch_id(),
+                        vehicle_type=int(vehicle.get('type', 2)),
                     )
                 if vehicle['type'] == 1:
                     self._clear_ev_charge_trigger(vehicle_id)
@@ -3376,6 +3406,7 @@ class ChargingIntegratedEnvironment(Environment):
                         int(request_id),
                         vehicle_id=int(vehicle_id),
                         epoch_id=self._epoch_id(),
+                        vehicle_type=int(vehicle.get('type', 1)),
                     )
                     vehicle['assigned_request'] = None
                     if self.current_time % 25 == 0 or self.current_time > request.pickup_deadline:
@@ -3494,6 +3525,8 @@ class ChargingIntegratedEnvironment(Environment):
                 self.request_lifecycle.record_completion(
                     completed_request_id,
                     epoch_id=self._epoch_id(),
+                    vehicle_id=int(vehicle_id),
+                    vehicle_type=int(vehicle.get('type', 1)),
                 )
                 
                 earnings = completed_request.final_value
@@ -4270,36 +4303,18 @@ class ChargingIntegratedEnvironment(Environment):
             
     def generate_vehicle_wait(self, vehicle_ids,rebalance_num = 0):
         """
-        计算车辆是否可以执行等待动作
-        
-        
-        
-        
-        
-        Normal idle vehicles may always wait.  Only a critically depleted AEV
-        with reachable charging capacity is prevented from waiting.  The old
-        rule made every available charging slot disable waiting, which forced
-        myopic MCMF to send healthy AEVs to charge.
+        Return the physical stationary outside action for every vehicle.
+
+        Charging urgency belongs in the structured score, not feasibility.
+        Keeping a real wait/outside edge makes the rollout flow and target
+        MILP feasible under shared charging-capacity competition.
         
         Returns:
             vehicle_wait: shape (len(vehicle_ids), 1)
-                         1 means waiting is feasible; 0 means a critically
-                         depleted AEV must use reachable charging capacity.
+                         1 means the stationary/outside action is feasible.
         """
-        carindex = self.findchargerange_c(rebalance_num)
-        vehicle_wait = np.zeros((len(vehicle_ids), 1))
-        
-        for i, vehicle_id in enumerate(vehicle_ids):
-            if self.vehicles[vehicle_id]['type'] == 1:
-                vehicle_wait[i][0] = 1  
-            else:
-                battery = float(self.vehicles[vehicle_id].get('battery', 0.0))
-                must_charge = (
-                    battery <= self.critical_charging_battery
-                    and carindex.get(vehicle_id, 0) > 0
-                )
-                vehicle_wait[i][0] = 0 if must_charge else 1
-        return vehicle_wait
+        del rebalance_num
+        return np.ones((len(vehicle_ids), 1), dtype=np.float32)
             
     def generate_whole_matrix(self, vehicle_ids,rebalance_num = 0,onlyev = False):
         """

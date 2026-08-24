@@ -13,7 +13,7 @@ from src.recourse.metrics import summarize_metric_with_uncertainty
 from src.recourse.manifest import write_experiment_manifest
 from src.recourse.replay import PrioritizedJointReplayBuffer
 from src.recourse.state_snapshot import StateSnapshotBuilder
-from src.recourse.target_builder import RecourseTargetBuilder
+from src.recourse.target_builder import RecourseTargetBuilder, TargetComponents
 from src.recourse.types import (
     ActionType,
     FeasibleEdgeSnapshot,
@@ -338,9 +338,11 @@ def test_terminal_edge_replay_retains_r4_within_epoch_follower_value():
     value_function.device = torch.device("cpu")
     value_function.target_network = None
     value_function.target_critic2 = None
-    value_function._solver_consistent_residual_value = lambda graph: (
-        torch.tensor(7.0),
+    value_function._follower_target_provider = lambda graph, **kwargs: TargetComponents(
         ("aev-edge",),
+        online_full_value=7.0,
+        target_structured_value=5.0,
+        target_correction_value=2.0,
     )
     value_function._last_actor_loss_tensor = torch.tensor(0.0)
     value_function._last_alpha_term_tensor = torch.tensor(0.0)
@@ -382,7 +384,9 @@ def test_joint_projection_respects_requests_stations_and_double_q():
         target_scores={"v0_req": 3, "v1_req": 20, "v0_station": 30, "v1_station": 4},
     )
     assert set(target.selected_edge_ids) == {"v0_req", "v1_station"}
-    assert target.target_evaluation_value == 7
+    # The target evaluates the online-selected edges with the complete
+    # structured-plus-target-correction score: (9 + 3) + (2 + 4).
+    assert target.target_evaluation_value == 18
     structured = builder.double_q_target(
         graph,
         online_scores={edge.edge_id: -100 for edge in edges},
@@ -406,7 +410,7 @@ def test_joint_projection_uses_optional_outside_action_for_negative_scores():
     graph = _graph(edges)
     builder = RecourseTargetBuilder()
     selected = builder.project(graph)
-    assert selected == ()
+    assert set(selected) == {"v0_wait", "v1_wait"}
     builder.verify_feasible(graph, selected)
 
 
@@ -420,6 +424,7 @@ def test_assignment_mapping_does_not_confuse_relocation_with_request_pickup():
             ),
             FeasibleEdgeSnapshot(
                 "v0_reloc", 0, 1, ActionType.RELOCATE, "reloc_3", 3, 3,
+                metadata=(("zone_index", 3),),
             ),
         )
     )
@@ -509,4 +514,4 @@ def test_experiment_manifest_records_config_hashes_and_uncertainty(tmp_path):
     assert manifest["resolved_config"]["recourse_variant"] == "r4"
     assert manifest["data_hashes"][str(data_path)]
     assert manifest["uncertainty"]["reward"]["mean"] == 2.0
-    assert manifest["replay_schema_version"] == 1
+    assert manifest["replay_schema_version"] == 2

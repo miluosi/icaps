@@ -97,6 +97,18 @@ def parse_args():
                         action="store_false")
     parser.set_defaults(assignment_gurobi=True)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--checkpoint-replay",
+        choices=["none", "recent", "full"],
+        default="recent",
+        help="Joint replay payload stored in checkpoints",
+    )
+    parser.add_argument(
+        "--checkpoint-replay-recent",
+        type=int,
+        default=5000,
+        help="Number of newest joint transitions saved by --checkpoint-replay recent",
+    )
     parser.add_argument("--start-training-episode", type=int, default=0)
     parser.add_argument("--prestep", type=int, default=0,
                         help="Use heuristic-only rollouts for the first N global training steps to accumulate experience before enabling gradient updates")
@@ -829,6 +841,8 @@ def run_nyc_training(
     iftransformer: bool = False,
     gat_neighbour_number: int = 0,
     post_demand_q_weight: float = 0.0,
+    checkpoint_replay: str = "recent",
+    checkpoint_replay_recent: int = 5_000,
     post_demand_head_lr_multiplier: float = 10.0,
     masac_target_entropy_ratio: float = 0.9,
     residual_target_policy: str = "joint_projection",
@@ -911,6 +925,8 @@ def run_nyc_training(
         iftransformer=iftransformer,
         gat_neighbour_number=gat_neighbour_number,
         post_demand_q_weight=post_demand_q_weight,
+        checkpoint_replay=checkpoint_replay,
+        checkpoint_replay_recent=checkpoint_replay_recent,
         post_demand_head_lr_multiplier=post_demand_head_lr_multiplier,
         masac_target_entropy_ratio=masac_target_entropy_ratio,
         residual_target_policy=residual_target_policy,
@@ -1224,6 +1240,8 @@ def main():
             iftransformer=args.iftransformer,
             gat_neighbour_number=args.gat_neighbour_number,
             post_demand_q_weight=args.post_demand_q_weight,
+            checkpoint_replay=args.checkpoint_replay,
+            checkpoint_replay_recent=args.checkpoint_replay_recent,
             post_demand_head_lr_multiplier=args.post_demand_head_lr_multiplier,
             masac_target_entropy_ratio=args.masac_target_entropy_ratio,
             residual_target_policy=args.residual_target_policy,
@@ -1270,6 +1288,21 @@ def main():
                 arguments=manifest_arguments,
                 results=results,
                 data_paths=parquet_paths or (),
+                value_functions=(
+                    getattr(env, "value_function", None),
+                    getattr(env, "value_function_ev", None),
+                ),
+                checkpoint_paths=tuple(dict.fromkeys(
+                    path
+                    for value_function in (
+                        getattr(env, "value_function", None),
+                        getattr(env, "value_function_ev", None),
+                    )
+                    if value_function is not None
+                    for path in getattr(
+                        value_function, "checkpoint_artifact_paths", ()
+                    )
+                )),
             )
             print(f"Manifest: {manifest_path}")
 

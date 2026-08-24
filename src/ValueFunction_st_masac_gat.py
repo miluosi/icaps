@@ -28,6 +28,7 @@ import torch.optim as optim
 from src.recourse.replay import PrioritizedJointReplayBuffer
 from src.recourse.target_builder import RecourseTargetBuilder
 from src.recourse.types import (
+    ActionType,
     FeasibleEdgeSnapshot,
     FeasibleGraphSnapshot,
     RecourseTransition,
@@ -233,6 +234,8 @@ class PyTorchChargingValueFunction:
         encoder: bool = False,
         zone_distribution_mode: str | None = None,
         replay_buffer_size: int = 500000,
+        checkpoint_replay: str = "recent",
+        checkpoint_replay_recent: int = 5_000,
         iftransformer: bool = False,
         neighbour_number: int = 5,
     ):
@@ -251,8 +254,11 @@ class PyTorchChargingValueFunction:
         )
 
         self.gamma = 0.95
+        self.within_epoch_gamma = 1.0
         self.tau = 0.005
         self.learning_rate = 1e-3
+        self.huber_kappa = 1.0
+        self.gradient_clip_norm = 10.0
         self.beta_max = 0.30
         self.beta_warmup_steps = 500
         self.eta_pi = 0.0
@@ -288,6 +294,8 @@ class PyTorchChargingValueFunction:
         self.target_critic2 = copy.deepcopy(self.critic2).to(self.device)
         self.actor = _MLP(self.edge_dim, hidden_dim=128).to(self.device)
         self.queue_predictor = _MLP(self.queue_feature_dim, hidden_dim=64).to(self.device)
+        self.target_queue_predictor = copy.deepcopy(self.queue_predictor).to(self.device)
+        self.target_queue_predictor.requires_grad_(False)
         self.log_alpha = nn.Parameter(torch.tensor(math.log(0.05), dtype=torch.float32, device=self.device))
 
         params = (
@@ -300,13 +308,16 @@ class PyTorchChargingValueFunction:
         )
         self.optimizer = optim.Adam(params, lr=self.learning_rate)
         self.queue_optimizer = optim.Adam(self.queue_predictor.parameters(), lr=self.learning_rate)
-        self.loss_fn = nn.SmoothL1Loss()
+        self.loss_fn = nn.SmoothL1Loss(beta=self.huber_kappa)
         self.queue_loss_fn = nn.MSELoss()
         self.experience_buffer = deque(maxlen=int(replay_buffer_size))
         self.rejection_buffer = deque(maxlen=int(replay_buffer_size))
         self.joint_replay_buffer = PrioritizedJointReplayBuffer(
-            capacity=max(1, int(replay_buffer_size) // 5)
+            capacity=max(1, int(replay_buffer_size) // 5),
+            seed=int(getattr(env, "initial_random_seed", 0) or 0),
         )
+        self.checkpoint_replay = str(checkpoint_replay)
+        self.checkpoint_replay_recent = max(1, int(checkpoint_replay_recent))
         self.target_builder = RecourseTargetBuilder()
         self.planning_objective_mode = "learned"
         self.state_variant = "joint_state_shared_critic"
@@ -332,6 +343,14 @@ class PyTorchChargingValueFunction:
         self._target_graph_cache_key = None
         self._target_graph_cache = None
         self._replay_collection_context = None
+        self._joint_critic_router: dict[int, "PyTorchChargingValueFunction"] = {
+            1: self,
+            2: self,
+        }
+        self._follower_target_provider = None
+        self.joint_training_diagnostics: list[dict[str, float | int | str]] = []
+        self.next_transition_link_misses = 0
+        self.next_transition_link_lookups = 0
         # The actor is not part of the deployed MCMF policy when eta_pi=0.
         # Keep it diagnostic-only instead of allowing its gradients to change
         # the shared graph encoder used by assignment.
@@ -416,6 +435,8 @@ class PyTorchChargingValueFunction:
         if isinstance(action_type, (int, np.integer)):
             return int(action_type)
         action = str(action_type)
+        if action in {"wait", "waiting", "continue_wait"}:
+            return 0
         if action == "idle" or action == "reloc" or action.startswith("reloc"):
             return 1
         if action.startswith("charge"):
@@ -719,7 +740,12 @@ class PyTorchChargingValueFunction:
         except (TypeError, ValueError, IndexError):
             return None
 
-    def _queue_wait_from_feature_snapshot(self, features: Any) -> float | None:
+    def _queue_wait_from_feature_snapshot(
+        self,
+        features: Any,
+        *,
+        target_context: bool = False,
+    ) -> float | None:
         if features is None or not self.queue_predictor_trained:
             return None
         try:
@@ -728,9 +754,14 @@ class PyTorchChargingValueFunction:
             return None
         if len(row) != self.queue_feature_dim:
             return None
+        predictor = (
+            self.target_queue_predictor
+            if target_context
+            else self.queue_predictor
+        )
         with torch.no_grad():
             tensor = torch.tensor([row], dtype=torch.float32, device=self.device)
-            wait = self.queue_predictor(tensor).squeeze(1)
+            wait = predictor(tensor).squeeze(1)
             wait = torch.relu(wait).item()
         return float(wait)
 
@@ -772,7 +803,13 @@ class PyTorchChargingValueFunction:
         features[charge_idx] = self._normalize_queue_wait(waits).astype(np.float32)
         return features
 
-    def _queue_wait_feature_from_experience(self, exp: dict, candidate: dict | None = None) -> float:
+    def _queue_wait_feature_from_experience(
+        self,
+        exp: dict,
+        candidate: dict | None = None,
+        *,
+        target_context: bool = False,
+    ) -> float:
         source = exp if candidate is None else candidate
         action_type = source.get("action_type", exp.get("action_type", "idle"))
         action_id = self._action_id(action_type)
@@ -783,7 +820,9 @@ class PyTorchChargingValueFunction:
                 return float(np.clip(float(source["queue_wait_feature"]), 0.0, 5.0))
             except (TypeError, ValueError):
                 pass
-        wait = self._queue_wait_from_feature_snapshot(source.get("queue_features"))
+        wait = self._queue_wait_from_feature_snapshot(
+            source.get("queue_features"), target_context=target_context
+        )
         if wait is not None:
             return float(self._normalize_queue_wait(wait))
         for key in ("predicted_queue_wait", "observed_queue_wait", "observed_wait", "wait_time"):
@@ -910,7 +949,12 @@ class PyTorchChargingValueFunction:
 
         demand = {z: 0.0 for z in zones}
         for req in active_requests:
-            zid = int(getattr(req, "pickup", 0))
+            pickup_zone = getattr(req, "pickup_zone_id", None)
+            zid = int(
+                getattr(req, "pickup", 0)
+                if pickup_zone is None
+                else pickup_zone
+            )
             if zid in demand:
                 demand[zid] += 1.0
 
@@ -977,13 +1021,21 @@ class PyTorchChargingValueFunction:
                     len(getattr(station, "current_vehicles", []) or []),
                 )
             )
-            queue = float(
+            inbound = float(
                 getattr(
                     station,
                     "inbound",
                     len(getattr(station, "charging_queue_notarrived", []) or []),
                 )
             )
+            queued = float(
+                getattr(
+                    station,
+                    "queued",
+                    len(getattr(station, "charging_queue", []) or []),
+                )
+            )
+            queue = inbound + queued
             loc = int(getattr(station, "location", 0))
             near_demand = demand.get(loc, 0.0)
             rows.append([
@@ -1061,6 +1113,7 @@ class PyTorchChargingValueFunction:
             "w_ev": w_ev,
             "w_aev": w_aev,
             "baseline": baseline,
+            "encoder": encoder,
             "vehicle_type_by_id": (
                 {vehicle.vehicle_id: vehicle.vehicle_type for vehicle in snapshot.vehicles}
                 if snapshot is not None
@@ -1151,7 +1204,7 @@ class PyTorchChargingValueFunction:
             )
 
         source_batch = torch.stack([source_embeddings[vehicle_id] for vehicle_id in vehicle_order])
-        enriched_batch = self.graph_encoder.add_neighbour_context(
+        enriched_batch = graph["encoder"].add_neighbour_context(
             source_batch,
             torch.stack(padded_embeddings),
             torch.stack(padded_distances),
@@ -2006,7 +2059,9 @@ class PyTorchChargingValueFunction:
                 )
         if target_station_id is None:
             target_station_id = self._station_id_from_action_type(action_type)
-        queue_wait_feature = self._queue_wait_feature_from_experience(exp, candidate)
+        queue_wait_feature = self._queue_wait_feature_from_experience(
+            exp, candidate, target_context=target_context
+        )
         feature_source = exp if candidate is None else candidate
         post_demand_feature = feature_source.get(
             "post_demand_feature", exp.get("post_demand_feature")
@@ -2066,68 +2121,225 @@ class PyTorchChargingValueFunction:
         )
         return edge_t, type_w, g
 
+    def set_joint_critic_router(
+        self,
+        *,
+        ev_value_function: "PyTorchChargingValueFunction",
+        aev_value_function: "PyTorchChargingValueFunction",
+    ) -> None:
+        """Route every graph edge through the critic deployed for its fleet."""
+
+        self._joint_critic_router = {
+            1: ev_value_function,
+            2: aev_value_function,
+        }
+
+    def set_follower_target_provider(self, provider) -> None:
+        """Install the lagged AEV stage-value provider used by an R4 leader."""
+
+        self._follower_target_provider = provider
+
+    def _provider_for_edge(
+        self, edge: FeasibleEdgeSnapshot
+    ) -> "PyTorchChargingValueFunction":
+        router = getattr(self, "_joint_critic_router", {})
+        return router.get(int(edge.vehicle_type), self)
+
+    @staticmethod
+    def _edge_experience(
+        graph: FeasibleGraphSnapshot,
+        edge: FeasibleEdgeSnapshot,
+        *,
+        state_variant: str,
+    ) -> dict:
+        vehicle = next(
+            item for item in graph.state.vehicles if item.vehicle_id == edge.vehicle_id
+        )
+        return {
+            "vehicle_id": edge.vehicle_id,
+            "vehicle_type": edge.vehicle_type,
+            "action_type": edge.action_id,
+            "action_type_id": int(edge.action_type),
+            "vehicle_location": vehicle.location,
+            "target_location": edge.target_location,
+            "post_action_location": edge.post_action_location,
+            "current_time": graph.state.current_time,
+            "battery_level": vehicle.battery,
+            "vehicle_idle_time": vehicle.idle_time,
+            "other_vehicles": sum(item.online for item in graph.state.vehicles) - 1,
+            "num_requests": len(graph.state.requests),
+            "request_value": edge.request_value,
+            "target_distance": edge.target_distance,
+            "post_action_distance": edge.post_action_distance,
+            "post_action_duration": edge.post_action_duration,
+            "target_station_id": edge.station_id,
+            "queue_features": edge.queue_features,
+            "post_demand_feature": edge.post_demand_feature,
+            "state_snapshot": graph.state,
+            "state_variant": state_variant,
+        }
+
+    def _correction_bound(
+        self,
+        graph: FeasibleGraphSnapshot,
+        edge: FeasibleEdgeSnapshot,
+        *,
+        target_context: bool,
+    ) -> float:
+        structured = torch.tensor(
+            [float(item.structured_score) for item in graph.edges],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        sigma_g = torch.std(structured, unbiased=False).clamp_min(1.0)
+        bound = float(self.residual_clip_rho) * float(sigma_g.item())
+        if edge.action_type == ActionType.CHARGE:
+            wait = self._queue_wait_from_feature_snapshot(
+                edge.queue_features, target_context=target_context
+            )
+            wait = max(0.0, float(wait or 0.0))
+            charge_duration = max(
+                1.0,
+                float(
+                    getattr(self.env, "charge_duration", 1.0)
+                    if self.env is not None
+                    else 1.0
+                ),
+            )
+            charging_cost = float(
+                getattr(
+                    self.env,
+                    "charging_penalty_per_step",
+                    getattr(self.env, "charging_penalty", 0.0),
+                )
+                if self.env is not None
+                else 0.0
+            )
+            bound = max(
+                bound,
+                charging_cost * charge_duration
+                + self._queue_penalty_per_step() * wait,
+            )
+        return float(bound)
+
+    def _deployed_correction(
+        self,
+        raw_value: torch.Tensor,
+        graph: FeasibleGraphSnapshot,
+        edge: FeasibleEdgeSnapshot,
+        *,
+        target_context: bool,
+    ) -> torch.Tensor:
+        if getattr(self, "direct_q", False):
+            return raw_value
+        bound = self._correction_bound(
+            graph, edge, target_context=target_context
+        )
+        return float(self._beta()) * torch.clamp(raw_value, -bound, bound)
+
+    def _edge_correction_tensors(
+        self,
+        graph: FeasibleGraphSnapshot,
+        edge: FeasibleEdgeSnapshot,
+        *,
+        target_context: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        exp = self._edge_experience(
+            graph, edge, state_variant=self.state_variant
+        )
+        edge_tensor, type_weight, _ = self._edge_tensor_from_experience(
+            exp,
+            target_context=target_context,
+            state_snapshot=graph.state,
+        )
+        critic1 = self.target_network if target_context else self.network
+        critic2 = self.target_critic2 if target_context else self.critic2
+        raw1 = critic1(edge_tensor) * type_weight
+        raw2 = critic2(edge_tensor) * type_weight
+        return (
+            self._deployed_correction(
+                raw1, graph, edge, target_context=target_context
+            ),
+            self._deployed_correction(
+                raw2, graph, edge, target_context=target_context
+            ),
+            type_weight,
+        )
+
     def _graph_edge_scores(
         self,
         graph: FeasibleGraphSnapshot,
         *,
         target_context: bool,
     ) -> tuple[dict[str, float], dict[str, float]]:
-        """Return full selection scores and residual evaluation scores."""
+        """Return deployed full scores and deployed correction values."""
 
         full_scores: dict[str, float] = {}
-        residual_scores: dict[str, float] = {}
-        critic1 = self.target_network if target_context else self.network
-        critic2 = self.target_critic2 if target_context else self.critic2
+        correction_scores: dict[str, float] = {}
         for edge in graph.edges:
-            vehicle = next(
-                item for item in graph.state.vehicles if item.vehicle_id == edge.vehicle_id
+            provider = self._provider_for_edge(edge)
+            correction1, correction2, _ = provider._edge_correction_tensors(
+                graph, edge, target_context=target_context
             )
-            exp = {
-                "vehicle_id": edge.vehicle_id,
-                "vehicle_type": edge.vehicle_type,
-                "action_type": edge.action_id,
-                "action_type_id": int(edge.action_type),
-                "vehicle_location": vehicle.location,
-                "target_location": edge.target_location,
-                "post_action_location": edge.post_action_location,
-                "current_time": graph.state.current_time,
-                "battery_level": vehicle.battery,
-                "vehicle_idle_time": vehicle.idle_time,
-                "other_vehicles": sum(item.online for item in graph.state.vehicles) - 1,
-                "num_requests": len(graph.state.requests),
-                "request_value": edge.request_value,
-                "target_distance": edge.target_distance,
-                "post_action_distance": edge.post_action_distance,
-                "post_action_duration": edge.post_action_duration,
-                "target_station_id": edge.station_id,
-                "queue_features": edge.queue_features,
-                "post_demand_feature": edge.post_demand_feature,
-                "state_snapshot": graph.state,
-                "state_variant": self.state_variant,
-            }
-            edge_tensor, type_weight, _ = self._edge_tensor_from_experience(
-                exp,
-                target_context=target_context,
-                state_snapshot=graph.state,
+            if target_context:
+                correction = torch.minimum(correction1, correction2)
+            else:
+                # Selection uses the online double-Q convention of the
+                # deployed provider.  For the residual learner this is the
+                # critic mean; legacy modes keep the clipped minimum.
+                exp = provider._edge_experience(
+                    graph, edge, state_variant=provider.state_variant
+                )
+                edge_tensor, type_weight, _ = provider._edge_tensor_from_experience(
+                    exp, target_context=False, state_snapshot=graph.state
+                )
+                raw = provider._selection_residual(
+                    provider.network(edge_tensor),
+                    provider.critic2(edge_tensor),
+                    type_weight,
+                )
+                correction = provider._deployed_correction(
+                    raw, graph, edge, target_context=False
+                )
+            correction_value = float(
+                correction.squeeze().detach().cpu().item()
             )
-            q1 = critic1(edge_tensor)
-            q2 = critic2(edge_tensor)
-            residual = (
-                torch.minimum(q1, q2) * type_weight
-                if target_context
-                else self._selection_residual(q1, q2, type_weight)
-            )
-            residual_value = float(residual.squeeze().detach().cpu().item())
-            residual_scores[edge.edge_id] = residual_value
-            if self.planning_objective_mode == "structured_only":
+            correction_scores[edge.edge_id] = correction_value
+            if provider.planning_objective_mode == "structured_only":
                 full_scores[edge.edge_id] = float(edge.structured_score)
-            elif getattr(self, "direct_q", False):
-                full_scores[edge.edge_id] = residual_value
+            elif getattr(provider, "direct_q", False):
+                full_scores[edge.edge_id] = correction_value
             else:
                 full_scores[edge.edge_id] = float(
-                    edge.structured_score + self._beta() * residual_value
+                    edge.structured_score + correction_value
                 )
-        return full_scores, residual_scores
+        return full_scores, correction_scores
+
+    def target_components_for_graph(
+        self,
+        graph: FeasibleGraphSnapshot | None,
+        *,
+        structured_only: bool = False,
+    ):
+        if graph is None or not graph.edges:
+            from src.recourse.target_builder import TargetComponents
+
+            return TargetComponents((), 0.0, 0.0, 0.0, solver_status="empty")
+        with torch.no_grad():
+            online_full, _ = self._graph_edge_scores(
+                graph, target_context=False
+            )
+            _, target_correction = self._graph_edge_scores(
+                graph, target_context=True
+            )
+            direct_q = bool(getattr(self, "direct_q", False))
+            return self.target_builder.double_q_target(
+                graph,
+                online_scores=online_full,
+                target_scores=target_correction,
+                structured_only=structured_only,
+                direct_q=direct_q,
+            )
 
     def _solver_consistent_residual_value(
         self,
@@ -2135,23 +2347,11 @@ class PyTorchChargingValueFunction:
         *,
         structured_only: bool = False,
     ) -> tuple[torch.Tensor, tuple[str, ...]]:
-        if graph is None or not graph.edges:
-            return torch.zeros((), dtype=torch.float32, device=self.device), ()
-        with torch.no_grad():
-            online_full, _ = self._graph_edge_scores(graph, target_context=False)
-            _, target_residual = self._graph_edge_scores(graph, target_context=True)
-            components = self.target_builder.double_q_target(
-                graph,
-                online_scores=online_full,
-                target_scores=(
-                    {edge.edge_id: edge.structured_score for edge in graph.edges}
-                    if structured_only
-                    else target_residual
-                ),
-                structured_only=structured_only,
-            )
+        components = self.target_components_for_graph(
+            graph, structured_only=structured_only
+        )
         value = torch.tensor(
-            components.target_evaluation_value,
+            components.target_full_value,
             dtype=torch.float32,
             device=self.device,
         )
@@ -2169,8 +2369,11 @@ class PyTorchChargingValueFunction:
             recourse_variant = str(exp.get("recourse_variant", "legacy"))
             if stage_id == 1 and recourse_variant == "r4":
                 follower_graph = exp.get("aev_stage_graph")
-                follower_value, _ = self._solver_consistent_residual_value(
-                    follower_graph
+                components = self._r4_follower_components(follower_graph)
+                follower_value = torch.tensor(
+                    components.target_full_value,
+                    dtype=torch.float32,
+                    device=self.device,
                 )
                 joint_action = exp.get("joint_action_snapshot")
                 leader_edges = len(
@@ -2259,54 +2462,47 @@ class PyTorchChargingValueFunction:
             })
             return normalized_loss
 
+    def _selected_correction_tensors(
+        self,
+        graph: FeasibleGraphSnapshot,
+        selected_edge_ids: tuple[str, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple["PyTorchChargingValueFunction", ...]]:
+        selected = set(selected_edge_ids)
+        values1 = []
+        values2 = []
+        providers: dict[int, "PyTorchChargingValueFunction"] = {}
+        for edge in graph.edges:
+            if edge.edge_id not in selected:
+                continue
+            provider = self._provider_for_edge(edge)
+            providers[id(provider)] = provider
+            provider._graph_cache_key = None
+            provider._graph_cache = None
+            correction1, correction2, _ = provider._edge_correction_tensors(
+                graph, edge, target_context=False
+            )
+            values1.append(correction1.reshape(()))
+            values2.append(correction2.reshape(()))
+        if not values1:
+            zero = torch.zeros((), dtype=torch.float32, device=self.device)
+            return zero, zero, tuple(providers.values())
+        return (
+            torch.stack(values1).sum(),
+            torch.stack(values2).sum(),
+            tuple(providers.values()),
+        )
+
     def _selected_residual_tensor(
         self,
         graph: FeasibleGraphSnapshot,
         selected_edge_ids: tuple[str, ...],
     ) -> torch.Tensor:
-        self._graph_cache_key = None
-        self._graph_cache = None
-        selected = set(selected_edge_ids)
-        values = []
-        for edge in graph.edges:
-            if edge.edge_id not in selected:
-                continue
-            vehicle = next(
-                item for item in graph.state.vehicles if item.vehicle_id == edge.vehicle_id
-            )
-            exp = {
-                "vehicle_id": edge.vehicle_id,
-                "vehicle_type": edge.vehicle_type,
-                "action_type": edge.action_id,
-                "action_type_id": int(edge.action_type),
-                "vehicle_location": vehicle.location,
-                "target_location": edge.target_location,
-                "post_action_location": edge.post_action_location,
-                "current_time": graph.state.current_time,
-                "battery_level": vehicle.battery,
-                "vehicle_idle_time": vehicle.idle_time,
-                "other_vehicles": sum(item.online for item in graph.state.vehicles) - 1,
-                "num_requests": len(graph.state.requests),
-                "request_value": edge.request_value,
-                "target_distance": edge.target_distance,
-                "post_action_distance": edge.post_action_distance,
-                "post_action_duration": edge.post_action_duration,
-                "target_station_id": edge.station_id,
-                "queue_features": edge.queue_features,
-                "post_demand_feature": edge.post_demand_feature,
-                "state_snapshot": graph.state,
-                "state_variant": self.state_variant,
-            }
-            edge_tensor, type_weight, _ = self._edge_tensor_from_experience(
-                exp, state_snapshot=graph.state
-            )
-            values.append(
-                torch.minimum(self.network(edge_tensor), self.critic2(edge_tensor))
-                * type_weight
-            )
-        if not values:
-            return torch.zeros((), dtype=torch.float32, device=self.device)
-        return torch.cat(values).sum()
+        """Compatibility wrapper returning the conservative online correction."""
+
+        q1, q2, _ = self._selected_correction_tensors(
+            graph, selected_edge_ids
+        )
+        return torch.minimum(q1, q2)
 
     def _next_transition_graph(
         self,
@@ -2314,20 +2510,51 @@ class PyTorchChargingValueFunction:
         *,
         fleet: str,
     ) -> FeasibleGraphSnapshot | None:
-        for candidate in self.joint_replay_buffer:
-            if (
-                candidate.episode_id == transition.episode_id
-                and candidate.day_id == transition.day_id
-                and candidate.epoch_id == transition.epoch_id + 1
-            ):
-                if candidate.mode == "integrated":
-                    return candidate.ev_stage_graph
-                return (
-                    candidate.ev_stage_graph
-                    if fleet == "ev"
-                    else candidate.aev_stage_graph
-                )
-        return None
+        self.next_transition_link_lookups += 1
+        next_id = transition.next_transition_id
+        if not next_id:
+            self.next_transition_link_misses += int(not transition.done)
+            return None
+        candidate = self.joint_replay_buffer.get_by_transition_id(next_id)
+        if candidate is None:
+            self.next_transition_link_misses += 1
+            return None
+        expected = (
+            transition.run_id,
+            transition.cumulative_episode_id,
+            transition.transition_sequence_index + 1,
+            transition.mode,
+            transition.state_variant,
+            transition.learner_variant,
+        )
+        actual = (
+            candidate.run_id,
+            candidate.cumulative_episode_id,
+            candidate.transition_sequence_index,
+            candidate.mode,
+            candidate.state_variant,
+            candidate.learner_variant,
+        )
+        if actual != expected:
+            raise AssertionError(
+                "direct replay transition link has incompatible identity: "
+                f"expected={expected}, actual={actual}"
+            )
+        if candidate.mode == "integrated":
+            return candidate.ev_stage_graph
+        return (
+            candidate.ev_stage_graph
+            if fleet == "ev"
+            else candidate.aev_stage_graph
+        )
+
+    def _r4_follower_components(self, graph: FeasibleGraphSnapshot | None):
+        provider = getattr(self, "_follower_target_provider", None)
+        if provider is None:
+            # Shared critics legitimately use the same object.  Separate
+            # critics are wired explicitly by the environment/trainer.
+            provider = self.target_components_for_graph
+        return provider(graph, structured_only=False)
 
     def _train_joint_step(self, batch_size: int, *, ifEV: bool) -> float:
         if len(self.joint_replay_buffer) == 0:
@@ -2336,6 +2563,8 @@ class PyTorchChargingValueFunction:
         losses = []
         td_errors = []
         used_indices = []
+        providers_to_step: dict[int, "PyTorchChargingValueFunction"] = {}
+        diagnostics = []
         for transition, replay_index, importance_weight in zip(
             sample.transitions, sample.indices, sample.weights
         ):
@@ -2363,63 +2592,175 @@ class PyTorchChargingValueFunction:
                     reward = transition.reward_aev
             else:
                 continue
+            if transition.state_variant != self.state_variant:
+                raise ValueError(
+                    "joint replay state variant mismatch: "
+                    f"row={transition.state_variant}, learner={self.state_variant}"
+                )
+            if transition.learner_variant != self.learner_variant:
+                raise ValueError(
+                    "joint replay learner variant mismatch: "
+                    f"row={transition.learner_variant}, learner={self.learner_variant}"
+                )
+            if (
+                transition.mode == "ev_first"
+                and not ifEV
+                and transition.recourse_variant == "r2"
+            ):
+                # R2 is a strictly structured follower ablation.  It must be
+                # independent of every learned AEV critic output.
+                continue
             if graph is None or action is None or not action.selected_edge_ids:
                 continue
-            prediction = self._selected_residual_tensor(
+            prediction1, prediction2, providers = self._selected_correction_tensors(
                 graph, action.selected_edge_ids
             )
+            for provider in providers:
+                providers_to_step[id(provider)] = provider
             structured_value = float(action.structured_value)
-            if getattr(self, "direct_q", False):
-                immediate_target = float(reward)
-            else:
-                immediate_target = float(reward) - structured_value
 
-            bootstrap_value = 0.0
+            continuation_full_value = 0.0
+            continuation_discount = 0.0
+            target_components = None
+            target_graph_for_diagnostics = None
             if (
                 transition.mode == "ev_first"
                 and ifEV
                 and transition.recourse_variant == "r4"
             ):
-                # The follower action is inside the current epoch.  A terminal
-                # next state removes only the temporal bootstrap; it must not
-                # remove the already-observed same-epoch repair value.
-                follower_value, _ = self._solver_consistent_residual_value(
+                # The follower action is inside the current epoch and is
+                # evaluated by the explicitly wired AEV lagged target critic.
+                target_components = self._r4_follower_components(
                     transition.aev_stage_graph
                 )
-                bootstrap_value = float(follower_value.item())
+                target_graph_for_diagnostics = transition.aev_stage_graph
+                continuation_full_value = float(
+                    target_components.target_full_value
+                )
+                continuation_discount = self.within_epoch_gamma
             elif not transition.done:
                 next_graph = self._next_transition_graph(
                     transition, fleet=fleet
                 )
-                next_value, _ = self._solver_consistent_residual_value(next_graph)
-                bootstrap_value = float(next_value.item()) * (
-                    self.gamma ** float(transition.elapsed_epochs)
-                )
-            target_value = immediate_target + bootstrap_value
+                if next_graph is not None:
+                    target_graph_for_diagnostics = next_graph
+                    target_components = self.target_components_for_graph(
+                        next_graph,
+                        structured_only=(
+                            transition.recourse_variant == "r2"
+                            and fleet == "aev"
+                        ),
+                    )
+                    continuation_full_value = float(
+                        target_components.target_full_value
+                    )
+                    continuation_discount = self.gamma ** float(
+                        transition.elapsed_epochs
+                    )
+            full_target_value = float(reward) + (
+                continuation_discount * continuation_full_value
+            )
+            target_value = self.target_builder.correction_bellman_target(
+                reward=float(reward),
+                discount=continuation_discount,
+                next_components=target_components,
+                current_structured_value=structured_value,
+                direct_q=bool(getattr(self, "direct_q", False)),
+            )
             target = torch.tensor(target_value, dtype=torch.float32, device=self.device)
-            td_error = target.detach() - prediction.detach()
-            weighted_loss = F.smooth_l1_loss(prediction, target.detach())
-            losses.append(float(importance_weight) * weighted_loss)
-            td_errors.append(float(abs(td_error.item())))
+            loss1 = F.smooth_l1_loss(
+                prediction1, target.detach(), beta=self.huber_kappa
+            )
+            loss2 = F.smooth_l1_loss(
+                prediction2, target.detach(), beta=self.huber_kappa
+            )
+            losses.append(float(importance_weight) * (loss1 + loss2))
+            td1 = target.detach() - prediction1.detach()
+            td2 = target.detach() - prediction2.detach()
+            td_errors.append(
+                0.5 * (float(abs(td1.item())) + float(abs(td2.item())))
+            )
             used_indices.append(int(replay_index))
+            diagnostics.append({
+                "joint_q1_loss": float(loss1.detach().item()),
+                "joint_q2_loss": float(loss2.detach().item()),
+                "joint_target_full": float(full_target_value),
+                "joint_target_structured": float(
+                    0.0
+                    if target_components is None
+                    else target_components.target_structured_value
+                ),
+                "joint_target_correction": float(
+                    0.0
+                    if target_components is None
+                    else target_components.target_correction_value
+                ),
+                "r4_follower_full_value": float(
+                    continuation_full_value
+                    if transition.recourse_variant == "r4" and ifEV
+                    else 0.0
+                ),
+                "target_projection_runtime": float(
+                    0.0
+                    if target_components is None
+                    else target_components.solver_runtime_seconds
+                ),
+                "target_rollout_action_agreement": float(
+                    0.0
+                    if target_components is None
+                    or not getattr(
+                        target_graph_for_diagnostics,
+                        "selected_edge_ids",
+                        (),
+                    )
+                    else set(target_components.selected_edge_ids)
+                    == set(
+                        getattr(
+                            target_graph_for_diagnostics,
+                            "selected_edge_ids",
+                            (),
+                        )
+                    )
+                ),
+                "next_transition_link_miss_rate": float(
+                    self.next_transition_link_misses
+                    / max(1, self.next_transition_link_lookups)
+                ),
+            })
         if not losses:
             return 0.0
         loss = torch.stack(losses).mean()
-        self.optimizer.zero_grad(set_to_none=True)
+        for provider in providers_to_step.values():
+            provider.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [parameter for parameter in self.graph_encoder.parameters() if parameter.requires_grad]
-            + list(self.mixer.parameters())
-            + list(self.network.parameters())
-            + list(self.critic2.parameters()),
-            max_norm=10.0,
-        )
-        self.optimizer.step()
-        self._soft_update(self.network, self.target_network, self.tau)
-        self._soft_update(self.critic2, self.target_critic2, self.tau)
-        self._soft_update(self.graph_encoder, self.target_graph_encoder, self.tau)
-        self._soft_update(self.mixer, self.target_mixer, self.tau)
+        for provider in providers_to_step.values():
+            torch.nn.utils.clip_grad_norm_(
+                [
+                    parameter
+                    for parameter in provider.graph_encoder.parameters()
+                    if parameter.requires_grad
+                ]
+                + list(provider.mixer.parameters())
+                + list(provider.network.parameters())
+                + list(provider.critic2.parameters()),
+                max_norm=self.gradient_clip_norm,
+            )
+            provider.optimizer.step()
+            provider._soft_update(provider.network, provider.target_network, provider.tau)
+            provider._soft_update(provider.critic2, provider.target_critic2, provider.tau)
+            provider._soft_update(
+                provider.graph_encoder, provider.target_graph_encoder, provider.tau
+            )
+            provider._soft_update(provider.mixer, provider.target_mixer, provider.tau)
+            provider._soft_update(
+                provider.queue_predictor,
+                provider.target_queue_predictor,
+                provider.tau,
+            )
         self.joint_replay_buffer.update_priorities(used_indices, td_errors)
+        self.joint_training_diagnostics.extend(diagnostics)
+        if len(self.joint_training_diagnostics) > 10_000:
+            del self.joint_training_diagnostics[:-10_000]
         return float(loss.detach().item())
 
     def train_step(self, batch_size: int = 64, tau: float | None = None, ifEV: bool = False) -> float:
@@ -2431,7 +2772,26 @@ class PyTorchChargingValueFunction:
             return float(self.queue_loss_weight) * queue_only_loss + joint_loss
         self._graph_cache_key = None
         self._graph_cache = None
-        batch = random.sample(list(self.experience_buffer), min(batch_size, len(self.experience_buffer)))
+        fleet_type = 1 if ifEV else 2
+        fleet_rows = [
+            exp
+            for exp in self.experience_buffer
+            if int(exp.get("vehicle_type", fleet_type)) == fleet_type
+        ]
+        if not fleet_rows:
+            return self._train_joint_step(batch_size, ifEV=ifEV)
+        batch = random.sample(fleet_rows, min(batch_size, len(fleet_rows)))
+        if not ifEV:
+            batch = [
+                exp
+                for exp in batch
+                if not (
+                    int(exp.get("stage_id", 0) or 0) == 2
+                    and str(exp.get("recourse_variant", "legacy")) == "r2"
+                )
+            ]
+        if not batch:
+            return self._train_joint_step(batch_size, ifEV=ifEV)
         tau = self.tau if tau is None else float(tau)
 
         edge_rows = []
@@ -2440,6 +2800,8 @@ class PyTorchChargingValueFunction:
         rewards = []
         durs = []
         masks = []
+        action_ids = []
+        queue_wait_features = []
         for exp in batch:
             edge_t, type_w, g = self._edge_tensor_from_experience(exp)
             edge_rows.append(edge_t.squeeze(0))
@@ -2463,6 +2825,17 @@ class PyTorchChargingValueFunction:
                     else 1.0
                 )
             )
+            action_ids.append(
+                int(
+                    exp.get(
+                        "action_type_id",
+                        self._action_id(exp.get("action_type", "wait")),
+                    )
+                )
+            )
+            queue_wait_features.append(
+                self._queue_wait_feature_from_experience(exp)
+            )
 
         edges = torch.stack(edge_rows)
         weights = torch.stack(type_ws)
@@ -2471,8 +2844,54 @@ class PyTorchChargingValueFunction:
         durs_t = torch.tensor(durs, dtype=torch.float32, device=self.device).unsqueeze(1)
         masks_t = torch.tensor(masks, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-        q1 = self.network(edges) * weights
-        q2 = self.critic2(edges) * weights
+        raw_q1 = self.network(edges) * weights
+        raw_q2 = self.critic2(edges) * weights
+        sigma_g = torch.std(g_t, unbiased=False).clamp_min(1.0)
+        bounds = torch.full_like(
+            raw_q1, float(self.residual_clip_rho) * float(sigma_g.item())
+        )
+        charge_mask = torch.tensor(
+            np.asarray(action_ids) == int(ActionType.CHARGE),
+            dtype=torch.bool,
+            device=self.device,
+        ).unsqueeze(1)
+        if torch.any(charge_mask):
+            charge_duration = max(
+                1.0,
+                float(
+                    getattr(self.env, "charge_duration", 1.0)
+                    if self.env is not None
+                    else 1.0
+                ),
+            )
+            charging_cost = float(
+                getattr(
+                    self.env,
+                    "charging_penalty_per_step",
+                    getattr(self.env, "charging_penalty", 0.0),
+                )
+                if self.env is not None
+                else 0.0
+            )
+            waits = torch.tensor(
+                queue_wait_features,
+                dtype=torch.float32,
+                device=self.device,
+            ).unsqueeze(1) * charge_duration
+            charge_bounds = charging_cost * charge_duration + (
+                self._queue_penalty_per_step() * waits
+            )
+            bounds = torch.where(
+                charge_mask, torch.maximum(bounds, charge_bounds), bounds
+            )
+        score1 = self._execution_scores_from_residual(g_t, raw_q1, bounds)
+        score2 = self._execution_scores_from_residual(g_t, raw_q2, bounds)
+        if getattr(self, "direct_q", False):
+            q1 = score1
+            q2 = score2
+        else:
+            q1 = score1 - g_t
+            q2 = score2 - g_t
         next_v = self._next_soft_values(batch)
         bootstrap_discounts = []
         for exp, duration in zip(batch, durs):
@@ -2523,6 +2942,9 @@ class PyTorchChargingValueFunction:
         self._soft_update(self.critic2, self.target_critic2, tau)
         self._soft_update(self.graph_encoder, self.target_graph_encoder, tau)
         self._soft_update(self.mixer, self.target_mixer, tau)
+        self._soft_update(
+            self.queue_predictor, self.target_queue_predictor, tau
+        )
 
         objective_value = float(loss.item())
         loss_value = float(critic_loss.detach().item())
@@ -2579,6 +3001,10 @@ class PyTorchChargingValueFunction:
     # ------------------------------------------------------------------
 
     def extra_checkpoint_state(self) -> dict[str, Any]:
+        joint_replay_state = self.joint_replay_buffer.state_dict(
+            mode=self.checkpoint_replay,
+            recent_count=self.checkpoint_replay_recent,
+        )
         return {
             "critic2_state_dict": self.critic2.state_dict(),
             "target_critic2_state_dict": self.target_critic2.state_dict(),
@@ -2588,6 +3014,7 @@ class PyTorchChargingValueFunction:
             "target_mixer_state_dict": self.target_mixer.state_dict(),
             "actor_state_dict": self.actor.state_dict(),
             "queue_predictor_state_dict": self.queue_predictor.state_dict(),
+            "target_queue_predictor_state_dict": self.target_queue_predictor.state_dict(),
             "queue_optimizer_state_dict": self.queue_optimizer.state_dict(),
             "queue_predictor_trained": bool(self.queue_predictor_trained),
             "queue_training_losses": list(self.queue_training_losses),
@@ -2603,10 +3030,17 @@ class PyTorchChargingValueFunction:
             "beta_max": self.beta_max,
             "eta_pi": self.eta_pi,
             "residual_clip_rho": self.residual_clip_rho,
-            "joint_replay_schema_version": 1,
-            "joint_replay_state_dict": self.joint_replay_buffer.state_dict(),
+            "joint_replay_schema_version": 2,
+            "joint_replay_state_dict": joint_replay_state,
+            "joint_replay_hash": joint_replay_state["content_hash"],
+            "checkpoint_replay": self.checkpoint_replay,
+            "checkpoint_replay_recent": self.checkpoint_replay_recent,
             "state_variant": self.state_variant,
             "learner_variant": self.learner_variant,
+            "recourse_variant": getattr(self, "recourse_variant", "legacy"),
+            "joint_training_diagnostics": list(self.joint_training_diagnostics),
+            "next_transition_link_misses": int(self.next_transition_link_misses),
+            "next_transition_link_lookups": int(self.next_transition_link_lookups),
         }
 
     def load_extra_checkpoint_state(self, state: dict[str, Any]) -> None:
@@ -2638,6 +3072,14 @@ class PyTorchChargingValueFunction:
             self.actor.load_state_dict(state["actor_state_dict"], strict=False)
         if "queue_predictor_state_dict" in state:
             self.queue_predictor.load_state_dict(state["queue_predictor_state_dict"], strict=False)
+        if "target_queue_predictor_state_dict" in state:
+            self.target_queue_predictor.load_state_dict(
+                state["target_queue_predictor_state_dict"], strict=False
+            )
+        elif "queue_predictor_state_dict" in state:
+            self.target_queue_predictor.load_state_dict(
+                state["queue_predictor_state_dict"], strict=False
+            )
         if "queue_optimizer_state_dict" in state:
             try:
                 self.queue_optimizer.load_state_dict(state["queue_optimizer_state_dict"])
@@ -2654,7 +3096,25 @@ class PyTorchChargingValueFunction:
             if not isinstance(value, torch.Tensor):
                 value = torch.tensor(value, dtype=torch.float32)
             self.log_alpha.data.copy_(value.to(self.device).reshape(()))
-        self.state_variant = str(state.get("state_variant", self.state_variant))
+        for field_name in ("state_variant", "learner_variant", "recourse_variant"):
+            if field_name not in state:
+                continue
+            stored = str(state[field_name])
+            requested = str(getattr(self, field_name, stored))
+            if stored != requested:
+                raise ValueError(
+                    f"checkpoint {field_name} mismatch: "
+                    f"requested={requested}, stored={stored}"
+                )
+        self.joint_training_diagnostics = list(
+            state.get("joint_training_diagnostics", self.joint_training_diagnostics)
+        )
+        self.next_transition_link_misses = int(
+            state.get("next_transition_link_misses", self.next_transition_link_misses)
+        )
+        self.next_transition_link_lookups = int(
+            state.get("next_transition_link_lookups", self.next_transition_link_lookups)
+        )
         joint_replay_state = state.get("joint_replay_state_dict")
         if joint_replay_state is not None:
             self.joint_replay_buffer.load_state_dict(joint_replay_state)

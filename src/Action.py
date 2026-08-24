@@ -142,10 +142,15 @@ class IdleAction(Action):
     """
     
     def __init__(self, requests: Iterable[Request], current_coords: tuple, target_coords: tuple,vehicle_loc=None, vehicle_battery=None, next_action = None,next_value = 0,req_num=None,idle_time = 0) -> None:
-        super().__init__(requests, canonical_type=ActionType.RELOCATE)
+        is_wait = _same_position(current_coords, target_coords)
+        super().__init__(
+            requests,
+            canonical_type=(ActionType.WAIT if is_wait else ActionType.RELOCATE),
+        )
         self.current_coords = current_coords  # (x, y) current position
         self.target_coords = target_coords    # (x, y) target position
         self.action_type = "idle"
+        self.learning_action_type = "wait" if is_wait else "reloc"
         self.dur_reward = 0
         self.vehicle_loc = vehicle_loc
         self.vehicle_battery = vehicle_battery
@@ -172,3 +177,31 @@ class IdleAction(Action):
             'target_coords': self.target_coords,
             'action_type': self.action_type
         }
+
+
+class WaitingAction(IdleAction):
+    """Explicit stationary outside action for new call sites."""
+
+    def __init__(
+        self,
+        requests: Iterable[Request],
+        current_coords: tuple,
+        vehicle_loc=None,
+        vehicle_battery=None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            requests,
+            current_coords,
+            current_coords,
+            vehicle_loc=vehicle_loc,
+            vehicle_battery=vehicle_battery,
+            **kwargs,
+        )
+
+
+def _same_position(left: Any, right: Any) -> bool:
+    try:
+        return tuple(left) == tuple(right)
+    except TypeError:
+        return left == right

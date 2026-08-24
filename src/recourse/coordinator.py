@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-import uuid
+
+import numpy as np
 
 from .lifecycle import RequestLifecycleTracker
 from .replay import PrioritizedJointReplayBuffer
@@ -31,6 +32,13 @@ class PendingTransition:
     learner_variant: str
     solver_backend: str
     pre_state: SystemSnapshot
+    run_id: str
+    cumulative_episode_id: int
+    transition_sequence_index: int
+    previous_transition_id: str | None
+    next_transition_id: str
+    request_generation_seed: int
+    vehicle_initialization_seed: int
     ev_stage_graph: FeasibleGraphSnapshot | None = None
     ev_joint_action: JointActionSnapshot | None = None
     residual_state: SystemSnapshot | None = None
@@ -46,8 +54,12 @@ class RecourseCoordinator:
         replay: PrioritizedJointReplayBuffer | None = None,
     ) -> None:
         self.lifecycle = lifecycle or RequestLifecycleTracker()
-        self.replay = replay or PrioritizedJointReplayBuffer()
+        # Learners own the replay used for optimization.  Keeping another
+        # implicit full copy here previously tripled snapshot memory.
+        self.replay = replay
         self.pending: PendingTransition | None = None
+        self._active_episode_id: int | None = None
+        self._sequence_index = 0
 
     def begin(
         self,
@@ -63,9 +75,40 @@ class RecourseCoordinator:
             raise RuntimeError("previous joint transition was not finalized")
         pre_state = StateSnapshotBuilder.build(env)
         day_id = dict(pre_state.exogenous_context).get("day_id", "")
+        cumulative_episode_id = int(
+            getattr(
+                env,
+                "cumulative_episode_index",
+                getattr(env, "episode_day_index", getattr(env, "episode_index", 0)),
+            )
+            or 0
+        )
+        if self._active_episode_id != cumulative_episode_id:
+            self._active_episode_id = cumulative_episode_id
+            self._sequence_index = 0
+        sequence_index = self._sequence_index
+        self._sequence_index += 1
+        run_id = str(
+            getattr(
+                env,
+                "recourse_run_id",
+                f"seed-{int(getattr(env, 'initial_random_seed', 0) or 0)}",
+            )
+        )
+        transition_id = (
+            f"{run_id}:episode:{cumulative_episode_id}:sequence:{sequence_index}"
+        )
+        next_transition_id = (
+            f"{run_id}:episode:{cumulative_episode_id}:sequence:{sequence_index + 1}"
+        )
+        previous_transition_id = (
+            None
+            if sequence_index == 0
+            else f"{run_id}:episode:{cumulative_episode_id}:sequence:{sequence_index - 1}"
+        )
         self.pending = PendingTransition(
-            transition_id=str(uuid.uuid4()),
-            episode_id=int(getattr(env, "episode_day_index", getattr(env, "episode_index", 0)) or 0),
+            transition_id=transition_id,
+            episode_id=cumulative_episode_id,
             day_id=str(day_id),
             seed=int(getattr(env, "initial_random_seed", 0) or 0),
             epoch_id=pre_state.epoch_id,
@@ -75,6 +118,17 @@ class RecourseCoordinator:
             learner_variant=str(learner_variant),
             solver_backend=str(solver_backend),
             pre_state=pre_state,
+            run_id=run_id,
+            cumulative_episode_id=cumulative_episode_id,
+            transition_sequence_index=sequence_index,
+            previous_transition_id=previous_transition_id,
+            next_transition_id=next_transition_id,
+            request_generation_seed=int(
+                getattr(env, "request_generation_seed", 0) or 0
+            ),
+            vehicle_initialization_seed=int(
+                getattr(env, "vehicle_initialization_seed", 0) or 0
+            ),
         )
         return self.pending
 
@@ -88,14 +142,47 @@ class RecourseCoordinator:
         pending = self.pending
         if pending is None:
             return None
+        self._complete_missing_stage_graphs(env, pending)
+        selected_edges = []
+        for graph, action in (
+            (pending.ev_stage_graph, pending.ev_joint_action),
+            (pending.aev_stage_graph, pending.aev_joint_action),
+        ):
+            if graph is None or action is None:
+                continue
+            selected_ids = set(action.selected_edge_ids)
+            selected_edges.extend(
+                edge for edge in graph.edges if edge.edge_id in selected_ids
+            )
+        rewarded_vehicle_ids = tuple(
+            sorted({int(edge.vehicle_id) for edge in selected_edges})
+        )
+        unattributed = [
+            int(vehicle_id)
+            for vehicle_id, reward in rewards.items()
+            if abs(float(reward)) > 1e-12
+            and int(vehicle_id) not in rewarded_vehicle_ids
+        ]
+        if unattributed:
+            raise AssertionError(
+                "epoch reward contains vehicles without a serialized selected "
+                f"action edge: {unattributed}"
+            )
+        continuing_action_edge_ids = tuple(
+            edge.edge_id
+            for edge in selected_edges
+            if bool(dict(edge.metadata).get("continuing", False))
+        )
         reward_ev = sum(
             float(rewards.get(vehicle_id, 0.0))
             for vehicle_id, vehicle in getattr(env, "vehicles", {}).items()
+            if int(vehicle_id) in rewarded_vehicle_ids
             if int(vehicle.get("type", 1)) == 1
         )
         reward_aev = sum(
             float(rewards.get(vehicle_id, 0.0))
             for vehicle_id, vehicle in getattr(env, "vehicles", {}).items()
+            if int(vehicle_id) in rewarded_vehicle_ids
             if int(vehicle.get("type", 1)) == 2
         )
         next_state = StateSnapshotBuilder.build(env)
@@ -127,7 +214,68 @@ class RecourseCoordinator:
             done=bool(done),
             planner_metadata=PlannerMetadata(backend=pending.solver_backend),
             outcome_summary=self.lifecycle.outcome_summary(epoch_id=pending.epoch_id),
+            run_id=pending.run_id,
+            cumulative_episode_id=pending.cumulative_episode_id,
+            transition_sequence_index=pending.transition_sequence_index,
+            previous_transition_id=pending.previous_transition_id,
+            next_transition_id=(None if done else pending.next_transition_id),
+            request_generation_seed=pending.request_generation_seed,
+            vehicle_initialization_seed=pending.vehicle_initialization_seed,
+            reward_scope="selected_epoch_actions",
+            rewarded_vehicle_ids=rewarded_vehicle_ids,
+            continuing_action_edge_ids=continuing_action_edge_ids,
         )
-        self.replay.add(transition)
+        if self.replay is not None:
+            self.replay.add(transition)
         self.pending = None
         return transition
+
+    @staticmethod
+    def _complete_missing_stage_graphs(
+        env: Any, pending: PendingTransition
+    ) -> None:
+        def build(stage_id: int, state: SystemSnapshot):
+            matrix = np.zeros((0, 1), dtype=np.float32)
+            graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                env,
+                [],
+                matrix,
+                matrix,
+                matrix,
+                num_requests=0,
+                num_stations=0,
+                num_zones=0,
+                stage_id=stage_id,
+                solver_backend=pending.solver_backend,
+                state=state,
+            )
+            selected = StateSnapshotBuilder.selected_edge_ids(graph, {})
+            return graph.with_selected(selected, status="continuing_only"), (
+                JointActionSnapshot.from_graph(graph, selected)
+            )
+
+        if pending.mode == "integrated":
+            if pending.ev_stage_graph is None or pending.ev_joint_action is None:
+                pending.ev_stage_graph, pending.ev_joint_action = build(
+                    0, pending.pre_state
+                )
+            return
+        if pending.mode in {"ev_first", "evfirst"}:
+            if pending.ev_stage_graph is None or pending.ev_joint_action is None:
+                pending.ev_stage_graph, pending.ev_joint_action = build(
+                    1, pending.pre_state
+                )
+            if pending.aev_stage_graph is None or pending.aev_joint_action is None:
+                pending.aev_stage_graph, pending.aev_joint_action = build(
+                    2, pending.residual_state or pending.pre_state
+                )
+            return
+        if pending.mode in {"aev_first", "aevfirst"}:
+            if pending.ev_stage_graph is None or pending.ev_joint_action is None:
+                pending.ev_stage_graph, pending.ev_joint_action = build(
+                    2, pending.residual_state or pending.pre_state
+                )
+            if pending.aev_stage_graph is None or pending.aev_joint_action is None:
+                pending.aev_stage_graph, pending.aev_joint_action = build(
+                    1, pending.pre_state
+                )

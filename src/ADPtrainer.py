@@ -33,6 +33,7 @@ from .charging_station import ChargingStationManager, ChargingStation
 from .charging_wait_metrics import aggregate_wait_metrics
 from .CentralAgent import CentralAgent
 from .SpatialVisualization import SpatialVisualization
+from .recourse.critics import enforce_critic_identity, uses_shared_critic
 
 
 class ADPTrainer:
@@ -461,6 +462,9 @@ class ADPTrainer:
             print(f"✓ 价值网络{checkpoint_tag}检查点已保存到 {checkpoint_dir}")
             print(f"  - 完整状态: {os.path.basename(paths['full_state'])}")
             print(f"  - 网络权重: {os.path.basename(paths['network_only'])}")
+            artifacts = getattr(value_function, "checkpoint_artifact_paths", [])
+            artifacts.extend(paths.values())
+            value_function.checkpoint_artifact_paths = list(dict.fromkeys(artifacts))
             return paths
         except Exception as e:
             print(f"❌ 保存检查点失败: {e}")
@@ -760,6 +764,9 @@ class ADPTrainer:
                 return False
             
             print(f"📂 加载checkpoint: {checkpoint_path}", flush=True)
+            artifacts = getattr(value_function, "checkpoint_artifact_paths", [])
+            artifacts.append(str(checkpoint_path))
+            value_function.checkpoint_artifact_paths = list(dict.fromkeys(artifacts))
             try:
                 checkpoint = torch.load(
                     checkpoint_path,
@@ -911,6 +918,8 @@ class ADPTrainer:
         use_intense_requests: bool,
         assignmentgurobi: bool,
         batch_size: int = 256,
+        checkpoint_replay: str = "recent",
+        checkpoint_replay_recent: int = 5_000,
         num_vehicles: int = 50,
         num_ev: int = 25,
         heuristic_battery_threshold: float = 0.5,
@@ -999,6 +1008,7 @@ class ADPTrainer:
         }
         if state_variant not in valid_state_variants:
             raise ValueError(f"unknown state variant: {state_variant}")
+        shared_critic = uses_shared_critic(state_variant)
         if useauction:
             usemcmf = True
 
@@ -1226,17 +1236,29 @@ class ADPTrainer:
                 and hasattr(value_function_ev, 'disable_follower_zone_distribution_predictor')
             ):
                 value_function_ev.disable_follower_zone_distribution_predictor()
-            if str(state_variant) in {
-                "joint_state_shared_critic",
-                "fleet_local_shared_critic",
-            } and not ifloadgingValueFunction:
-                value_function_ev = value_function
+            value_function, value_function_ev = enforce_critic_identity(
+                value_function,
+                value_function_ev,
+                state_variant=state_variant,
+            )
             for current_value_function in {
                 id(value_function): value_function,
                 id(value_function_ev): value_function_ev,
             }.values():
                 current_value_function.state_variant = str(state_variant)
                 current_value_function.learner_variant = str(learner_variant)
+                current_value_function.recourse_variant = str(recourse_variant)
+                if hasattr(current_value_function, "joint_replay_buffer"):
+                    if checkpoint_replay not in {"none", "recent", "full"}:
+                        raise ValueError(
+                            "checkpoint_replay must be none, recent, or full"
+                        )
+                    current_value_function.checkpoint_replay = str(
+                        checkpoint_replay
+                    )
+                    current_value_function.checkpoint_replay_recent = max(
+                        1, int(checkpoint_replay_recent)
+                    )
             env.set_value_function(value_function)
             env.set_value_function_ev(value_function_ev)
             log_progress(f"EV value function initialized in {time.time() - ev_value_function_init_start:.2f}s")
@@ -1328,16 +1350,29 @@ class ADPTrainer:
             if aev_checkpoint:
                 aev_checkpoint_load_start = time.time()
                 log_progress("Loading AEV checkpoint")
-                self.load_checkpoint(value_function, aev_checkpoint)
+                if not self.load_checkpoint(value_function, aev_checkpoint):
+                    raise RuntimeError(
+                        "AEV checkpoint load failed; requested model/state/"
+                        "learner/recourse configuration was not restored"
+                    )
                 log_progress(f"AEV checkpoint loaded in {time.time() - aev_checkpoint_load_start:.2f}s")
             else:
                 log_progress(f"⚠ 未找到AEV checkpoint，将从头开始训练")
             
-            if ev_checkpoint:
+            if ev_checkpoint and not shared_critic:
                 ev_checkpoint_load_start = time.time()
                 log_progress("Loading EV checkpoint")
-                self.load_checkpoint(value_function_ev, ev_checkpoint)
+                if not self.load_checkpoint(value_function_ev, ev_checkpoint):
+                    raise RuntimeError(
+                        "EV checkpoint load failed; requested model/state/"
+                        "learner/recourse configuration was not restored"
+                    )
                 log_progress(f"EV checkpoint loaded in {time.time() - ev_checkpoint_load_start:.2f}s")
+            elif ev_checkpoint and shared_critic:
+                log_progress(
+                    "Shared-critic variant: verified the EV/AEV checkpoint pair "
+                    "and loaded the canonical AEV copy once"
+                )
             else:
                 log_progress(f"⚠ 未找到EV checkpoint，将从头开始训练")
             log_progress(f"Checkpoint loading complete in {time.time() - checkpoint_loading_start:.2f}s")
@@ -1419,6 +1454,8 @@ class ADPTrainer:
 
         for episode in range(num_episodes):
             cumulative_episode_index = resume_episode_offset + episode
+            env.cumulative_episode_index = int(cumulative_episode_index)
+            env.recourse_run_id = f"synthetic-seed-{int(random_seed)}"
             # Pre-training episodes use the historical pure-heuristic warmup.
             if use_neural_network and episode < effective_start_training_episode:
                 env.adp_value = 0

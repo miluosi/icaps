@@ -24,6 +24,7 @@ class ValueFunctionSpec:
 
 VALUE_FUNCTION_REGISTRY: dict[str, ValueFunctionSpec] = {
     "bayes": ValueFunctionSpec("src.ValueFunction_pytorch_bayes"),
+    "time-only": ValueFunctionSpec("src.ValueFunction_pytorch_bayes"),
     "st_masac_gat": ValueFunctionSpec("src.ValueFunction_st_masac_gat"),
     "st_masac_gat_frozen": ValueFunctionSpec("src.ValueFunction_st_masac_gat"),
     "st_masac_gat_neighbour_frozen": ValueFunctionSpec("src.ValueFunction_st_masac_gat"),
@@ -31,6 +32,9 @@ VALUE_FUNCTION_REGISTRY: dict[str, ValueFunctionSpec] = {
         "src.ValueFunction_st_masac_gat_post_demand"
     ),
     "st_masac_gat_post_demand_direct": ValueFunctionSpec(
+        "src.ValueFunction_st_masac_gat_post_demand_direct"
+    ),
+    "st_masac_gat_queue_demand_gurobi": ValueFunctionSpec(
         "src.ValueFunction_st_masac_gat_post_demand_direct"
     ),
     "optimization_anchored_residual": ValueFunctionSpec(
@@ -65,4 +69,3 @@ def validate_value_function_registry() -> dict[str, type]:
     if set(VALUE_FUNCTION_CHOICES) != set(VALUE_FUNCTION_REGISTRY):
         raise AssertionError("every registry entry must be deliberately public or internal")
     return loaded
-

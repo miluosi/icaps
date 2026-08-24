@@ -5,8 +5,11 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from hashlib import sha256
 import json
+import os
+import platform
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any, Iterable, Mapping
 
 from .metrics import summarize_metric_with_uncertainty
@@ -20,6 +23,9 @@ METRIC_DEFINITIONS = {
     "recovery_rate_assignment": "same-epoch AEV assignments divided by unique rejected residual requests",
     "recovery_rate_pickup": "AEV pickups after EV rejection divided by unique rejected residual requests",
     "recovery_rate_completion": "completions after EV rejection divided by unique rejected residual requests",
+    "conditional_recovery_rate_assignment": "same-epoch AEV assignments divided by eligible rejected residual requests",
+    "conditional_recovery_rate_pickup": "pickups by the assigned AEV divided by eligible rejected residual requests",
+    "conditional_recovery_rate_completion": "completions by the assigned AEV divided by eligible rejected residual requests",
 }
 
 
@@ -29,6 +35,9 @@ def write_experiment_manifest(
     arguments: Mapping[str, Any],
     results: Mapping[str, Any],
     data_paths: Iterable[str | Path] = (),
+    checkpoint_paths: Iterable[str | Path] = (),
+    value_functions: Iterable[Any] = (),
+    test_status: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write resolved arguments, provenance, hashes, and uncertainty summaries."""
 
@@ -43,11 +52,14 @@ def write_experiment_manifest(
         "recovery_rate_assignment",
         "recovery_rate_pickup",
         "recovery_rate_completion",
+        "conditional_recovery_rate_assignment",
+        "conditional_recovery_rate_pickup",
+        "conditional_recovery_rate_completion",
     ):
         if any(row.get(metric) is not None for row in rows):
             summaries[metric] = summarize_metric_with_uncertainty(rows, metric)
     manifest = {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "git_commit": _git_commit(output_path.parent),
         "replay_schema_version": REPLAY_SCHEMA_VERSION,
         "resolved_config": _json_safe(dict(arguments)),
@@ -58,6 +70,23 @@ def write_experiment_manifest(
         },
         "checkpoint_namespace": arguments.get("checkpoint_suffix")
         or arguments.get("checkpoint_scenario_suffix"),
+        "checkpoint_hashes": {
+            str(path): _sha256_file(path)
+            for raw_path in checkpoint_paths
+            if (path := Path(raw_path)).is_file()
+        },
+        "effective_model_hyperparameters": _effective_model_hyperparameters(
+            value_functions
+        ),
+        "effective_replay_hyperparameters": _effective_replay_hyperparameters(
+            value_functions
+        ),
+        "target_builder_version": "solver_consistent_v2",
+        "target_solver_backend": "scipy_highs_milp",
+        "test_status": _json_safe(
+            dict(test_status or results.get("test_status", {}) or {})
+        ),
+        "environment": _environment_metadata(),
         "metric_definitions": METRIC_DEFINITIONS,
         "seed_day_rows": rows,
         "uncertainty": summaries,
@@ -86,6 +115,7 @@ def _result_rows(
                 or index
             ),
             "reward": float(rewards[index]) if index < len(rewards) else None,
+            "recourse_variant": str(arguments.get("recourse_variant", "legacy")),
         }
         for metric in (
             "completed_orders",
@@ -93,6 +123,9 @@ def _result_rows(
             "recovery_rate_assignment",
             "recovery_rate_pickup",
             "recovery_rate_completion",
+            "conditional_recovery_rate_assignment",
+            "conditional_recovery_rate_pickup",
+            "conditional_recovery_rate_completion",
         ):
             if detail.get(metric) is not None:
                 row[metric] = float(detail[metric])
@@ -106,6 +139,126 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _effective_model_hyperparameters(
+    value_functions: Iterable[Any],
+) -> list[dict[str, Any]]:
+    fields = (
+        "gamma",
+        "within_epoch_gamma",
+        "tau",
+        "learning_rate",
+        "huber_kappa",
+        "gradient_clip_norm",
+        "beta_max",
+        "beta_warmup_steps",
+        "eta_pi",
+        "residual_clip_rho",
+        "lambda_actor",
+        "lambda_alpha",
+        "lambda_orth",
+        "lambda_cql",
+        "hidden_dim",
+        "graph_node_dim",
+        "edge_local_dim",
+        "edge_dim",
+        "queue_loss_weight",
+        "queue_edge_loss_weight",
+        "checkpoint_replay",
+        "checkpoint_replay_recent",
+        "state_variant",
+        "learner_variant",
+        "recourse_variant",
+    )
+    rows = []
+    seen = set()
+    for value_function in value_functions:
+        if value_function is None or id(value_function) in seen:
+            continue
+        seen.add(id(value_function))
+        rows.append(
+            {
+                "class": (
+                    f"{type(value_function).__module__}."
+                    f"{type(value_function).__name__}"
+                ),
+                **{
+                    field: _json_safe(getattr(value_function, field))
+                    for field in fields
+                    if hasattr(value_function, field)
+                },
+            }
+        )
+    return rows
+
+
+def _effective_replay_hyperparameters(
+    value_functions: Iterable[Any],
+) -> list[dict[str, Any]]:
+    rows = []
+    seen = set()
+    for value_function in value_functions:
+        replay = getattr(value_function, "joint_replay_buffer", None)
+        if replay is None or id(replay) in seen:
+            continue
+        seen.add(id(replay))
+        rows.append(
+            {
+                field: _json_safe(getattr(replay, field))
+                for field in (
+                    "capacity",
+                    "alpha",
+                    "beta_start",
+                    "beta_end",
+                    "beta_anneal_steps",
+                    "beta",
+                    "beta_step",
+                    "epsilon",
+                    "rejection_bonus",
+                    "recourse_bonus",
+                    "seed",
+                )
+            }
+        )
+    return rows
+
+
+def _environment_metadata() -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "github_actions": os.environ.get("GITHUB_ACTIONS") == "true",
+    }
+    try:
+        import numpy
+
+        metadata["numpy"] = numpy.__version__
+    except ImportError:
+        pass
+    try:
+        import scipy
+
+        metadata["scipy"] = scipy.__version__
+    except ImportError:
+        pass
+    try:
+        import torch
+
+        metadata.update(
+            {
+                "torch": torch.__version__,
+                "cuda_available": bool(torch.cuda.is_available()),
+                "cuda_version": torch.version.cuda,
+                "gpu_names": [
+                    torch.cuda.get_device_name(index)
+                    for index in range(torch.cuda.device_count())
+                ],
+            }
+        )
+    except ImportError:
+        pass
+    return metadata
 
 
 def _git_commit(start: Path) -> str | None:

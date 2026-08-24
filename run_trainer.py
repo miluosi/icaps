@@ -11,6 +11,10 @@ from src.ADPtrainer import ADPTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 from src.recourse.manifest import write_experiment_manifest
+from src.value_function_registry import (
+    get_value_function_class,
+    validate_value_function_registry,
+)
 from src.synthetic_scenario import (
     DEFAULT_AEV_INITIAL_BATTERY_SCALE,
     DEFAULT_CHARGE_DURATION,
@@ -49,6 +53,18 @@ def parse_args():
     parser.add_argument("--assignment-heuristic", dest="assignment_gurobi", action="store_false", help="Use heuristic assignment")
     parser.set_defaults(assignment_gurobi=True)
     parser.add_argument("--batch-size", type=int, default=256, help="Training batch size")
+    parser.add_argument(
+        "--checkpoint-replay",
+        choices=["none", "recent", "full"],
+        default="recent",
+        help="Joint replay payload stored in checkpoints",
+    )
+    parser.add_argument(
+        "--checkpoint-replay-recent",
+        type=int,
+        default=5000,
+        help="Number of newest joint transitions saved by --checkpoint-replay recent",
+    )
     parser.add_argument("--start-training-episode", type=int, default=3, help="Episode index to start NN training")
     parser.add_argument(
         "--resume",
@@ -89,7 +105,7 @@ def parse_args():
     parser.add_argument("--use-auction", action="store_true", dest="useauction", help="Use auction solver as the MCMF backend")
     parser.add_argument("--no-auction", action="store_false", dest="useauction", help="Disable auction solver backend")
     parser.set_defaults(useauction=False)
-    parser.add_argument("--auction -use-gpu", action="store_true", help="Use GPU auction solver when auction is enabled")
+    parser.add_argument("--auction-use-gpu", action="store_true", help="Use GPU auction solver when auction is enabled")
     parser.add_argument("--auction-use-cpu", dest="auction_use_gpu", action="store_false", help="Force CPU auction solver")
     parser.set_defaults(auction_use_gpu=False)
     parser.add_argument("--auction-epsilon", type=float, default=1e-3, help="Auction bidding epsilon")
@@ -211,45 +227,10 @@ def main():
         raise ValueError(
             "integrated_directq requires --transportation-mode integrated"
         )
-    if zone_distribution_mode == "elbo":
-        from src.ValueFunction_pytorch_elbo import PyTorchChargingValueFunction as ELBOPyTorchChargingValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = ELBOPyTorchChargingValueFunction
-    elif zone_distribution_mode == "bayes_simple":
-        from src.ValueFunction_pytorch_bayessimple import PyTorchChargingValueFunction as BayesSimplePyTorchChargingValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = BayesSimplePyTorchChargingValueFunction
-    elif zone_distribution_mode in {
-        "masac_queue_length",
-        "st_masac_gat_former2_queue_feature",
-        "st_masac_gat_former2_queue_feature_greedy_alpha",
-        "st_masac_gat_former2_queue_feature_fixed_alpha",
-    }:
-        from src.ValueFunction_st_masac_gat_former2_queue_feature import PyTorchChargingValueFunction as MASACQueueLengthValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = MASACQueueLengthValueFunction
-    elif zone_distribution_mode == "masac_baseline":
-        from src.ValueFunction_masac_baseline import PyTorchChargingValueFunction as MASACBaselineValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = MASACBaselineValueFunction
-    elif zone_distribution_mode in {
-        "st_masac_gat_post_demand_direct",
-        "st_masac_gat_queue_demand_gurobi",
-    }:
-        from src.ValueFunction_st_masac_gat_post_demand_direct import PyTorchChargingValueFunction as MASACPostDemandDirectValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = MASACPostDemandDirectValueFunction
-    elif zone_distribution_mode == "optimization_anchored_residual":
-        from src.ValueFunction_optimization_anchored_residual import PyTorchChargingValueFunction as OptimizationAnchoredValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = OptimizationAnchoredValueFunction
-    elif zone_distribution_mode == "integrated_directq":
-        from src.ValueFunction_integrated_directq import PyTorchChargingValueFunction as IntegratedDirectQValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = IntegratedDirectQValueFunction
-    elif zone_distribution_mode == "standard_masac_gat_total_q":
-        from src.ValueFunction_standard_masac_gat_total_q import PyTorchChargingValueFunction as StandardMASACTotalQValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = StandardMASACTotalQValueFunction
-    elif zone_distribution_mode in {
-        "standard_masac_gat",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
-        from src.ValueFunction_standard_masac_gat import PyTorchChargingValueFunction as StandardMASACGATValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = StandardMASACGATValueFunction
+    validate_value_function_registry()
+    adp_trainer_module.PyTorchChargingValueFunction = get_value_function_class(
+        zone_distribution_mode
+    )
 
     print("🚗⚡ ADPTrainer charging integration run")
     print(f"ADP={args.adp}, episodes={args.episodes}, vehicles={args.num_vehicles}, ev={args.num_ev}")
@@ -309,6 +290,8 @@ def main():
                 use_intense_requests=demand_pattern,
                 assignmentgurobi=args.assignment_gurobi,
                 batch_size=args.batch_size,
+                checkpoint_replay=args.checkpoint_replay,
+                checkpoint_replay_recent=args.checkpoint_replay_recent,
                 num_vehicles=args.num_vehicles,
                 num_ev=args.num_ev,
                 heuristic_battery_threshold=args.heuristic_battery_threshold,
@@ -410,6 +393,21 @@ def main():
                     manifest_path,
                     arguments=manifest_arguments,
                     results=results,
+                    value_functions=(
+                        getattr(env, "value_function", None),
+                        getattr(env, "value_function_ev", None),
+                    ),
+                    checkpoint_paths=tuple(dict.fromkeys(
+                        path
+                        for value_function in (
+                            getattr(env, "value_function", None),
+                            getattr(env, "value_function_ev", None),
+                        )
+                        if value_function is not None
+                        for path in getattr(
+                            value_function, "checkpoint_artifact_paths", ()
+                        )
+                    )),
                 )
                 print(f"Manifest saved to: {manifest_path}")
 

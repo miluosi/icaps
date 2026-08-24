@@ -236,7 +236,9 @@ def test_critical_aev_cannot_wait_when_queue_admission_is_reachable():
         }
     )
 
-    assert env.generate_vehicle_wait([100], rebalance_num=200).tolist() == [[0.0]]
+    # Waiting remains a physical outside action; charging urgency is scored,
+    # not encoded by making the exact-one assignment infeasible.
+    assert env.generate_vehicle_wait([100], rebalance_num=200).tolist() == [[1.0]]
 
 
 def test_predictive_aev_initial_battery_scale_creates_charge_demand():

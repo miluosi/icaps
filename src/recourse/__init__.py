@@ -1,6 +1,7 @@
 """Shared recourse-learning infrastructure for synthetic and NYC runs."""
 
 from .coordinator import RecourseCoordinator
+from .critics import enforce_critic_identity, uses_shared_critic
 from .lifecycle import RequestLifecycleTracker
 from .replay import PrioritizedJointReplayBuffer
 from .state_snapshot import StateSnapshotBuilder
@@ -13,4 +14,6 @@ __all__ = [
     "RecourseTargetBuilder",
     "RequestLifecycleTracker",
     "StateSnapshotBuilder",
+    "enforce_critic_identity",
+    "uses_shared_critic",
 ]

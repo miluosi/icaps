@@ -13,7 +13,7 @@ from enum import IntEnum
 from typing import Any, Iterable, Mapping
 
 
-REPLAY_SCHEMA_VERSION = 1
+REPLAY_SCHEMA_VERSION = 2
 STATE_VARIANTS = (
     "joint_state_shared_critic",
     "joint_state_separate_critics",
@@ -48,6 +48,7 @@ class RequestSnapshot:
     dropoff_deadline: float
     travel_time: float
     trip_distance_km: float | None = None
+    pickup_zone_id: int | None = None
 
     @classmethod
     def from_request(cls, request: Any) -> "RequestSnapshot":
@@ -73,6 +74,11 @@ class RequestSnapshot:
                 None
                 if getattr(request, "trip_distance_km", None) is None
                 else float(getattr(request, "trip_distance_km"))
+            ),
+            pickup_zone_id=(
+                None
+                if getattr(request, "pickup_zone_id", None) is None
+                else int(getattr(request, "pickup_zone_id"))
             ),
         )
 
@@ -119,6 +125,10 @@ class StationSnapshot:
     occupied: int
     inbound: int
     queued: int
+    physical_capacity: int = 0
+    queue_admission_capacity: int = 0
+    reserve_inbound_capacity: bool = False
+    remaining_admission_capacity: int = 0
 
 
 @dataclass(frozen=True)
@@ -306,6 +316,14 @@ class OfferAttempt:
 
 
 @dataclass(frozen=True)
+class ResidualObservation:
+    request_id: int
+    epoch_id: int
+    category: str
+    eligible: bool
+
+
+@dataclass(frozen=True)
 class RejectionOutcomeSnapshot:
     offer_attempts: tuple[OfferAttempt, ...] = ()
 
@@ -329,6 +347,14 @@ class RecourseEvent:
     completion_epoch_id: int | None = None
     expired: bool = False
     cancelled: bool = False
+    residual_observations: tuple[ResidualObservation, ...] = ()
+    first_rejected_epoch: int | None = None
+    assigned_vehicle_type: int | None = None
+    pickup_vehicle_id: int | None = None
+    pickup_vehicle_type: int | None = None
+    completion_vehicle_id: int | None = None
+    completion_vehicle_type: int | None = None
+    same_epoch_recourse_link: bool = False
 
 
 @dataclass(frozen=True)
@@ -376,7 +402,25 @@ class RecourseTransition:
     planner_metadata: PlannerMetadata = field(default_factory=PlannerMetadata)
     outcome_summary: OutcomeSummary = field(default_factory=OutcomeSummary)
     schema_version: int = REPLAY_SCHEMA_VERSION
-    target_builder_version: str = "solver_consistent_v1"
+    target_builder_version: str = "solver_consistent_v2"
+    run_id: str = ""
+    cumulative_episode_id: int = 0
+    transition_sequence_index: int = 0
+    previous_transition_id: str | None = None
+    next_transition_id: str | None = None
+    request_generation_seed: int = 0
+    vehicle_initialization_seed: int = 0
+    reward_scope: str = "selected_epoch_actions"
+    rewarded_vehicle_ids: tuple[int, ...] = ()
+    continuing_action_edge_ids: tuple[str, ...] = ()
+    online_model_step: int = 0
+    target_model_step: int = 0
+    target_solver_backend: str = ""
+    target_solver_status: str = "not_built"
+    target_selected_edge_ids: tuple[str, ...] = ()
+    target_structured_value: float = 0.0
+    target_correction_value: float = 0.0
+    target_full_value: float = 0.0
 
     def __post_init__(self) -> None:
         if self.schema_version != REPLAY_SCHEMA_VERSION:
