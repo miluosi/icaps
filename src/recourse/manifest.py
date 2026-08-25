@@ -82,7 +82,17 @@ def write_experiment_manifest(
             value_functions
         ),
         "target_builder_version": "solver_consistent_v2",
-        "target_solver_backend": "scipy_highs_milp",
+        "target_solver_backend": "exact_mcmf_quantized",
+        "optimizer_budget": _json_safe(
+            dict(results.get("optimizer_budget", {}) or {})
+        ),
+        "run_identity": _json_safe({
+            "training_run_id": results.get("training_run_id"),
+            "resume_episode_offset": results.get(
+                "resume_episode_offset", 0
+            ),
+            "episodes": results.get("episode_identity_rows", ()),
+        }),
         "test_status": _json_safe(
             dict(test_status or results.get("test_status", {}) or {})
         ),

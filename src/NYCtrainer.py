@@ -1,6 +1,7 @@
 import copy
 import json
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -11,7 +12,12 @@ import torch
 from src.ADPtrainer import ADPTrainer
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import aggregate_wait_metrics
-from src.recourse.critics import enforce_critic_identity, uses_shared_critic
+from src.recourse.critics import (
+    enforce_critic_identity,
+    uses_shared_critic,
+    wire_recourse_critics,
+)
+from src.recourse.training import training_readiness
 
 
 class NYCTrainer:
@@ -1026,6 +1032,8 @@ class NYCTrainer:
             value_function = None
             value_function_ev = None
 
+        training_run_id = uuid.uuid4().hex
+        resume_episode_offset = 0
         if ifloadcheckpoint:
             checkpoint_assign_tag = self._trainer_helper._resolve_checkpoint_assign_tag(
                 assignmentgurobi,
@@ -1082,6 +1090,19 @@ class NYCTrainer:
                 )
             print(f"   AEV checkpoint: {aev_ckpt or 'Not Found'}")
             print(f"   EV  checkpoint: {ev_ckpt or 'Not Found'}")
+            if ev_ckpt and aev_ckpt:
+                ev_identity = self._trainer_helper._checkpoint_identity(ev_ckpt)
+                aev_identity = self._trainer_helper._checkpoint_identity(aev_ckpt)
+                if int(ev_identity.get("episode", -1)) != int(
+                    aev_identity.get("episode", -1)
+                ):
+                    raise ValueError("NYC EV/AEV checkpoints have different episodes")
+                resume_episode_offset = max(
+                    0, int(ev_identity.get("episode", 0) or 0)
+                )
+                loaded_run_id = ev_identity.get("training_run_id")
+                if loaded_run_id:
+                    training_run_id = str(loaded_run_id)
             missing_checkpoints = []
             if not aev_ckpt:
                 missing_checkpoints.append(aevfile)
@@ -1125,6 +1146,15 @@ class NYCTrainer:
                 only_manhattan_zones=only_manhattan_zones,
                 full_demand=full_demand,
             )
+
+        if value_function is not None and value_function_ev is not None:
+            value_function, value_function_ev = wire_recourse_critics(
+                value_function,
+                value_function_ev,
+                state_variant=state_variant,
+            )
+            env.set_value_function(value_function)
+            env.set_value_function_ev(value_function_ev)
 
         env.adp_value = adpvalue
         env.assignmentgurobi = assignmentgurobi
@@ -1192,6 +1222,9 @@ class NYCTrainer:
             "episode_times": [],
             "avg_step_times": [],
             "step_timing_rows": [],
+            "training_run_id": training_run_id,
+            "resume_episode_offset": int(resume_episode_offset),
+            "episode_identity_rows": [],
         }
         best_reward = float("-inf")
         best_reward_ev = float("-inf")
@@ -1202,11 +1235,18 @@ class NYCTrainer:
         global_step = 0
         combined_best_loss = float("inf")
         for episode in range(num_episodes):
-            env.cumulative_episode_index = int(episode)
-            env.recourse_run_id = f"nyc-seed-{int(random_seed)}"
+            cumulative_episode_index = resume_episode_offset + episode
+            global_episode_number = cumulative_episode_index + 1
+            env.cumulative_episode_index = int(cumulative_episode_index)
+            env.recourse_run_id = str(training_run_id)
             episode_start = time.time()
-            episode_seed = 32 + episode
+            episode_seed = 32 + cumulative_episode_index
             env.set_request_generation_seed(episode_seed)
+            results["episode_identity_rows"].append({
+                "cumulative_episode_index": int(cumulative_episode_index),
+                "request_generation_seed": int(episode_seed),
+                "recourse_run_id": str(training_run_id),
+            })
 
             env.reset()
             episode_reward = 0
@@ -1245,7 +1285,7 @@ class NYCTrainer:
                 simulation_profile = info.get("simulation_profile", {})
                 step_profile = info.get("step_profile", {})
                 results["step_timing_rows"].append({
-                    "episode_number": episode + 1,
+                    "episode_number": global_episode_number,
                     "step_number": step,
                     "global_step": global_step,
                     "simulate_motion_time_sec": simulate_motion_time,
@@ -1337,18 +1377,19 @@ class NYCTrainer:
                         )
                     idle_list.append(vehicle_status_count["fully_idle"])
 
-                def _value_training_ready(value_fn) -> bool:
-                    if value_fn is None:
-                        return False
-                    replay_ready = len(getattr(value_fn, "experience_buffer", [])) >= warmup_steps
-                    queue_ready = (
-                        hasattr(value_fn, "train_queue_predictor")
-                        and len(getattr(value_fn, "queue_experience_buffer", [])) >= 4
-                    )
-                    return bool(replay_ready or queue_ready)
+                def _value_training_ready(value_fn, *, ifEV: bool) -> bool:
+                    return training_readiness(
+                        value_fn,
+                        ifEV=ifEV,
+                        edge_warmup=warmup_steps,
+                    ).any_ready
 
-                aev_training_ready = _value_training_ready(value_function)
-                ev_training_ready = _value_training_ready(value_function_ev)
+                aev_training_ready = _value_training_ready(
+                    value_function, ifEV=False
+                )
+                ev_training_ready = _value_training_ready(
+                    value_function_ev, ifEV=True
+                )
                 if (
                     use_neural_network
                     and global_step >= prestep
@@ -1503,7 +1544,7 @@ class NYCTrainer:
                 episode_charging_events.extend(info.get("charging_events", []))
                 global_step += 1
 
-            if use_neural_network and not ifloadcheckpoint:
+            if use_neural_network:
                 evfile, aevfile = self._checkpoint_dirs(
                     transportation_mode=transportation_mode,
                     assignmentgurobi=assignmentgurobi,
@@ -1520,17 +1561,41 @@ class NYCTrainer:
                 if episode_reward > best_reward:
                     best_reward = episode_reward
                     print(f"🏆 New best total reward: {best_reward:.2f} at episode {episode + 1}, saving paired checkpoints...")
+                    best_pair_id = (
+                        f"{training_run_id}:best:{global_episode_number}"
+                    )
+                    best_metadata = {
+                        "checkpoint_pair_id": best_pair_id,
+                        "training_run_id": training_run_id,
+                        "combined_reward": float(episode_reward),
+                        "episode_reward_ev": float(episode_reward_ev),
+                        "episode_reward_aev": float(episode_reward_aev),
+                    }
                     self._trainer_helper._save_q_network_checkpoint(
                         value_function,
-                        episode + 1,
+                        global_episode_number,
                         checkpoint_dir=aevfile,
                         checkpoint_tag="best",
+                        checkpoint_metadata=best_metadata,
                     )
+                    shared_payload_owner = bool(
+                        getattr(
+                            value_function_ev,
+                            "_owns_joint_replay_payload",
+                            True,
+                        )
+                    )
+                    if value_function_ev is value_function:
+                        value_function_ev._owns_joint_replay_payload = False
                     self._trainer_helper._save_q_network_checkpoint(
                         value_function_ev,
-                        episode + 1,
+                        global_episode_number,
                         checkpoint_dir=evfile,
                         checkpoint_tag="best",
+                        checkpoint_metadata=best_metadata,
+                    )
+                    value_function_ev._owns_joint_replay_payload = (
+                        shared_payload_owner
                     )
 
                 if episode_reward_ev > best_reward_ev:
@@ -1538,7 +1603,7 @@ class NYCTrainer:
                     print(f"🏆 New best EV reward: {best_reward_ev:.2f} at episode {episode + 1}, saving EV-only best checkpoint...")
                     self._trainer_helper._save_q_network_checkpoint(
                         value_function_ev,
-                        episode + 1,
+                        global_episode_number,
                         checkpoint_dir=evfile,
                         checkpoint_tag="best_ev",
                     )
@@ -1548,12 +1613,12 @@ class NYCTrainer:
                     print(f"🏆 New best AEV reward: {best_reward_aev:.2f} at episode {episode + 1}, saving AEV-only best checkpoint...")
                     self._trainer_helper._save_q_network_checkpoint(
                         value_function,
-                        episode + 1,
+                        global_episode_number,
                         checkpoint_dir=aevfile,
                         checkpoint_tag="best_aev",
                     )
 
-            if use_neural_network and not ifloadcheckpoint:
+            if use_neural_network:
                 evfile, aevfile = self._checkpoint_dirs(
                     transportation_mode=transportation_mode,
                     assignmentgurobi=assignmentgurobi,
@@ -1566,16 +1631,31 @@ class NYCTrainer:
                     full_demand=full_demand,
                     checkpoint_suffix=checkpoint_suffix,
                 )
+                latest_pair_id = (
+                    f"{training_run_id}:latest:{global_episode_number}"
+                )
+                checkpoint_metadata = {
+                    "checkpoint_pair_id": latest_pair_id,
+                    "training_run_id": training_run_id,
+                }
                 self._trainer_helper._save_q_network_checkpoint(
                     value_function,
-                    episode + 1,
+                    global_episode_number,
                     checkpoint_dir=aevfile,
+                    checkpoint_metadata=checkpoint_metadata,
                 )
+                shared_payload_owner = bool(
+                    getattr(value_function_ev, "_owns_joint_replay_payload", True)
+                )
+                if value_function_ev is value_function:
+                    value_function_ev._owns_joint_replay_payload = False
                 self._trainer_helper._save_q_network_checkpoint(
                     value_function_ev,
-                    episode + 1,
+                    global_episode_number,
                     checkpoint_dir=evfile,
+                    checkpoint_metadata=checkpoint_metadata,
                 )
+                value_function_ev._owns_joint_replay_payload = shared_payload_owner
 
             avg_loss_aev = np.mean(episode_losses) if episode_losses else 0.0
             avg_loss_ev = np.mean(episode_losses_ev) if episode_losses_ev else 0.0
@@ -1609,7 +1689,7 @@ class NYCTrainer:
             results["battery_levels"].append(stats["average_battery"])
 
             episode_stats = env.get_episode_stats()
-            episode_stats["episode_number"] = episode + 1
+            episode_stats["episode_number"] = global_episode_number
             episode_stats["episode_reward"] = episode_reward
             episode_stats["episode_reward_aev"] = episode_reward_aev
             episode_stats["episode_reward_ev"] = episode_reward_ev
@@ -1704,4 +1784,57 @@ class NYCTrainer:
         results["excel_path"] = excel_path
         results["spatial_image_path"] = spatial_path
 
+        results["optimizer_budget"] = {
+            "shared_critic": bool(value_function is value_function_ev),
+            "optimizer_steps_total": int(
+                sum(
+                    getattr(vf, "optimizer_steps_total", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+            "optimizer_steps_aev": int(
+                getattr(value_function, "optimizer_steps_total", 0)
+                if value_function is not None
+                else 0
+            ),
+            "optimizer_steps_ev": int(
+                getattr(value_function_ev, "optimizer_steps_total", 0)
+                if value_function_ev is not None
+                else 0
+            ),
+            "joint_updates": int(
+                sum(
+                    getattr(vf, "optimizer_steps_joint", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+            "edge_updates": int(
+                sum(
+                    getattr(vf, "optimizer_steps_edge", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+            "queue_updates": int(
+                sum(
+                    getattr(vf, "optimizer_steps_queue", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+        }
         return results, env

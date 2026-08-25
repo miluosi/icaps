@@ -33,7 +33,12 @@ from .charging_station import ChargingStationManager, ChargingStation
 from .charging_wait_metrics import aggregate_wait_metrics
 from .CentralAgent import CentralAgent
 from .SpatialVisualization import SpatialVisualization
-from .recourse.critics import enforce_critic_identity, uses_shared_critic
+from .recourse.critics import (
+    enforce_critic_identity,
+    uses_shared_critic,
+    wire_recourse_critics,
+)
+from .recourse.training import training_readiness
 
 
 class ADPTrainer:
@@ -1392,6 +1397,14 @@ class ADPTrainer:
                 ):
                     current_value_function.post_demand_predictor_trained = False
                     log_progress(f"Post-demand predictor disabled for {label} ablation")
+
+            value_function, value_function_ev = wire_recourse_critics(
+                value_function,
+                value_function_ev,
+                state_variant=state_variant,
+            )
+            env.set_value_function(value_function)
+            env.set_value_function_ev(value_function_ev)
         
         env.adp_value = adpvalue
         env.assignmentgurobi = assignmentgurobi
@@ -1435,6 +1448,9 @@ class ADPTrainer:
             'sample_assign_q_values_aev': [],
             'sample_assign_q_values_ev': [],
             'episode_times': [],
+            'training_run_id': training_run_id,
+            'resume_episode_offset': int(resume_episode_offset),
+            'episode_identity_rows': [],
         }
 
         best_reward = resume_best_reward
@@ -1522,6 +1538,14 @@ class ADPTrainer:
                 )
             else:
                 env.vehicle_initialization_seed = env.initial_random_seed
+            results['episode_identity_rows'].append({
+                'cumulative_episode_index': int(cumulative_episode_index),
+                'request_generation_seed': int(episode_seed),
+                'vehicle_initialization_seed': int(
+                    env.vehicle_initialization_seed
+                ),
+                'recourse_run_id': str(env.recourse_run_id),
+            })
 
             log_progress(f"Resetting environment for episode {episode + 1}")
             _states = env.reset()
@@ -1639,16 +1663,34 @@ class ADPTrainer:
                     else:
                         print(f"  Neural Network: {'Not training yet' if use_neural_network else 'Disabled'}")
 
-                if use_neural_network and len(value_function.experience_buffer) >= warmup_steps and episode >= start_training_episode:
+                aev_training_ready = training_readiness(
+                    value_function,
+                    ifEV=False,
+                    edge_warmup=warmup_steps,
+                ).any_ready
+                ev_training_ready = training_readiness(
+                    value_function_ev,
+                    ifEV=True,
+                    edge_warmup=warmup_steps,
+                ).any_ready
+                if use_neural_network and (aev_training_ready or ev_training_ready) and episode >= start_training_episode:
                     if step % training_frequency == 0:
                         if step % 100 == 0:
                             aev_buffer_size = len(value_function.experience_buffer)
                             ev_buffer_size = len(value_function_ev.experience_buffer)
                             print(f"🔄 Training (Episode {episode}): AEV buffer={aev_buffer_size}, EV buffer={ev_buffer_size}")
-                        training_loss = value_function.train_step(batch_size=batch_size, ifEV=False)
+                        training_loss = (
+                            value_function.train_step(batch_size=batch_size, ifEV=False)
+                            if aev_training_ready
+                            else 0.0
+                        )
                         if training_loss > 0:
                             episode_losses.append(training_loss)
-                        training_loss_ev = value_function_ev.train_step(batch_size=batch_size, ifEV=True)
+                        training_loss_ev = (
+                            value_function_ev.train_step(batch_size=batch_size, ifEV=True)
+                            if ev_training_ready
+                            else 0.0
+                        )
                         if training_loss_ev > 0:
                             episode_losses_ev.append(training_loss_ev)
                 elif use_neural_network and episode < effective_start_training_episode and step % 100 == 0:
@@ -2136,5 +2178,58 @@ class ADPTrainer:
         results['excel_path'] = excel_path
         results['spatial_image_path'] = spatial_path
 
+        results["optimizer_budget"] = {
+            "shared_critic": bool(value_function is value_function_ev),
+            "optimizer_steps_total": int(
+                sum(
+                    getattr(vf, "optimizer_steps_total", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+            "optimizer_steps_aev": int(
+                getattr(value_function, "optimizer_steps_total", 0)
+                if value_function is not None
+                else 0
+            ),
+            "optimizer_steps_ev": int(
+                getattr(value_function_ev, "optimizer_steps_total", 0)
+                if value_function_ev is not None
+                else 0
+            ),
+            "joint_updates": int(
+                sum(
+                    getattr(vf, "optimizer_steps_joint", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+            "edge_updates": int(
+                sum(
+                    getattr(vf, "optimizer_steps_edge", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+            "queue_updates": int(
+                sum(
+                    getattr(vf, "optimizer_steps_queue", 0)
+                    for vf in {
+                        id(value_function): value_function,
+                        id(value_function_ev): value_function_ev,
+                    }.values()
+                    if vf is not None
+                )
+            ),
+        }
         return results, env
     

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 import json
 import pickle
 
@@ -81,6 +81,10 @@ class PrioritizedJointReplayBuffer:
 
     def add(self, transition: RecourseTransition, *, td_error: float | None = None) -> int:
         self._validate(transition)
+        if transition.transition_id in self._transition_index:
+            raise ValueError(
+                f"duplicate transition id: {transition.transition_id}"
+            )
         priority = self._initial_priority(transition, td_error)
         if len(self._items) < self.capacity:
             index = len(self._items)
@@ -104,29 +108,64 @@ class PrioritizedJointReplayBuffer:
         *,
         rng: np.random.Generator | None = None,
     ) -> ReplaySample:
+        return self.sample_ready(batch_size, rng=rng)
+
+    def sample_ready(
+        self,
+        batch_size: int,
+        *,
+        predicate: Callable[[RecourseTransition], bool] | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> ReplaySample:
+        """Sample only trainable rows without advancing the beta schedule."""
+
         if not self._items:
             raise ValueError("cannot sample an empty replay buffer")
         rng = rng or self.rng
-        fraction = min(1.0, self.beta_step / float(self.beta_anneal_steps))
-        self.beta = self.beta_start + fraction * (self.beta_end - self.beta_start)
-        self.beta_step += 1
-        count = min(max(1, int(batch_size)), len(self._items))
-        priorities = np.asarray(self._priorities, dtype=np.float64)
+        eligible_indices = np.asarray(
+            [
+                index
+                for index, transition in enumerate(self._items)
+                if predicate is None or bool(predicate(transition))
+            ],
+            dtype=np.int64,
+        )
+        if eligible_indices.size == 0:
+            return ReplaySample((), (), (), ())
+        count = min(max(1, int(batch_size)), int(eligible_indices.size))
+        priorities = np.asarray(
+            [self._priorities[int(index)] for index in eligible_indices],
+            dtype=np.float64,
+        )
         scaled = np.power(np.maximum(priorities, self.epsilon), self.alpha)
         probabilities = scaled / scaled.sum()
-        indices = rng.choice(
-            len(self._items),
+        local_indices = rng.choice(
+            len(eligible_indices),
             size=count,
-            replace=count > len(self._items),
+            replace=count > len(eligible_indices),
             p=probabilities,
         )
-        weights = np.power(len(self._items) * probabilities[indices], -self.beta)
+        indices = eligible_indices[local_indices]
+        weights = np.power(
+            len(eligible_indices) * probabilities[local_indices], -self.beta
+        )
         weights /= max(float(weights.max()), self.epsilon)
         return ReplaySample(
             transitions=tuple(self._items[int(index)] for index in indices),
             indices=tuple(int(index) for index in indices),
             weights=tuple(float(weight) for weight in weights),
-            probabilities=tuple(float(probabilities[int(index)]) for index in indices),
+            probabilities=tuple(
+                float(probabilities[int(index)]) for index in local_indices
+            ),
+        )
+
+    def advance_beta(self) -> None:
+        """Advance PER annealing after one successful optimizer update."""
+
+        self.beta_step += 1
+        fraction = min(1.0, self.beta_step / float(self.beta_anneal_steps))
+        self.beta = self.beta_start + fraction * (
+            self.beta_end - self.beta_start
         )
 
     def update_priorities(self, indices: Sequence[int], td_errors: Sequence[float]) -> None:
@@ -136,7 +175,28 @@ class PrioritizedJointReplayBuffer:
             index = int(index)
             if index < 0 or index >= len(self._priorities):
                 raise IndexError(f"replay index out of range: {index}")
-            self._priorities[index] = abs(float(error)) + self.epsilon
+            self._priorities[index] = self.priority_from_td(
+                self._items[index], float(error)
+            )
+
+    def priority_from_td(
+        self,
+        transition: RecourseTransition,
+        td_error: float,
+    ) -> float:
+        has_rejection = bool(
+            transition.rejection_outcome.rejected_request_ids
+        )
+        has_recourse = bool(
+            transition.outcome_summary.count("assigned")
+            or transition.outcome_summary.count("picked_up")
+        )
+        return float(
+            abs(float(td_error))
+            + self.epsilon
+            + self.rejection_bonus * float(has_rejection)
+            + self.recourse_bonus * float(has_recourse)
+        )
 
     def state_dict(
         self,
@@ -208,6 +268,9 @@ class PrioritizedJointReplayBuffer:
             raise ValueError("serialized replay content hash mismatch")
         for transition in items:
             self._validate(transition)
+        transition_ids = [transition.transition_id for transition in items]
+        if len(transition_ids) != len(set(transition_ids)):
+            raise ValueError("serialized replay contains duplicate transition ids")
         self.capacity = int(state.get("capacity", self.capacity))
         self.alpha = float(state.get("alpha", self.alpha))
         self.beta_start = float(
@@ -278,16 +341,10 @@ class PrioritizedJointReplayBuffer:
             if td_error is None
             else abs(float(td_error)) + self.epsilon
         )
-        has_rejection = bool(transition.rejection_outcome.rejected_request_ids)
-        has_recourse = bool(
-            transition.outcome_summary.count("assigned")
-            or transition.outcome_summary.count("picked_up")
-        )
-        return float(
-            base
-            + self.rejection_bonus * float(has_rejection)
-            + self.recourse_bonus * float(has_recourse)
-        )
+        # ``base`` for a fresh row is the current maximum priority, not a TD
+        # error.  Add the persistent event bonuses using the same formula as
+        # later updates.
+        return self.priority_from_td(transition, base - self.epsilon)
 
     @staticmethod
     def _validate(transition: RecourseTransition) -> None:

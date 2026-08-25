@@ -31,6 +31,7 @@ from shapely import contains_xy
 
 from src.Action import Action, ChargingAction, IdleAction, ServiceAction
 from src.charging_station import ChargingStation, ChargingStationManager
+from src.charging_metrics import charging_session_metrics
 from src.charging_wait_metrics import positive_wait_metrics
 from src.qvalue_precision import qvalue_rounding_diagnostics, round_qvalue_matrix
 from src.Request import Request
@@ -1250,6 +1251,8 @@ class NYCEnvironment:
                 'battery': random.uniform(0.8, 0.95),
                 'charging_station': None,
                 'charging_time_left': 0,
+                'charging_session_start_time': None,
+                'completed_charging_durations_minutes': [],
                 'total_distance': 0.0,
                 'charging_count': 0,
                 'assigned_request': None,
@@ -3435,6 +3438,7 @@ class NYCEnvironment:
         vehicle = self.vehicles[vehicle_id]
         vehicle['charge_target_soc'] = self._charge_target_for_battery(float(vehicle.get('battery', 0.0)))
         vehicle['charging_time_left'] = self._charge_duration_for_battery(float(vehicle.get('battery', 0.0)))
+        vehicle['charging_session_start_time'] = float(self.current_time)
 
     def _can_reach_location_with_battery(self, vehicle_id: int, target_zone: int, reserve: float = 0.01) -> bool:
         vehicle = self.vehicles[vehicle_id]
@@ -3955,6 +3959,18 @@ class NYCEnvironment:
                     sid = v['charging_station']
                     if sid in self.charging_manager.stations:
                         self.charging_manager.stations[sid].stop_charging(str(vid))
+                    session_start = v.get('charging_session_start_time')
+                    if session_start is not None:
+                        duration_minutes = max(
+                            0.0,
+                            (float(self.current_time) - float(session_start))
+                            * float(self.EPOCH_LENGTH)
+                            / 60.0,
+                        )
+                        v.setdefault('completed_charging_durations_minutes', []).append(
+                            duration_minutes
+                        )
+                    v['charging_session_start_time'] = None
                     v['charging_station'] = None
                     v.pop('charge_target_soc', None)
                     self.charge_finished += 1
@@ -3971,6 +3987,7 @@ class NYCEnvironment:
                         self._mark_charging_started(cvid, sid)
                         v['charging_station'] = sid
                         self._set_vehicle_charging_session(cvid)
+                        v['charging_count'] = int(v.get('charging_count', 0)) + 1
             self.idle_charging_num[sid] = station.max_capacity - len(station.current_vehicles)
 
         self.current_online = sum(1 for v in self.vehicles.values() if v.get('is_online', True))
@@ -5757,6 +5774,7 @@ class NYCEnvironment:
         RecourseTargetBuilder.validate_variant(
             getattr(self, "recourse_variant", "legacy"), "aevfirst"
         )
+        pending_transition = self._begin_joint_collection("aev_first")
         storeactions = {vid: self.storeactions.get(vid) for vid in self.vehicles}
         storeactions_ev = {vid: self.storeactions_ev.get(vid) for vid in self.vehicles}
 
@@ -5800,12 +5818,29 @@ class NYCEnvironment:
                     peer_dist=ev_state_dist, prior_features=None,
                 )
                 available_requests = self._get_available_requests()
+                self._active_recourse_stage = 1
+                self._active_stage_state_snapshot = (
+                    pending_transition.pre_state
+                    if pending_transition is not None
+                    else None
+                )
                 rebalancing_aev = self._solve_rebalancing(vehicles_aev, available_requests)
+                aev_stage_graph = getattr(
+                    self, "_last_feasible_graph_snapshot", None
+                )
                 aev_profile = dict(self._last_rebalancing_profile)
                 aev_new, aev_ch = self._process_integrated_assignments(
                     rebalancing_aev, actions, storeactions, storeactions_ev)
                 new_assignments += aev_new
                 charging_assignments += aev_ch
+                if pending_transition is not None:
+                    pending_transition.aev_stage_graph = aev_stage_graph
+                    pending_transition.aev_joint_action = JointActionSnapshot.from_graph(
+                        aev_stage_graph
+                    )
+                    pending_transition.residual_state = StateSnapshotBuilder.build(
+                        self
+                    )
 
                 # Build prior features from AEV leader for EV follower
                 aev_action_ids = [vid for vid in actions if not self._is_ev(vid)]
@@ -5818,10 +5853,36 @@ class NYCEnvironment:
                     peer_dist=aev_target_dist, prior_features=aev_prior_features,
                 )
                 available_requests = self._get_available_requests()
+                self._active_recourse_stage = 2
+                self._active_stage_state_snapshot = (
+                    pending_transition.residual_state
+                    if pending_transition is not None
+                    else None
+                )
                 rebalancing_ev = self._solve_rebalancing(vehicles_ev, available_requests, onlyev=True)
+                ev_stage_graph = getattr(
+                    self, "_last_feasible_graph_snapshot", None
+                )
                 ev_profile = dict(self._last_rebalancing_profile)
                 ev_new = self._process_ev_only_assignments(rebalancing_ev, actions, storeactions_ev)
                 new_assignments += ev_new
+                if pending_transition is not None:
+                    pending_transition.ev_stage_graph = ev_stage_graph
+                    pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
+                        ev_stage_graph
+                    )
+                    self._annotate_stage_actions(
+                        actions,
+                        aev_stage_graph,
+                        state_snapshot=pending_transition.pre_state,
+                        residual_state=pending_transition.residual_state,
+                    )
+                    self._annotate_stage_actions(
+                        actions,
+                        ev_stage_graph,
+                        state_snapshot=pending_transition.residual_state,
+                        residual_state=pending_transition.residual_state,
+                    )
                 ev_action_ids = [vid for vid in actions if self._is_ev(vid)]
                 ev_target_dist = self._zone_distribution_from_actions(ev_action_ids, actions)
                 self._bayes_step_contexts = {
@@ -5849,6 +5910,8 @@ class NYCEnvironment:
 
         fallback_start = time.time()
         self._build_fallback_actions(actions)
+        self._active_recourse_stage = 0
+        self._active_stage_state_snapshot = None
         fallback_time = time.time() - fallback_start
         if current_requests:
             self.update_recent_requests(current_requests)
@@ -6834,6 +6897,12 @@ class NYCEnvironment:
     # Episode stats
     # ==================================================================
 
+    def _charging_session_stats(self):
+        simulated_days = (
+            float(self.current_time) * float(self.EPOCH_LENGTH) / 86400.0
+        )
+        return charging_session_metrics(self.vehicles, simulated_days)
+
     def get_episode_stats(self):
         total_bat = sum(v['battery'] for v in self.vehicles.values())
         avg_bat = total_bat / max(1, len(self.vehicles))
@@ -7109,6 +7178,7 @@ class NYCEnvironment:
             'avg_request_value': avg_val,
             'avg_battery': avg_bat,
             'charge_finished': self.charge_finished,
+            **self._charging_session_stats(),
             'charging_wait_penalty_total': float(self.charging_wait_penalty_total),
             'charging_wait_steps': int(self.charging_wait_steps),
             'avg_charging_wait_time': avg_charging_wait_time,
@@ -7297,6 +7367,7 @@ class NYCEnvironment:
             ),
             'avg_battery': avg_bat,
             'average_battery': avg_bat,
+            **self._charging_session_stats(),
         }
 
     # ==================================================================

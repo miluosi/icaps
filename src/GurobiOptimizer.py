@@ -6851,7 +6851,9 @@ class GurobiOptimizer:
         chargingcapacitylist = {}
         if charging_stations:
             for station in charging_stations:
-                chargingcapacitylist[station.id] = max(station.max_capacity - len(station.current_vehicles), 0)
+                chargingcapacitylist[station.id] = self._charging_station_vacancy(
+                    station
+                )
         
 
         # 若调用方已经构造好 batch_q_value（来自 generate_vehicle_qvalue），
@@ -7004,7 +7006,11 @@ class GurobiOptimizer:
                         best_reloc_zone = scale_zone_indices[m] if m < len(scale_zone_indices) else None
                 
                 # 4. 等待Q值
-                wait_q = float(batch_q_value[vehicle_idx, -1])
+                wait_q = (
+                    float(batch_q_value[vehicle_idx, -1])
+                    if wait_feasibility[vehicle_idx] != 0
+                    else float("-inf")
+                )
                 
                 # 比较所有选项，选Q值最大的
                 options = []
@@ -7054,8 +7060,20 @@ class GurobiOptimizer:
 
  
 
-    def _heuristic_assignment_fastqvalue_evfirst(self, vehicle_ids, charging_stations=None, batch_q_value=None,):
+    def _heuristic_assignment_fastqvalue_evfirst(
+        self,
+        vehicle_ids,
+        charging_stations=None,
+        vehicle_action_matrix=None,
+        batch_q_value=None,
+    ):
         """基于Q值的启发式分配：按电量排序，AEV比较订单/充电/reloc最大Q值决策，EV选最大订单Q值"""
+        return self._heuristic_assignment_fastqvalue(
+            vehicle_ids,
+            charging_stations,
+            vehicle_action_matrix,
+            batch_q_value,
+        )
         
 
         
@@ -7244,8 +7262,20 @@ class GurobiOptimizer:
 
 
 
-    def _heuristic_assignment_fastqvalue_aevfirst(self, vehicle_ids, charging_stations=None, batch_q_value=None,):
+    def _heuristic_assignment_fastqvalue_aevfirst(
+        self,
+        vehicle_ids,
+        charging_stations=None,
+        vehicle_action_matrix=None,
+        batch_q_value=None,
+    ):
         """基于Q值的启发式分配：按电量排序，AEV比较订单/充电/reloc最大Q值决策，EV选最大订单Q值"""
+        return self._heuristic_assignment_fastqvalue(
+            vehicle_ids,
+            charging_stations,
+            vehicle_action_matrix,
+            batch_q_value,
+        )
         
 
         

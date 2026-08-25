@@ -17,6 +17,7 @@ import hashlib
 import numpy as np
 import math
 from .charging_station import ChargingStationManager, ChargingStation
+from .charging_metrics import charging_session_metrics
 from .Action import Action, ChargingAction, ServiceAction, IdleAction
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import positive_wait_metrics
@@ -2310,6 +2311,8 @@ class ChargingIntegratedEnvironment(Environment):
                 'battery': self._initial_vehicle_battery(i),
                 'charging_station': None,
                 'charging_time_left': 0,
+                'charging_session_start_time': None,
+                'completed_charging_durations_minutes': [],
                 'total_distance': 0,
                 'charging_count': 0,
                 'assigned_request': None,  # Currently assigned passenger request
@@ -2471,10 +2474,22 @@ class ChargingIntegratedEnvironment(Environment):
             if metadata is None:
                 continue
             vehicle_type = int(self.vehicles.get(vehicle_id, {}).get("type", 1))
+            aev_first = pending.mode in {"aev_first", "aevfirst"}
+            is_leader = (
+                vehicle_type == 2 if aev_first else vehicle_type == 1
+            )
             metadata.transition_id = pending.transition_id
-            metadata.stage_id = 1 if vehicle_type == 1 else 2
-            metadata.state_snapshot = (
-                pending.pre_state if vehicle_type == 1 else pending.residual_state
+            metadata.stage_id = 1 if is_leader else 2
+            metadata.state_snapshot = pending.pre_state if is_leader else pending.residual_state
+            metadata.feasible_graph_snapshot = (
+                pending.aev_stage_graph
+                if vehicle_type == 2
+                else pending.ev_stage_graph
+            )
+            metadata.joint_action_snapshot = (
+                pending.aev_joint_action
+                if vehicle_type == 2
+                else pending.ev_joint_action
             )
             if isinstance(action, ServiceAction):
                 request_id = int(action.request_id)
@@ -5742,9 +5757,12 @@ class ChargingIntegratedEnvironment(Environment):
                     RecourseTargetBuilder.verify_feasible(
                         integrated_graph, selected_edges
                     )
+                    integrated_graph = integrated_graph.with_selected(
+                        selected_edges, status="selected"
+                    )
                     pending_transition.ev_stage_graph = integrated_graph
                     pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
-                        integrated_graph, selected_edges
+                        integrated_graph
                     )
 
                 new_assignments = 0
@@ -6414,7 +6432,12 @@ class ChargingIntegratedEnvironment(Environment):
                     else:
                         charging_stations = self._charging_stations_accepting_arrivals()
                         if self.adp_value > 0 and self.value_function_ev is not None:
-                            rebalancing_assignments_ev = self.gurobi_optimizer._heuristic_assignment_fastqvalue_evfirst(vehicles_to_rebalance_ev, charging_stations, batch_q_value)
+                            rebalancing_assignments_ev = self.gurobi_optimizer._heuristic_assignment_fastqvalue_evfirst(
+                                vehicles_to_rebalance_ev,
+                                charging_stations,
+                                vehicle_action_matrix,
+                                batch_q_value,
+                            )
                         else:
                             vehicle_action_matrix, num_requests, num_stations, num_zones = self.generate_whole_matrix(vehicles_to_rebalance_ev, rebalance_num=len(vehicles_to_rebalance_ev), onlyev=True)
                             available_requests = list(self.active_requests.values()) if hasattr(self, 'active_requests') and self.active_requests else []
@@ -6431,8 +6454,12 @@ class ChargingIntegratedEnvironment(Environment):
                     RecourseTargetBuilder.verify_feasible(
                         ev_stage_graph, selected_ev_edges
                     )
+                    ev_stage_graph = ev_stage_graph.with_selected(
+                        selected_ev_edges, status="selected"
+                    )
+                    pending_transition.ev_stage_graph = ev_stage_graph
                     pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
-                        ev_stage_graph, selected_ev_edges
+                        ev_stage_graph
                     )
                                 
                 rejected_ev_requests = []
@@ -6776,8 +6803,12 @@ class ChargingIntegratedEnvironment(Environment):
                     RecourseTargetBuilder.verify_feasible(
                         aev_stage_graph, selected_aev_edges
                     )
+                    aev_stage_graph = aev_stage_graph.with_selected(
+                        selected_aev_edges, status="selected"
+                    )
+                    pending_transition.aev_stage_graph = aev_stage_graph
                     pending_transition.aev_joint_action = JointActionSnapshot.from_graph(
-                        aev_stage_graph, selected_aev_edges
+                        aev_stage_graph
                     )
 
                 # for vehicle_id in vehicles_to_rebalance_aev:
@@ -7144,7 +7175,7 @@ class ChargingIntegratedEnvironment(Environment):
         RecourseTargetBuilder.validate_variant(
             getattr(self, "recourse_variant", "legacy"), "aevfirst"
         )
-        self._begin_joint_collection("aev_first")
+        pending_transition = self._begin_joint_collection("aev_first")
         actions = {}
         follower_t_prediction = self.refresh_bayes_state_distribution()
         self._prior_features_for_posterior = None
@@ -7259,6 +7290,24 @@ class ChargingIntegratedEnvironment(Environment):
                     batch_q_value = self.generate_vehicle_qvalue(vehicles_to_rebalance_aev)
                 else:
                     batch_q_value = self.generate_vehicle_qvalue_withoutqnetwork(vehicles_to_rebalance_aev)
+                aev_stage_graph = None
+                if pending_transition is not None:
+                    structured_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
+                        vehicles_to_rebalance_aev
+                    )
+                    aev_stage_graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                        self,
+                        vehicles_to_rebalance_aev,
+                        vehicle_action_matrix,
+                        batch_q_value,
+                        structured_q_value,
+                        num_requests=num_requests,
+                        num_stations=num_stations,
+                        num_zones=num_zones,
+                        stage_id=1,
+                        solver_backend=pending_transition.solver_backend,
+                        state=pending_transition.pre_state,
+                    )
                 force_mcmf_knownreject = self._should_force_mcmf_knownreject(onlyev=False)
                 if self.usemcmf or force_mcmf_knownreject:
                     rebalancing_assignments_aev = self.gurobi_optimizer._np_vehicle_rebalancing_network(vehicles_to_rebalance_aev,available_requests, vehicle_action_matrix, batch_q_value, iflp=True)
@@ -7272,11 +7321,30 @@ class ChargingIntegratedEnvironment(Environment):
                     else:
                         charging_stations = self._charging_stations_accepting_arrivals()
                         if self.adp_value > 0 and self.value_function is not None:
-                            rebalancing_assignments_aev = self.gurobi_optimizer._heuristic_assignment_fastqvalue_aevfirst(vehicles_to_rebalance_aev, charging_stations, batch_q_value)
+                            rebalancing_assignments_aev = self.gurobi_optimizer._heuristic_assignment_fastqvalue_aevfirst(
+                                vehicles_to_rebalance_aev,
+                                charging_stations,
+                                vehicle_action_matrix,
+                                batch_q_value,
+                            )
                         else:
                             vehicle_action_matrix, num_requests, num_stations, num_zones = self.generate_whole_matrix(vehicles_to_rebalance_aev, rebalance_num=len(vehicles_to_rebalance_aev))
                             available_requests = list(self.active_requests.values()) if hasattr(self, 'active_requests') and self.active_requests else []
                             rebalancing_assignments_aev = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance_aev, available_requests, charging_stations, vehicle_action_matrix)
+                if pending_transition is not None and aev_stage_graph is not None:
+                    selected_aev_edges = StateSnapshotBuilder.selected_edge_ids(
+                        aev_stage_graph, rebalancing_assignments_aev
+                    )
+                    RecourseTargetBuilder.verify_feasible(
+                        aev_stage_graph, selected_aev_edges
+                    )
+                    aev_stage_graph = aev_stage_graph.with_selected(
+                        selected_aev_edges, status="selected"
+                    )
+                    pending_transition.aev_stage_graph = aev_stage_graph
+                    pending_transition.aev_joint_action = JointActionSnapshot.from_graph(
+                        aev_stage_graph
+                    )
                 quest_num_now = len(self.active_requests)
                 for vehicle_id, target_request in rebalancing_assignments_aev.items():
                     vehicle_location = self.vehicles[vehicle_id]['location']
@@ -7495,6 +7563,10 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
                                 self.storeactions[vehicle_id].current_time = self.current_time
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
+                if pending_transition is not None:
+                    pending_transition.residual_state = StateSnapshotBuilder.build(
+                        self
+                    )
                 requests_for_rebalance = list(self.active_requests.values()) if hasattr(self, 'active_requests') else []
                 # 获取所有已分配的request_id（包括assigned_request和passenger_onboard）
                 assigned_request = []
@@ -7522,6 +7594,24 @@ class ChargingIntegratedEnvironment(Environment):
                     batch_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
                         vehicles_to_rebalance_ev, onlyev=True
                     )
+                ev_stage_graph = None
+                if pending_transition is not None:
+                    structured_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
+                        vehicles_to_rebalance_ev, onlyev=True
+                    )
+                    ev_stage_graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+                        self,
+                        vehicles_to_rebalance_ev,
+                        vehicle_action_matrix,
+                        batch_q_value,
+                        structured_q_value,
+                        num_requests=num_requests,
+                        num_stations=num_stations,
+                        num_zones=num_zones,
+                        stage_id=2,
+                        solver_backend=pending_transition.solver_backend,
+                        state=pending_transition.residual_state,
+                    )
                 force_mcmf_knownreject = self._should_force_mcmf_knownreject(onlyev=True)
                 if self.usemcmf or force_mcmf_knownreject:
                     rebalancing_assignments_ev = self.gurobi_optimizer._np_vehicle_rebalancing_network_ev(vehicles_to_rebalance_ev,available_requests, vehicle_action_matrix, batch_q_value, iflp=True)
@@ -7544,6 +7634,20 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle_action_matrix, num_requests, num_stations, num_zones = self.generate_whole_matrix(vehicles_to_rebalance_ev, rebalance_num=len(vehicles_to_rebalance_ev), onlyev=True)
                             available_requests = list(self.active_requests.values()) if hasattr(self, 'active_requests') and self.active_requests else []
                             rebalancing_assignments_ev = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance_ev, available_requests, charging_stations, vehicle_action_matrix)
+                if pending_transition is not None and ev_stage_graph is not None:
+                    selected_ev_edges = StateSnapshotBuilder.selected_edge_ids(
+                        ev_stage_graph, rebalancing_assignments_ev
+                    )
+                    RecourseTargetBuilder.verify_feasible(
+                        ev_stage_graph, selected_ev_edges
+                    )
+                    ev_stage_graph = ev_stage_graph.with_selected(
+                        selected_ev_edges, status="selected"
+                    )
+                    pending_transition.ev_stage_graph = ev_stage_graph
+                    pending_transition.ev_joint_action = JointActionSnapshot.from_graph(
+                        ev_stage_graph
+                    )
                 for vehicle_id, target_request in rebalancing_assignments_ev.items():
                     vehicle = self.vehicles[vehicle_id]
                     vehicle_location = vehicle['location']
@@ -8644,7 +8748,7 @@ class ChargingIntegratedEnvironment(Environment):
                         if success:
                             self._mark_charging_started(vehicle_id, station_id)
                             vehicle['charging_station'] = station_id
-                            vehicle['charging_time_left'] = self.charge_duration
+                            self._set_vehicle_charging_session(vehicle_id)
                             vehicle['charging_count'] += 1
                             vehicle['target_location'] = None
                             vehicle.pop('target_charging_station', None)
@@ -9156,6 +9260,11 @@ class ChargingIntegratedEnvironment(Environment):
 
 
 
+    def _set_vehicle_charging_session(self, vehicle_id):
+        vehicle = self.vehicles[vehicle_id]
+        vehicle['charging_time_left'] = int(getattr(self, 'charge_duration', 2))
+        vehicle['charging_session_start_time'] = float(self.current_time)
+
     def _execute_movement_towards_charging_station(self, vehicle_id, station_id):
         """Execute movement towards charging station"""
         vehicle = self.vehicles[vehicle_id]
@@ -9179,7 +9288,7 @@ class ChargingIntegratedEnvironment(Environment):
             if success:
                 self._mark_charging_started(vehicle_id, station_id)
                 vehicle['charging_station'] = station_id
-                vehicle['charging_time_left'] = getattr(self, 'charge_duration', 2)
+                self._set_vehicle_charging_session(vehicle_id)
                 vehicle['charging_count'] += 1
                 vehicle['target_location'] = None  # Clear any rebalance target
                 vehicle.pop('target_charging_station', None)  # Remove target
@@ -9222,7 +9331,7 @@ class ChargingIntegratedEnvironment(Environment):
             if success:
                 self._mark_charging_started(vehicle_id, station_id)
                 vehicle['charging_station'] = station_id
-                vehicle['charging_time_left'] = getattr(self, 'charge_duration', 2)
+                self._set_vehicle_charging_session(vehicle_id)
                 vehicle['charging_count'] += 1
                 vehicle['target_location'] = None  # Clear any rebalance target
                 vehicle.pop('target_charging_station', None)  # Remove target
@@ -9654,6 +9763,21 @@ class ChargingIntegratedEnvironment(Environment):
                     if station_id in self.charging_manager.stations:
                         station = self.charging_manager.stations[station_id]
                         station.stop_charging(str(vehicle_id))
+                    session_start = vehicle.get('charging_session_start_time')
+                    if session_start is not None:
+                        duration_epochs = max(
+                            0.0,
+                            float(self.current_time) - float(session_start),
+                        )
+                        duration_minutes = (
+                            duration_epochs
+                            * 1440.0
+                            / max(1.0, float(self.simulation_period))
+                        )
+                        vehicle.setdefault(
+                            'completed_charging_durations_minutes', []
+                        ).append(duration_minutes)
+                    vehicle['charging_session_start_time'] = None
                     vehicle['charging_station'] = None
                     self.charge_finished += 1
                     self.charge_stats[station_id].append(self.current_time)
@@ -9671,8 +9795,9 @@ class ChargingIntegratedEnvironment(Environment):
                     if vehicle['charging_station'] is None:
                         self._mark_charging_started(vehicle_id, station_id)
                         vehicle['charging_station'] = station_id
-                        vehicle['charging_time_left'] = self.charge_duration
-                        # Don't increment charging_count as this is just a sync operation
+                        self._set_vehicle_charging_session(vehicle_id)
+                        # Auto-starting the next queued vehicle is a real session start.
+                        vehicle['charging_count'] = int(vehicle.get('charging_count', 0)) + 1
             self.idle_charging_num[station_id] = station.max_capacity - len(station.current_vehicles)
         self.current_online = sum(1 for vehicle in self.vehicles.values() if vehicle.get('is_online', True))
 
@@ -9817,6 +9942,13 @@ class ChargingIntegratedEnvironment(Environment):
         self._record_zone_vehicle_snapshot()
         return self.get_initial_states()
     
+    def _charging_session_stats(self):
+        simulated_days = float(self.current_time) / max(
+            1.0,
+            float(self.simulation_period),
+        )
+        return charging_session_metrics(self.vehicles, simulated_days)
+
     def get_episode_stats(self):
         """Get detailed statistics for current episode"""
         if not self.daily_online_history:
@@ -10006,6 +10138,7 @@ class ChargingIntegratedEnvironment(Environment):
             'completion_rate': completion_rate,
             'avg_battery_level': avg_battery,
             'finished_charge': self.charge_finished,
+            **self._charging_session_stats(),
             'charge_stats': self.charge_stats,
             'total_vehicles': len(self.vehicles),
             'online_vehicles': self.current_online,
@@ -10120,6 +10253,7 @@ class ChargingIntegratedEnvironment(Environment):
         return {
             'average_battery': avg_battery,
             'total_charging_events': total_charging,
+            **self._charging_session_stats(),
             'vehicles_charging': len([v for v in self.vehicles.values() 
                                     if v['charging_station'] is not None]),
             'online_vehicles': sum(1 for v in self.vehicles.values() if v.get('is_online', True)),

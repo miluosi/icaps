@@ -25,3 +25,5 @@ jobs:
         run: make smoke-toy
       - name: NYC sample CPU smoke
         run: make smoke-nyc
+      - name: End-to-end recourse learner smokes
+        run: make smoke-recourse

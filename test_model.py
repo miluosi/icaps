@@ -603,6 +603,30 @@ def main():
                     mean_episode_reward_ev = _mean_detail_metric(detailed, "episode_reward_ev")
                     mean_avg_battery_level = _mean_detail_metric(detailed, "avg_battery_level", "avg_battery")
                     mean_finished_charge = _mean_detail_metric(detailed, "finished_charge", "charge_finished")
+                    mean_daily_charges_human_ev = _mean_detail_metric(
+                        detailed,
+                        "avg_daily_charging_sessions_per_human_ev",
+                    )
+                    mean_daily_charges_aev = _mean_detail_metric(
+                        detailed,
+                        "avg_daily_charging_sessions_per_aev",
+                    )
+                    mean_daily_charges_all = _mean_detail_metric(
+                        detailed,
+                        "avg_daily_charging_sessions_per_vehicle",
+                    )
+                    mean_charge_duration_human_ev = _mean_detail_metric(
+                        detailed,
+                        "avg_charging_session_duration_minutes_human_ev",
+                    )
+                    mean_charge_duration_aev = _mean_detail_metric(
+                        detailed,
+                        "avg_charging_session_duration_minutes_aev",
+                    )
+                    mean_charge_duration_all = _mean_detail_metric(
+                        detailed,
+                        "avg_charging_session_duration_minutes_all",
+                    )
                     mean_charging_wait_penalty = _mean_detail_metric(detailed, "charging_wait_penalty_total")
                     mean_charging_wait_steps = _mean_detail_metric(detailed, "charging_wait_steps")
                     mean_charging_wait_time = _mean_detail_metric(detailed, "avg_charging_wait_time")
@@ -657,6 +681,12 @@ def main():
                         "episode_reward_ev": mean_episode_reward_ev,
                         "avg_battery_level": mean_avg_battery_level,
                         "finished_charge": mean_finished_charge,
+                        "avg_daily_charging_sessions_per_human_ev": mean_daily_charges_human_ev,
+                        "avg_daily_charging_sessions_per_aev": mean_daily_charges_aev,
+                        "avg_daily_charging_sessions_per_vehicle": mean_daily_charges_all,
+                        "avg_charging_session_duration_minutes_human_ev": mean_charge_duration_human_ev,
+                        "avg_charging_session_duration_minutes_aev": mean_charge_duration_aev,
+                        "avg_charging_session_duration_minutes_all": mean_charge_duration_all,
                         "charging_wait_penalty_total": mean_charging_wait_penalty,
                         "charging_wait_steps": mean_charging_wait_steps,
                         "avg_charging_wait_time": mean_charging_wait_time,
@@ -681,6 +711,14 @@ def main():
                           f"AvgWait: {mean_avg_wait:.2f}  "
                           f"WaitVeh: {mean_waiting_vehicle_count:.1f}  "
                           f"WaitSteps: {mean_charging_wait_steps:.2f}  "
+                          f"Charge/veh-day(EV/AEV/All): "
+                          f"{mean_daily_charges_human_ev:.3f}/"
+                          f"{mean_daily_charges_aev:.3f}/"
+                          f"{mean_daily_charges_all:.3f}  "
+                          f"ChargeTime(EV/AEV/All min): "
+                          f"{mean_charge_duration_human_ev:.1f}/"
+                          f"{mean_charge_duration_aev:.1f}/"
+                          f"{mean_charge_duration_all:.1f}  "
                           f"MaxPressure: {max_station_pressure:.2f}  "
                           f"DropOff: {mean_drop_off_rate:.4f}")
 
@@ -768,6 +806,12 @@ def main():
             "episode_reward_ev": np.mean([r["episode_reward_ev"] for r in subset]),
             "avg_battery_level": np.mean([r["avg_battery_level"] for r in subset]),
             "finished_charge": np.mean([r["finished_charge"] for r in subset]),
+            "avg_daily_charging_sessions_per_human_ev": np.mean([r["avg_daily_charging_sessions_per_human_ev"] for r in subset]),
+            "avg_daily_charging_sessions_per_aev": np.mean([r["avg_daily_charging_sessions_per_aev"] for r in subset]),
+            "avg_daily_charging_sessions_per_vehicle": np.mean([r["avg_daily_charging_sessions_per_vehicle"] for r in subset]),
+            "avg_charging_session_duration_minutes_human_ev": np.mean([r["avg_charging_session_duration_minutes_human_ev"] for r in subset]),
+            "avg_charging_session_duration_minutes_aev": np.mean([r["avg_charging_session_duration_minutes_aev"] for r in subset]),
+            "avg_charging_session_duration_minutes_all": np.mean([r["avg_charging_session_duration_minutes_all"] for r in subset]),
             "charging_wait_penalty_total": np.mean([r["charging_wait_penalty_total"] for r in subset]),
             "charging_wait_steps": np.mean([r["charging_wait_steps"] for r in subset]),
             "avg_charging_wait_time": np.mean([r["avg_charging_wait_time"] for r in subset]),

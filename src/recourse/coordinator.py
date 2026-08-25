@@ -150,6 +150,12 @@ class RecourseCoordinator:
         ):
             if graph is None or action is None:
                 continue
+            if tuple(graph.selected_edge_ids) != tuple(action.selected_edge_ids):
+                raise AssertionError(
+                    "serialized graph/action selected-edge mismatch: "
+                    f"graph={graph.selected_edge_ids}, "
+                    f"action={action.selected_edge_ids}"
+                )
             selected_ids = set(action.selected_edge_ids)
             selected_edges.extend(
                 edge for edge in graph.edges if edge.edge_id in selected_ids

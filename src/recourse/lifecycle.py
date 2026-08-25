@@ -19,6 +19,8 @@ from .types import (
 @dataclass
 class _MutableLifecycle:
     request_id: int
+    rejection_event_id: str = ""
+    transition_id: str = ""
     rejected_epoch_id: int | None = None
     residual_category: str = "other"
     residual_epoch_id: int | None = None
@@ -38,6 +40,7 @@ class _MutableLifecycle:
     completion_epoch_id: int | None = None
     expired: bool = False
     cancelled: bool = False
+    ultimately_served: bool = False
     residual_observations: list[ResidualObservation] = field(default_factory=list)
 
 
@@ -54,6 +57,9 @@ class RequestLifecycleTracker:
 
     def reset(self) -> None:
         self._requests: dict[int, _MutableLifecycle] = {}
+        self._rejection_events: dict[
+            tuple[int, int], _MutableLifecycle
+        ] = {}
         self._offers: list[OfferAttempt] = []
         self._offer_counts: dict[tuple[int, int, int], int] = {}
 
@@ -115,6 +121,22 @@ class RequestLifecycleTracker:
             if state.rejected_epoch_id is None:
                 state.rejected_epoch_id = int(epoch_id)
             state.residual_category = "rejected"
+            event_key = (request_snapshot.request_id, int(epoch_id))
+            rejection_event = self._rejection_events.setdefault(
+                event_key,
+                _MutableLifecycle(
+                    request_id=request_snapshot.request_id,
+                    rejection_event_id=(
+                        f"{transition_id}:rejection:{request_snapshot.request_id}:"
+                        f"{int(epoch_id)}"
+                    ),
+                    transition_id=str(transition_id),
+                    rejected_epoch_id=int(epoch_id),
+                    residual_category="rejected",
+                    residual_epoch_id=int(epoch_id),
+                ),
+            )
+            rejection_event.residual_category = "rejected"
         return offer
 
     def mark_residual(
@@ -143,6 +165,39 @@ class RequestLifecycleTracker:
         state.residual_category = category
         state.residual_epoch_id = int(epoch_id)
         state.eligible = bool(eligible)
+        if category != "rejected":
+            latest_rejection = max(
+                (
+                    event
+                    for (candidate_request_id, candidate_epoch), event
+                    in self._rejection_events.items()
+                    if candidate_request_id == int(request_id)
+                    and candidate_epoch <= int(epoch_id)
+                ),
+                key=lambda event: _epoch_or_default(event.rejected_epoch_id),
+                default=None,
+            )
+            if (
+                latest_rejection is not None
+                and observation not in latest_rejection.residual_observations
+            ):
+                latest_rejection.residual_observations.append(observation)
+        if category == "rejected":
+            rejection_event = self._rejection_events.setdefault(
+                (int(request_id), int(epoch_id)),
+                _MutableLifecycle(
+                    request_id=int(request_id),
+                    rejection_event_id=(
+                        f"rejection:{int(request_id)}:{int(epoch_id)}"
+                    ),
+                    rejected_epoch_id=int(epoch_id),
+                ),
+            )
+            if observation not in rejection_event.residual_observations:
+                rejection_event.residual_observations.append(observation)
+            rejection_event.residual_category = "rejected"
+            rejection_event.residual_epoch_id = int(epoch_id)
+            rejection_event.eligible = bool(eligible)
 
     def record_aev_assignment(
         self,
@@ -157,16 +212,43 @@ class RequestLifecycleTracker:
         )
         if int(vehicle_type) != 2:
             return False
+        rejection_event = self._rejection_events.get(
+            (int(request_id), int(epoch_id))
+        )
+        if rejection_event is None:
+            rejection_event = max(
+                (
+                    event
+                    for (candidate_request_id, _), event
+                    in self._rejection_events.items()
+                    if candidate_request_id == int(request_id)
+                    and not event.assigned
+                    and _epoch_or_default(event.rejected_epoch_id) < int(epoch_id)
+                ),
+                key=lambda event: _epoch_or_default(event.rejected_epoch_id),
+                default=None,
+            )
+        new_assignment = bool(
+            rejection_event is not None and not rejection_event.assigned
+        )
+        if new_assignment:
+            rejection_event.assigned = True
+            rejection_event.assigned_vehicle_id = int(vehicle_id)
+            rejection_event.assigned_vehicle_type = int(vehicle_type)
+            rejection_event.assignment_epoch_id = int(epoch_id)
+            rejection_event.same_epoch_recourse_link = (
+                rejection_event.rejected_epoch_id == int(epoch_id)
+            )
         same_epoch_recourse = (
-            state.rejected_epoch_id is not None
-            and state.rejected_epoch_id == int(epoch_id)
+            new_assignment
+            and rejection_event is not None
+            and rejection_event.rejected_epoch_id == int(epoch_id)
             and any(
-                observation.epoch_id == int(epoch_id)
-                and observation.category == "rejected"
-                for observation in state.residual_observations
+                observation.category == "rejected"
+                for observation in rejection_event.residual_observations
             )
         )
-        if state.rejected_epoch_id is not None and not state.assigned:
+        if new_assignment:
             state.assigned = True
             state.assigned_vehicle_id = int(vehicle_id)
             state.assigned_vehicle_type = int(vehicle_type)
@@ -186,7 +268,20 @@ class RequestLifecycleTracker:
         state = self._requests.setdefault(
             int(request_id), _MutableLifecycle(request_id=int(request_id))
         )
-        if state.rejected_epoch_id is None or state.pickup_epoch_id is not None:
+        candidates = [
+            event
+            for (candidate_request_id, _), event in self._rejection_events.items()
+            if candidate_request_id == int(request_id)
+            and event.pickup_epoch_id is None
+            and event.assigned_vehicle_id == int(vehicle_id)
+            and event.assigned_vehicle_type == int(vehicle_type)
+        ]
+        rejection_event = max(
+            candidates,
+            key=lambda event: _epoch_or_default(event.rejected_epoch_id),
+            default=None,
+        )
+        if rejection_event is None:
             return False
         state.pickup_vehicle_id = int(vehicle_id)
         state.pickup_vehicle_type = int(vehicle_type)
@@ -197,6 +292,10 @@ class RequestLifecycleTracker:
             and state.assigned_vehicle_id == int(vehicle_id)
         )
         state.picked_up = bool(is_linked_aev)
+        rejection_event.pickup_vehicle_id = int(vehicle_id)
+        rejection_event.pickup_vehicle_type = int(vehicle_type)
+        rejection_event.pickup_epoch_id = int(epoch_id)
+        rejection_event.picked_up = bool(is_linked_aev)
         return bool(is_linked_aev)
 
     def record_completion(
@@ -229,19 +328,40 @@ class RequestLifecycleTracker:
             and state.completion_vehicle_type == 2
         )
         state.completion_epoch_id = int(epoch_id)
-        return bool(state.completed)
+        state.ultimately_served = True
+        linked_completion = False
+        for (candidate_request_id, _), event in self._rejection_events.items():
+            if candidate_request_id != int(request_id):
+                continue
+            event.completion_vehicle_id = state.completion_vehicle_id
+            event.completion_vehicle_type = state.completion_vehicle_type
+            event.completion_epoch_id = int(epoch_id)
+            event.ultimately_served = True
+            event.completed = bool(
+                event.assigned_vehicle_type == 2
+                and event.assigned_vehicle_id == event.completion_vehicle_id
+                and event.completion_vehicle_type == 2
+            )
+            linked_completion = linked_completion or event.completed
+        return bool(linked_completion)
 
     def record_expiry(self, request_id: int) -> None:
         state = self._requests.setdefault(
             int(request_id), _MutableLifecycle(request_id=int(request_id))
         )
         state.expired = True
+        for (candidate_request_id, _), event in self._rejection_events.items():
+            if candidate_request_id == int(request_id):
+                event.expired = True
 
     def record_cancellation(self, request_id: int) -> None:
         state = self._requests.setdefault(
             int(request_id), _MutableLifecycle(request_id=int(request_id))
         )
         state.cancelled = True
+        for (candidate_request_id, _), event in self._rejection_events.items():
+            if candidate_request_id == int(request_id):
+                event.cancelled = True
 
     def rejection_outcome(
         self,
@@ -257,28 +377,57 @@ class RequestLifecycleTracker:
         return RejectionOutcomeSnapshot(tuple(offers))
 
     def outcome_summary(self, *, epoch_id: int | None = None) -> OutcomeSummary:
-        return OutcomeSummary(
-            tuple(
+        rows = list(self._rejection_events.values())
+        rows.extend(
+            state
+            for state in self._requests.values()
+            if state.rejected_epoch_id is None
+            and state.residual_epoch_id is not None
+            and state.residual_category in {"unoffered", "other"}
+        )
+        first_rejected_epoch = {
+            request_id: min(
+                event_epoch
+                for candidate_request_id, event_epoch in self._rejection_events
+                if candidate_request_id == request_id
+            )
+            for request_id, _ in self._rejection_events
+        }
+        events = []
+        for state in sorted(
+            rows,
+            key=lambda item: (
+                item.request_id,
+                _epoch_or_default(
+                    item.rejected_epoch_id
+                    if item.rejected_epoch_id is not None
+                    else item.residual_epoch_id
+                ),
+            ),
+        ):
+            event_epoch = int(
+                state.rejected_epoch_id
+                if state.rejected_epoch_id is not None
+                else _epoch_or_default(state.residual_epoch_id)
+            )
+            if epoch_id is not None and event_epoch != int(epoch_id):
+                continue
+            events.append(
                 RecourseEvent(
                     request_id=state.request_id,
-                    epoch_id=(
-                        state.rejected_epoch_id
-                        if state.rejected_epoch_id is not None
-                        else (
-                            state.residual_epoch_id
-                            if state.residual_epoch_id is not None
-                            else -1
-                        )
-                    ),
+                    epoch_id=event_epoch,
                     residual_category=(
                         "rejected"
                         if state.rejected_epoch_id is not None
                         else state.residual_category
                     ),
-                    eligible=any(
-                        observation.category == "rejected"
-                        and observation.eligible
-                        for observation in state.residual_observations
+                    eligible=(
+                        state.eligible
+                        or any(
+                            observation.category == "rejected"
+                            and observation.eligible
+                            for observation in state.residual_observations
+                        )
                     ),
                     assigned=state.assigned,
                     picked_up=state.picked_up,
@@ -290,30 +439,21 @@ class RequestLifecycleTracker:
                     expired=state.expired,
                     cancelled=state.cancelled,
                     residual_observations=tuple(state.residual_observations),
-                    first_rejected_epoch=state.rejected_epoch_id,
+                    first_rejected_epoch=first_rejected_epoch.get(
+                        state.request_id
+                    ),
                     assigned_vehicle_type=state.assigned_vehicle_type,
                     pickup_vehicle_id=state.pickup_vehicle_id,
                     pickup_vehicle_type=state.pickup_vehicle_type,
                     completion_vehicle_id=state.completion_vehicle_id,
                     completion_vehicle_type=state.completion_vehicle_type,
                     same_epoch_recourse_link=state.same_epoch_recourse_link,
-                )
-                for state in sorted(self._requests.values(), key=lambda item: item.request_id)
-                if (
-                    state.rejected_epoch_id is not None
-                    or (
-                        state.residual_epoch_id is not None
-                        and state.residual_category in {"unoffered", "other"}
-                    )
-                )
-                and (
-                    epoch_id is None
-                    or state.rejected_epoch_id == int(epoch_id)
-                    or state.assignment_epoch_id == int(epoch_id)
-                    or state.residual_epoch_id == int(epoch_id)
+                    rejection_event_id=state.rejection_event_id,
+                    transition_id=state.transition_id,
+                    ultimately_served=state.ultimately_served,
                 )
             )
-        )
+        return OutcomeSummary(tuple(events))
 
     def metrics(self) -> dict[str, float | int]:
         events = self.outcome_summary().events
@@ -341,17 +481,37 @@ class RequestLifecycleTracker:
         assignment_delays = [
             int(event.assignment_epoch_id) - int(event.epoch_id)
             for event in rejected
-            if event.assignment_epoch_id is not None
+            if event.same_epoch_recourse_link
+            and event.assignment_epoch_id is not None
         ]
         pickup_delays = [
             int(event.pickup_epoch_id) - int(event.epoch_id)
             for event in rejected
-            if event.pickup_epoch_id is not None
+            if event.picked_up and event.pickup_epoch_id is not None
         ]
         completion_delays = [
             int(event.completion_epoch_id) - int(event.epoch_id)
             for event in rejected
-            if event.completion_epoch_id is not None
+            if event.completed and event.completion_epoch_id is not None
+        ]
+        later_aev_rescue_delays = [
+            int(event.assignment_epoch_id) - int(event.epoch_id)
+            for event in rejected
+            if event.assigned
+            and event.assigned_vehicle_type == 2
+            and not event.same_epoch_recourse_link
+            and event.assignment_epoch_id is not None
+        ]
+        later_ev_completion_delays = [
+            int(event.completion_epoch_id) - int(event.epoch_id)
+            for event in rejected
+            if event.completion_vehicle_type == 1
+            and event.completion_epoch_id is not None
+        ]
+        ultimate_service_delays = [
+            int(event.completion_epoch_id) - int(event.epoch_id)
+            for event in rejected
+            if event.ultimately_served and event.completion_epoch_id is not None
         ]
         accepted_offers = sum(offer.accepted for offer in self._offers)
         rejected_offers = sum(offer.rejected for offer in self._offers)
@@ -382,6 +542,12 @@ class RequestLifecycleTracker:
             "unrecovered_rejected_count": sum(
                 not event.completed for event in rejected
             ),
+            "not_recovered_by_recourse_count": sum(
+                not event.completed for event in rejected
+            ),
+            "ultimately_unserved_count": sum(
+                not event.ultimately_served for event in rejected
+            ),
             "recovery_rate_assignment": assigned / denominator if rejected else 0.0,
             "recovery_rate_pickup": picked_up / denominator if rejected else 0.0,
             "recovery_rate_completion": completed / denominator if rejected else 0.0,
@@ -409,6 +575,11 @@ class RequestLifecycleTracker:
             "mean_completion_recovery_delay": _mean(completion_delays),
             "median_completion_recovery_delay": _quantile(completion_delays, 0.5),
             "p90_completion_recovery_delay": _quantile(completion_delays, 0.9),
+            "mean_later_aev_rescue_delay": _mean(later_aev_rescue_delays),
+            "mean_later_ev_completion_delay": _mean(
+                later_ev_completion_delays
+            ),
+            "mean_ultimate_service_delay": _mean(ultimate_service_delays),
         }
 
     def assert_reconciled(self) -> None:
@@ -435,6 +606,12 @@ class RequestLifecycleTracker:
 
 def _mean(values: list[int]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
+
+
+def _epoch_or_default(epoch_id: int | None) -> int:
+    """Preserve epoch zero; only missing epochs sort before real events."""
+
+    return -1 if epoch_id is None else int(epoch_id)
 
 
 def _quantile(values: list[int], probability: float) -> float:

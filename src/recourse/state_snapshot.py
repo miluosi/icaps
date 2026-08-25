@@ -33,10 +33,22 @@ class StateSnapshotBuilder:
         *,
         request_labels: Mapping[int, str] | None = None,
     ) -> SystemSnapshot:
-        vehicles = tuple(
-            VehicleSnapshot.from_vehicle(vehicle_id, vehicle)
-            for vehicle_id, vehicle in sorted(getattr(env, "vehicles", {}).items())
-        )
+        active_requests = getattr(env, "active_requests", {})
+        vehicles = []
+        for vehicle_id, vehicle in sorted(getattr(env, "vehicles", {}).items()):
+            request_id = vehicle.get("passenger_onboard")
+            if request_id is None:
+                request_id = vehicle.get("assigned_request")
+            vehicles.append(
+                VehicleSnapshot.from_vehicle(
+                    vehicle_id,
+                    vehicle,
+                    request=active_requests.get(request_id),
+                    env=env,
+                    current_time=float(getattr(env, "current_time", 0.0)),
+                )
+            )
+        vehicles = tuple(vehicles)
         zone_candidates = list(
             getattr(env, "aux_zone_ids", ())
             or getattr(env, "relocation_target_ids", ())
@@ -141,6 +153,7 @@ class StateSnapshotBuilder:
         request_map = {request.request_id: request for request in state.requests}
         station_ids = list(getattr(env, "_last_matrix_charge_station_ids", ()))[:num_stations]
         station_map = {station.station_id: station for station in state.stations}
+        zone_indices = list(getattr(env, "_last_matrix_zone_indices", ()))[:num_zones]
         zone_ids = list(getattr(env, "_last_matrix_zone_target_ids", ()))[:num_zones]
         vehicle_map = {vehicle.vehicle_id: vehicle for vehicle in state.vehicles}
         edges: list[FeasibleEdgeSnapshot] = []
@@ -241,7 +254,15 @@ class StateSnapshotBuilder:
                     target_distance = _distance(env, vehicle.location, target_location)
                     post_distance = target_distance
                     post_duration = _travel_time(env, vehicle.location, target_location)
-                    edge_metadata = (("zone_index", local_column),)
+                    serialized_zone_index = (
+                        int(zone_indices[local_column])
+                        if local_column < len(zone_indices)
+                        else int(local_column)
+                    )
+                    edge_metadata = (
+                        ("zone_column", int(local_column)),
+                        ("zone_index", serialized_zone_index),
+                    )
                 else:
                     if vehicle.vehicle_type == 1:
                         target_location = int(
@@ -398,6 +419,10 @@ class StateSnapshotBuilder:
             solver_backend=str(solver_backend),
             state=state,
             edges=tuple(edges),
+            objective_cost_scale=max(
+                1, int(getattr(env, "mcmf_cost_scale", 10_000) or 10_000)
+            ),
+            objective_precision_mode="integer_q_grid",
         )
 
     @staticmethod
@@ -489,6 +514,8 @@ class StateSnapshotBuilder:
             fleet_types = {2} if stage_id == 1 else {1}
         else:
             fleet_types = {1, 2}
+        request_map = {request.request_id: request for request in state.requests}
+        station_map = {station.station_id: station for station in state.stations}
         for vehicle in state.vehicles:
             if (
                 not vehicle.online
@@ -496,34 +523,156 @@ class StateSnapshotBuilder:
                 or vehicle.vehicle_id in matrix_vehicle_ids
             ):
                 continue
-            request_id = (
-                vehicle.assigned_request
-                if vehicle.assigned_request is not None
-                else vehicle.passenger_onboard
-            )
+            request_id = vehicle.service_request_id
             station_id = (
                 vehicle.charging_station
                 if vehicle.charging_station is not None
                 else vehicle.charging_target
             )
-            target = (
-                vehicle.target_location
-                if vehicle.target_location is not None
-                else vehicle.location
-            )
+            target = vehicle.location
+            post_location = vehicle.location
+            request_value = 0.0
+            post_duration = 1.0
+            post_distance = 0.0
+            resource_type = None
+            resource_id = None
+            resource_capacity = 1
+            queue_features: tuple[float, ...] = ()
+            metadata: dict[str, float | int | str | bool | None] = {
+                "continuing": True,
+                "service_phase": vehicle.service_phase,
+                "remaining_pickup_time": vehicle.remaining_pickup_time,
+                "remaining_trip_time": vehicle.remaining_trip_time,
+                "remaining_service_distance": vehicle.remaining_service_distance,
+                "charging_time_left": vehicle.charging_time_left,
+                "remaining_relocation_time": vehicle.remaining_relocation_time,
+                "stationary_duration_left": vehicle.stationary_duration_left,
+            }
             if request_id is not None:
                 action_type = ActionType.SERVICE
                 action_id = f"assign_{request_id}:continue"
+                request = request_map.get(request_id)
+                request_value = float(
+                    vehicle.service_request_value
+                    or getattr(request, "final_value", 0.0)
+                    or 0.0
+                )
+                if vehicle.service_phase == "passenger_onboard":
+                    target = int(
+                        vehicle.service_dropoff
+                        if vehicle.service_dropoff is not None
+                        else vehicle.location
+                    )
+                    post_duration = max(1.0, vehicle.remaining_trip_time)
+                else:
+                    target = int(
+                        vehicle.service_pickup
+                        if vehicle.service_pickup is not None
+                        else vehicle.location
+                    )
+                    post_duration = max(
+                        1.0,
+                        vehicle.remaining_pickup_time
+                        + vehicle.remaining_trip_time,
+                    )
+                post_location = int(
+                    vehicle.service_dropoff
+                    if vehicle.service_dropoff is not None
+                    else target
+                )
+                post_distance = vehicle.remaining_service_distance
+                resource_type = "request"
+                resource_id = int(request_id)
             elif station_id is not None:
                 action_type = ActionType.CHARGE
                 action_id = f"charge_{station_id}:continue"
-            elif vehicle.target_location is not None:
+                station = station_map.get(station_id)
+                target = int(
+                    station.location if station is not None else vehicle.location
+                )
+                post_location = target
+                travel_duration = (
+                    0.0
+                    if vehicle.charging_station is not None
+                    else _travel_time(env, vehicle.location, target)
+                )
+                post_duration = max(
+                    1.0, travel_duration + vehicle.charging_time_left
+                )
+                post_distance = _distance(env, vehicle.location, target)
+                # An in-progress session does not consume another admission
+                # slot, so it has a typed, separate capacity resource.
+                resource_type = "station_session"
+                resource_id = int(station_id)
+                resource_capacity = max(
+                    1,
+                    sum(
+                        other.charging_station == station_id
+                        or other.charging_target == station_id
+                        for other in state.vehicles
+                    ),
+                )
+                value_function = _value_function_for_vehicle(
+                    env, vehicle.vehicle_type
+                )
+                queue_builder = getattr(value_function, "_queue_features", None)
+                if callable(queue_builder):
+                    try:
+                        queue_features = tuple(
+                            float(value)
+                            for value in queue_builder(
+                                station_id=station_id,
+                                target_location=target,
+                                vehicle_id=vehicle.vehicle_id,
+                                vehicle_location=vehicle.location,
+                                current_time=state.current_time,
+                                num_requests=float(len(state.requests)),
+                                travel_duration=travel_duration,
+                            )
+                        )
+                    except (TypeError, ValueError, RuntimeError):
+                        queue_features = ()
+            elif vehicle.relocation_target is not None:
                 action_type = ActionType.RELOCATE
+                target = int(vehicle.relocation_target)
+                post_location = target
                 action_id = f"reloc_{target}:continue"
+                post_duration = max(1.0, vehicle.remaining_relocation_time)
+                post_distance = _distance(env, vehicle.location, target)
             else:
                 action_type = ActionType.WAIT
                 action_id = "continue_wait"
+                post_duration = max(1.0, vehicle.stationary_duration_left)
             distance = _distance(env, vehicle.location, target)
+            value_function = _value_function_for_vehicle(
+                env, vehicle.vehicle_type
+            )
+            score_builder = getattr(value_function, "_myopic_score", None)
+            if callable(score_builder):
+                try:
+                    structured_score = float(
+                        score_builder(
+                            int(action_type),
+                            request_value,
+                            distance,
+                            post_distance,
+                        )
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    structured_score = 0.0
+            else:
+                structured_score = 0.0
+            if action_type == ActionType.CHARGE:
+                structured_score = -abs(
+                    float(getattr(env, "charging_penalty", 0.0) or 0.0)
+                )
+            elif action_type == ActionType.WAIT:
+                wait_penalty = getattr(env, "idle_penalty", None)
+                structured_score = (
+                    -abs(float(wait_penalty))
+                    if wait_penalty is not None
+                    else float(getattr(env, "movingpenalty", 0.0) or 0.0)
+                )
             edges.append(
                 FeasibleEdgeSnapshot(
                     edge_id=(
@@ -534,15 +683,26 @@ class StateSnapshotBuilder:
                     action_type=action_type,
                     action_id=action_id,
                     target_location=int(target),
-                    post_action_location=int(target),
+                    post_action_location=int(post_location),
                     request_id=request_id,
                     station_id=station_id,
-                    structured_score=0.0,
-                    collection_score=0.0,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    resource_capacity=resource_capacity,
+                    structured_score=structured_score,
+                    collection_score=structured_score,
+                    request_value=request_value,
                     target_distance=float(distance),
-                    post_action_distance=float(distance),
-                    post_action_duration=1.0,
-                    metadata=(("continuing", True),),
+                    post_action_distance=float(post_distance),
+                    post_action_duration=float(post_duration),
+                    target_zoneid=_zone_for_location(
+                        env, int(target), list(state.zone_ids)
+                    ),
+                    post_action_zoneid=_zone_for_location(
+                        env, int(post_location), list(state.zone_ids)
+                    ),
+                    queue_features=queue_features,
+                    metadata=tuple(sorted(metadata.items())),
                 )
             )
 

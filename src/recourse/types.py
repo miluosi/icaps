@@ -96,24 +96,149 @@ class VehicleSnapshot:
     charging_station: int | None
     charging_target: int | None
     target_location: int | None
+    service_phase: str | None = None
+    service_request_id: int | None = None
+    service_request_value: float = 0.0
+    service_pickup: int | None = None
+    service_dropoff: int | None = None
+    remaining_pickup_time: float = 0.0
+    remaining_trip_time: float = 0.0
+    remaining_service_distance: float = 0.0
+    service_deadline_remaining: float = 0.0
+    charging_time_left: float = 0.0
+    relocation_target: int | None = None
+    remaining_relocation_time: float = 0.0
+    stationary_duration_left: float = 0.0
 
     @classmethod
-    def from_vehicle(cls, vehicle_id: int, vehicle: Mapping[str, Any]) -> "VehicleSnapshot":
+    def from_vehicle(
+        cls,
+        vehicle_id: int,
+        vehicle: Mapping[str, Any],
+        *,
+        request: Any | None = None,
+        env: Any | None = None,
+        current_time: float = 0.0,
+    ) -> "VehicleSnapshot":
         target = vehicle.get("target_location")
         if not isinstance(target, (int, float)):
             target = None
+        assigned_request = _optional_int(vehicle.get("assigned_request"))
+        passenger_onboard = _optional_int(vehicle.get("passenger_onboard"))
+        service_request_id = (
+            passenger_onboard
+            if passenger_onboard is not None
+            else assigned_request
+        )
+        service_phase = (
+            "passenger_onboard"
+            if passenger_onboard is not None
+            else ("to_pickup" if assigned_request is not None else None)
+        )
+        pickup = _optional_int(getattr(request, "pickup", None))
+        dropoff = _optional_int(getattr(request, "dropoff", None))
+        location = int(vehicle.get("location", 0))
+        remaining_pickup = (
+            _environment_metric(env, "get_travel_time", location, pickup)
+            if service_phase == "to_pickup" and pickup is not None
+            else 0.0
+        )
+        remaining_trip = (
+            _environment_metric(env, "get_travel_time", location, dropoff)
+            if service_phase == "passenger_onboard" and dropoff is not None
+            else (
+                float(getattr(request, "travel_time", 0.0) or 0.0)
+                if service_phase == "to_pickup"
+                else 0.0
+            )
+        )
+        remaining_service_distance = 0.0
+        if service_phase == "to_pickup" and pickup is not None:
+            remaining_service_distance += _environment_distance(
+                env, location, pickup
+            )
+            if dropoff is not None:
+                remaining_service_distance += _environment_distance(
+                    env, pickup, dropoff
+                )
+        elif service_phase == "passenger_onboard" and dropoff is not None:
+            remaining_service_distance = _environment_distance(
+                env, location, dropoff
+            )
+        deadline = (
+            getattr(request, "dropoff_deadline", current_time)
+            if service_phase == "passenger_onboard"
+            else getattr(request, "pickup_deadline", current_time)
+        )
+        charging_station = _optional_int(vehicle.get("charging_station"))
+        charging_target = _optional_int(
+            vehicle.get(
+                "charging_target", vehicle.get("target_charging_station")
+            )
+        )
+        relocation_target = None
+        if (
+            service_request_id is None
+            and charging_station is None
+            and charging_target is None
+        ):
+            relocation_target = _optional_int(
+                vehicle.get("idle_target", target)
+            )
         return cls(
             vehicle_id=int(vehicle_id),
             vehicle_type=int(vehicle.get("type", 1)),
-            location=int(vehicle.get("location", 0)),
+            location=location,
             battery=float(vehicle.get("battery", 1.0) or 0.0),
             idle_time=float(vehicle.get("idle_timer", 0.0) or 0.0),
             online=bool(vehicle.get("is_online", True)),
-            assigned_request=_optional_int(vehicle.get("assigned_request")),
-            passenger_onboard=_optional_int(vehicle.get("passenger_onboard")),
-            charging_station=_optional_int(vehicle.get("charging_station")),
-            charging_target=_optional_int(vehicle.get("charging_target")),
+            assigned_request=assigned_request,
+            passenger_onboard=passenger_onboard,
+            charging_station=charging_station,
+            charging_target=charging_target,
             target_location=_optional_int(target),
+            service_phase=service_phase,
+            service_request_id=service_request_id,
+            service_request_value=float(
+                getattr(request, "final_value", getattr(request, "value", 0.0))
+                or 0.0
+            ),
+            service_pickup=pickup,
+            service_dropoff=dropoff,
+            remaining_pickup_time=max(0.0, remaining_pickup),
+            remaining_trip_time=max(0.0, remaining_trip),
+            remaining_service_distance=max(0.0, remaining_service_distance),
+            service_deadline_remaining=max(
+                0.0, float(deadline or current_time) - float(current_time)
+            ),
+            charging_time_left=max(
+                0.0, float(vehicle.get("charging_time_left", 0.0) or 0.0)
+            ),
+            relocation_target=relocation_target,
+            remaining_relocation_time=(
+                max(
+                    0.0,
+                    float(vehicle.get("relocation_time_left", 0.0) or 0.0),
+                )
+                if vehicle.get("relocation_time_left") is not None
+                else (
+                    _environment_metric(
+                        env, "get_travel_time", location, relocation_target
+                    )
+                    if relocation_target is not None
+                    else 0.0
+                )
+            ),
+            stationary_duration_left=max(
+                0.0,
+                float(
+                    vehicle.get(
+                        "stationary_duration_left",
+                        vehicle.get("stationary_duration", 0.0),
+                    )
+                    or 0.0
+                ),
+            ),
         )
 
 
@@ -179,6 +304,19 @@ class SystemSnapshot:
                 charging_station=None,
                 charging_target=None,
                 target_location=None,
+                service_phase=None,
+                service_request_id=None,
+                service_request_value=0.0,
+                service_pickup=None,
+                service_dropoff=None,
+                remaining_pickup_time=0.0,
+                remaining_trip_time=0.0,
+                remaining_service_distance=0.0,
+                service_deadline_remaining=0.0,
+                charging_time_left=0.0,
+                relocation_target=None,
+                remaining_relocation_time=0.0,
+                stationary_duration_left=0.0,
             )
             for vehicle in self.vehicles
         )
@@ -240,6 +378,8 @@ class FeasibleGraphSnapshot:
     solver_status: str = "unknown"
     solver_objective: float = 0.0
     solver_runtime_seconds: float = 0.0
+    objective_cost_scale: int = 10_000
+    objective_precision_mode: str = "integer_q_grid"
 
     def with_selected(
         self,
@@ -355,6 +495,9 @@ class RecourseEvent:
     completion_vehicle_id: int | None = None
     completion_vehicle_type: int | None = None
     same_epoch_recourse_link: bool = False
+    rejection_event_id: str = ""
+    transition_id: str = ""
+    ultimately_served: bool = False
 
 
 @dataclass(frozen=True)
@@ -461,3 +604,37 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _environment_metric(
+    env: Any | None,
+    name: str,
+    origin: int,
+    destination: int | None,
+) -> float:
+    if env is None or destination is None:
+        return 0.0
+    function = getattr(env, name, None)
+    if callable(function):
+        try:
+            return float(function(int(origin), int(destination)))
+        except (TypeError, ValueError, RuntimeError):
+            pass
+    return _environment_distance(env, origin, destination)
+
+
+def _environment_distance(
+    env: Any | None,
+    origin: int,
+    destination: int | None,
+) -> float:
+    if env is None or destination is None:
+        return 0.0
+    for name in ("get_distance_km", "_manhattan_distance_loc"):
+        function = getattr(env, name, None)
+        if callable(function):
+            try:
+                return float(function(int(origin), int(destination)))
+            except (TypeError, ValueError, RuntimeError):
+                pass
+    return float(abs(int(destination) - int(origin)))

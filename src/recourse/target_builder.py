@@ -8,6 +8,8 @@ import time
 
 import numpy as np
 
+from src.exact_mcmf import build_reduced_problem, solve_exact
+
 from .types import FeasibleEdgeSnapshot, FeasibleGraphSnapshot
 
 
@@ -53,7 +55,7 @@ class RecourseVariantPolicy:
 RECOURSE_VARIANT_POLICIES = {
     "legacy": RecourseVariantPolicy(True, True, False, True, False),
     "r0": RecourseVariantPolicy(False, False, False, True, False),
-    "r1": RecourseVariantPolicy(True, False, False, False, False),
+    "r1": RecourseVariantPolicy(True, False, False, True, False),
     "r2": RecourseVariantPolicy(True, True, True, False, False),
     "r3": RecourseVariantPolicy(True, True, False, True, False),
     "r4": RecourseVariantPolicy(True, True, False, True, True),
@@ -164,9 +166,9 @@ class RecourseTargetBuilder:
     ) -> tuple[str, ...]:
         """Solve the same additive resource-constrained projection as rollout.
 
-        SciPy's HiGHS MILP backend is used for target selection.  Constraints
-        are derived from the serialized graph, so request exclusivity and
-        charging capacities cannot silently differ from collection.
+        The serialized graph is reduced to the same integer-grid exact MCMF
+        problem used by rollout.  This keeps quantization and deterministic
+        zero-gain tie handling identical for online and target selection.
         """
 
         edges = graph.edges
@@ -177,70 +179,64 @@ class RecourseTargetBuilder:
             return ()
         self._validate_resource_capacities(edges)
         self.last_solver_runtime_seconds = 0.0
-        score_values = np.asarray(
-            [self._score(edge, scores) for edge in edges], dtype=np.float64
-        )
-        try:
-            from scipy.optimize import Bounds, LinearConstraint, milp
+        vehicle_ids = sorted({edge.vehicle_id for edge in edges})
+        vehicle_index = {
+            vehicle_id: index for index, vehicle_id in enumerate(vehicle_ids)
+        }
 
-            rows = []
-            lower = []
-            upper = []
-            for vehicle_id in sorted({edge.vehicle_id for edge in edges}):
-                rows.append([1.0 if edge.vehicle_id == vehicle_id else 0.0 for edge in edges])
-                # Rollout sends one unit of flow per represented vehicle.  A
-                # real wait/continue edge supplies the outside option.
-                lower.append(1.0)
-                upper.append(1.0)
-            resources = sorted(
-                {
-                    (edge.resource_type, edge.resource_id)
-                    for edge in edges
-                    if edge.resource_type is not None and edge.resource_id is not None
-                }
+        def action_key(edge: FeasibleEdgeSnapshot):
+            if edge.resource_type is not None and edge.resource_id is not None:
+                return ("resource", edge.resource_type, int(edge.resource_id))
+            if bool(dict(edge.metadata).get("continuing", False)):
+                return ("continuing", edge.edge_id)
+            return (
+                "action",
+                int(edge.action_type),
+                edge.action_id,
+                int(edge.target_location),
             )
-            for resource in resources:
-                resource_edges = [edge for edge in edges if (edge.resource_type, edge.resource_id) == resource]
-                rows.append([
-                    1.0 if (edge.resource_type, edge.resource_id) == resource else 0.0
-                    for edge in edges
-                ])
-                lower.append(0.0)
-                upper.append(float(resource_edges[0].resource_capacity))
-            constraints = LinearConstraint(
-                np.asarray(rows, dtype=np.float64),
-                np.asarray(lower, dtype=np.float64),
-                np.asarray(upper, dtype=np.float64),
-            )
-            solve_start = time.perf_counter()
-            result = milp(
-                c=-score_values,
-                integrality=np.ones(len(edges), dtype=np.int8),
-                bounds=Bounds(np.zeros(len(edges)), np.ones(len(edges))),
-                constraints=constraints,
-                options={"disp": False},
-            )
-            self.last_solver_runtime_seconds = time.perf_counter() - solve_start
-            if result.success and result.x is not None:
-                self.last_solver_status = "optimal"
-                self.last_fallback_used = False
-                return tuple(
-                    edge.edge_id
-                    for edge, selected in zip(edges, result.x)
-                    if float(selected) > 0.5
-                )
-            message = getattr(result, "message", "unknown target MILP failure")
-            self.last_solver_status = f"failed:{message}"
-            raise RuntimeError(
-                "target projection is infeasible or failed; every represented "
-                f"vehicle requires a real action: {message}"
-            )
-        except ImportError as exc:
-            self.last_solver_status = "missing_scipy_milp"
-            self.last_solver_runtime_seconds = 0.0
-            raise RuntimeError(
-                "solver-consistent target projection requires scipy.optimize.milp"
-            ) from exc
+
+        action_keys = []
+        for edge in edges:
+            key = action_key(edge)
+            if key not in action_keys:
+                action_keys.append(key)
+        action_index = {key: index for index, key in enumerate(action_keys)}
+        feasibility = np.zeros(
+            (len(vehicle_ids), len(action_keys)), dtype=bool
+        )
+        q_values = np.zeros_like(feasibility, dtype=np.float64)
+        capacities = np.full(
+            len(action_keys), len(vehicle_ids), dtype=np.int64
+        )
+        edge_by_vehicle_action: dict[tuple[int, int], FeasibleEdgeSnapshot] = {}
+        for edge in edges:
+            row = vehicle_index[edge.vehicle_id]
+            column = action_index[action_key(edge)]
+            feasibility[row, column] = True
+            q_values[row, column] = self._score(edge, scores)
+            edge_by_vehicle_action[(row, column)] = edge
+            if edge.resource_type is not None and edge.resource_id is not None:
+                capacities[column] = int(edge.resource_capacity)
+
+        build_start = time.perf_counter()
+        problem = build_reduced_problem(
+            feasibility,
+            q_values,
+            capacities,
+            cost_scale=int(graph.objective_cost_scale),
+            graph_reduction=True,
+        )
+        result = solve_exact(problem, backend="primal_dual", verify=True)
+        self.last_solver_runtime_seconds = time.perf_counter() - build_start
+        self.last_solver_status = result.status.lower()
+        self.last_fallback_used = bool(result.fallback_used)
+        selected = tuple(
+            edge_by_vehicle_action[(row, int(column))].edge_id
+            for row, column in sorted(result.action_by_vehicle.items())
+        )
+        self.verify_feasible(graph, selected)
+        return selected
 
     def double_q_target(
         self,

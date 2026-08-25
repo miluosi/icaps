@@ -298,7 +298,7 @@ def test_direct_link_lookup_cannot_cross_episode_boundaries():
     graph1 = replace(graph0, graph_id="episode-1-next")
     current = replace(_transition(done=False), next_transition_id="ep0-next")
     correct = replace(
-        _transition("ep0-next", aev_graph=graph0),
+        _transition("ep0-next", ev_graph=graph0, aev_graph=graph0),
         run_id="run",
         episode_id=0,
         cumulative_episode_id=0,
@@ -560,6 +560,7 @@ def test_collection_to_r4_gradient_path_uses_full_aev_target():
     base_follower = aev_vf.target_components_for_graph(aev_graph).target_full_value
     aev_vf.target_network.net[-1].bias.data.fill_(1.0)
     aev_vf.target_critic2.net[-1].bias.data.fill_(1.0)
+    aev_vf._target_component_cache.clear()
     perturbed_follower = aev_vf.target_components_for_graph(aev_graph).target_full_value
     assert perturbed_follower > base_follower
 

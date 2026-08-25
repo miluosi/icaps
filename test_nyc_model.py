@@ -885,6 +885,30 @@ def main():
                 )
                 mean_avg_battery_level = _mean_detail_metric(detailed, "avg_battery_level", "avg_battery")
                 mean_finished_charge = _mean_detail_metric(detailed, "finished_charge", "charge_finished")
+                mean_daily_charges_human_ev = _mean_detail_metric(
+                    detailed,
+                    "avg_daily_charging_sessions_per_human_ev",
+                )
+                mean_daily_charges_aev = _mean_detail_metric(
+                    detailed,
+                    "avg_daily_charging_sessions_per_aev",
+                )
+                mean_daily_charges_all = _mean_detail_metric(
+                    detailed,
+                    "avg_daily_charging_sessions_per_vehicle",
+                )
+                mean_charge_duration_human_ev = _mean_detail_metric(
+                    detailed,
+                    "avg_charging_session_duration_minutes_human_ev",
+                )
+                mean_charge_duration_aev = _mean_detail_metric(
+                    detailed,
+                    "avg_charging_session_duration_minutes_aev",
+                )
+                mean_charge_duration_all = _mean_detail_metric(
+                    detailed,
+                    "avg_charging_session_duration_minutes_all",
+                )
                 hourly_zone_request_completed_orders, hourly_zone_request_completed_rows = _aggregate_hourly_zone_request_completed_orders(detailed)
                 daily_zone_request_completion_shares, daily_zone_request_completion_rows = _aggregate_daily_zone_request_completion_shares(detailed)
                 hourly_zone_charge_station_counts, hourly_zone_charge_station_rows = _aggregate_hourly_zone_charge_station_counts(detailed)
@@ -978,6 +1002,12 @@ def main():
                     "episode_ev_reward": mean_episode_reward_ev,
                     "avg_battery_level": mean_avg_battery_level,
                     "finished_charge": mean_finished_charge,
+                    "avg_daily_charging_sessions_per_human_ev": mean_daily_charges_human_ev,
+                    "avg_daily_charging_sessions_per_aev": mean_daily_charges_aev,
+                    "avg_daily_charging_sessions_per_vehicle": mean_daily_charges_all,
+                    "avg_charging_session_duration_minutes_human_ev": mean_charge_duration_human_ev,
+                    "avg_charging_session_duration_minutes_aev": mean_charge_duration_aev,
+                    "avg_charging_session_duration_minutes_all": mean_charge_duration_all,
                     "hourly_zone_request_completed_orders": hourly_zone_request_completed_orders,
                     "hourly_zone_request_completed_orders_json": _json_dumps(hourly_zone_request_completed_orders),
                     "daily_zone_request_completion_shares": daily_zone_request_completion_shares,
@@ -1002,6 +1032,8 @@ def main():
                         f"AEV complete(avg): {mean_aev_completed_orders:.2f}  "
                         f"AvgWait: {mean_avg_wait:.2f}  "
                         f"WaitVeh: {mean_waiting_vehicle_count:.1f}  "
+                        f"Charge/veh-day: {mean_daily_charges_all:.3f}  "
+                        f"ChargeTime: {mean_charge_duration_all:.2f} min  "
                         f"DropOff: {mean_drop_off_rate:.4f}  "
                         f"MaxPressure: {mean_max_station_pressure:.2f}")
 
@@ -1360,6 +1392,12 @@ def main():
             "episode_ev_reward": np.mean([r["episode_ev_reward"] for r in subset]),
             "avg_battery_level": np.mean([r["avg_battery_level"] for r in subset]),
             "finished_charge": np.mean([r["finished_charge"] for r in subset]),
+            "avg_daily_charging_sessions_per_human_ev": np.mean([r["avg_daily_charging_sessions_per_human_ev"] for r in subset]),
+            "avg_daily_charging_sessions_per_aev": np.mean([r["avg_daily_charging_sessions_per_aev"] for r in subset]),
+            "avg_daily_charging_sessions_per_vehicle": np.mean([r["avg_daily_charging_sessions_per_vehicle"] for r in subset]),
+            "avg_charging_session_duration_minutes_human_ev": np.mean([r["avg_charging_session_duration_minutes_human_ev"] for r in subset]),
+            "avg_charging_session_duration_minutes_aev": np.mean([r["avg_charging_session_duration_minutes_aev"] for r in subset]),
+            "avg_charging_session_duration_minutes_all": np.mean([r["avg_charging_session_duration_minutes_all"] for r in subset]),
             "peak_completed_date": peak_completed_date,
             "peak_completed_hour": peak_completed_hour,
             "peak_completed_orders": peak_completed_orders,
