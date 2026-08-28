@@ -34,6 +34,8 @@ from src.synthetic_scenario import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run charging integration training with ADPTrainer")
+    from src.acceptance_features import add_acceptance_arguments
+    add_acceptance_arguments(parser)
     parser.add_argument("--adp", type=float, default=1.0, help="ADP value (0 disables NN training)")
     parser.add_argument("--episodes", type=int, default=50, help="Number of episodes")
     parser.add_argument("--num-vehicles", type=int, default=200, help="Total vehicles")
@@ -347,6 +349,8 @@ def main():
                 common_random_numbers=args.common_random_numbers,
                 state_variant=args.state_variant,
                 learner_variant=args.learner_variant,
+                ev_acceptance_feature=args.ev_acceptance_feature,
+                ev_acceptance_model=args.ev_acceptance_model,
             )
 
             # Summary output

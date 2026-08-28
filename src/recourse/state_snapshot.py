@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from src.acceptance_features import predicted_acceptance
+from src.acceptance_inputs import offer_context
+
 from dataclasses import replace
 from typing import Any, Mapping
 
@@ -156,6 +159,8 @@ class StateSnapshotBuilder:
         zone_indices = list(getattr(env, "_last_matrix_zone_indices", ()))[:num_zones]
         zone_ids = list(getattr(env, "_last_matrix_zone_target_ids", ()))[:num_zones]
         vehicle_map = {vehicle.vehicle_id: vehicle for vehicle in state.vehicles}
+        acceptance_context = (offer_context(env, snapshot=state)
+                              if getattr(env, 'ev_acceptance_feature', 'off') == 'predicted' else None)
         edges: list[FeasibleEdgeSnapshot] = []
 
         for row, vehicle_id in enumerate(vehicle_ids):
@@ -339,6 +344,11 @@ class StateSnapshotBuilder:
                         target_zoneid=target_zoneid,
                         post_action_zoneid=post_zoneid,
                         queue_features=queue_features,
+                        acceptance_probability=(
+                            predicted_acceptance(env, vehicle_id, request_map[request_id], vehicle=vehicle,
+                                                 context=acceptance_context, snapshot=state)
+                            if request_id is not None and vehicle.vehicle_type == 1 else 0.0
+                        ),
                         metadata=edge_metadata,
                     )
                 )
@@ -692,6 +702,7 @@ class StateSnapshotBuilder:
                     structured_score=structured_score,
                     collection_score=structured_score,
                     request_value=request_value,
+                    acceptance_probability=0.0,
                     target_distance=float(distance),
                     post_action_distance=float(post_distance),
                     post_action_duration=float(post_duration),

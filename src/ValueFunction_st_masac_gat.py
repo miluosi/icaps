@@ -215,7 +215,10 @@ class _Mixer(nn.Module):
         return w_ev, w_aev, baseline
 
 
-class PyTorchChargingValueFunction:
+from src.acceptance_features import AcceptanceFeatureMixin, insert_zero_input
+
+
+class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
     """MCMF-compatible residual ST-GAT + MASAC value provider."""
 
     uses_post_action_locations = True
@@ -245,6 +248,7 @@ class PyTorchChargingValueFunction:
         self.episode_length = max(1.0, float(episode_length))
         self.max_requests = max(1.0, float(max_requests))
         self.env = env
+        self._init_acceptance_feature()
         self.device = torch.device(device)
         self.zone_distribution_mode = zone_distribution_mode or "st_masac_gat"
         self.neighbour_number = max(0, int(neighbour_number))
@@ -297,6 +301,13 @@ class PyTorchChargingValueFunction:
         self.target_queue_predictor = copy.deepcopy(self.queue_predictor).to(self.device)
         self.target_queue_predictor.requires_grad_(False)
         self.log_alpha = nn.Parameter(torch.tensor(math.log(0.05), dtype=torch.float32, device=self.device))
+
+        self.acceptance_input_index = self.edge_local_dim
+        if self.acceptance_input_enabled:
+            for module in (self.network, self.critic2, self.target_network, self.target_critic2, self.actor):
+                module.net[0] = insert_zero_input(module.net[0], self.acceptance_input_index)
+            self.edge_local_dim += 1
+            self.edge_dim += 1
 
         params = (
             [parameter for parameter in self.graph_encoder.parameters() if parameter.requires_grad]
@@ -538,10 +549,11 @@ class PyTorchChargingValueFunction:
         battery_level: float,
         vehicle_type: int,
         queue_wait_feature: float = 0.0,
+        acceptance_probability: float = 0.0,
     ) -> list[float]:
         action_type_id = int(action_type_id)
         post_soc = self._post_battery(float(battery_level), action_type_id, float(post_action_distance))
-        return state_features + [
+        features = state_features + [
             1.0 if action_type_id == 1 else 0.0,
             1.0 if action_type_id == 2 else 0.0,
             1.0 if action_type_id == 3 else 0.0,
@@ -551,6 +563,9 @@ class PyTorchChargingValueFunction:
             post_soc,
             1.0 + float(np.clip(float(queue_wait_feature), 0.0, 4.0)),
         ]
+        if self.acceptance_input_enabled:
+            features.append(float(acceptance_probability) if vehicle_type == 1 and action_type_id == 2 else 0.0)
+        return features
 
     def _resolve_station(self, station_id: Any = None, target_location: Any = None):
         stations = getattr(getattr(self.env, "charging_manager", None), "stations", {}) if self.env is not None else {}
@@ -1251,6 +1266,7 @@ class PyTorchChargingValueFunction:
         target_context: bool = False,
         vehicle_types=None,
         post_demand_features=None,
+        acceptance_probabilities=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del post_demand_features
         graph = self._graph_context(graph_snapshot, target=target_context)
@@ -1303,6 +1319,7 @@ class PyTorchChargingValueFunction:
                 battery_level=float(battery_levels[i]),
                 vehicle_type=vehicle_type,
                 queue_wait_feature=float(queue_wait_features[i]),
+                acceptance_probability=(0.0 if acceptance_probabilities is None else acceptance_probabilities[i]),
             )
             source_h = source_embeddings[int(vehicle_ids[i])]
             target_h = self._graph_embedding_for_location(graph, int(post_action_locations[i]))
@@ -1368,11 +1385,16 @@ class PyTorchChargingValueFunction:
         post_action_locations=None,
         target_station_ids=None,
         vehicle_neighbour_candidates: dict[int, list[dict]] | None = None,
+        request_ids=None,
+        acceptance_probabilities=None,
     ):
         del target_zoneids, post_action_zoneids
         size = len(vehicle_ids)
         if size == 0:
             return []
+        acceptance_probabilities = self.acceptance_for_live_edges(
+            vehicle_ids, action_type_ids, request_ids, acceptance_probabilities
+        )
         myopic_action_distances = (
             np.asarray(target_distances, dtype=np.float32)
             if post_action_distances is None
@@ -1445,6 +1467,7 @@ class PyTorchChargingValueFunction:
                 target_station_ids=target_station_ids,
                 queue_wait_features=queue_wait_features,
                 vehicle_neighbour_candidates=vehicle_neighbour_candidates,
+                acceptance_probabilities=acceptance_probabilities,
             )
             q1 = self.network(edge_t)
             q2 = self.critic2(edge_t)
@@ -1562,6 +1585,7 @@ class PyTorchChargingValueFunction:
             target_zoneids=[0],
             vehicle_idle_times=[0.0],
             action_type_ids=[2],
+            request_ids=[target_id],
             post_action_distances=[post_action_distance],
             post_action_durations=[post_action_duration],
             post_action_zoneids=[0],
@@ -1697,6 +1721,7 @@ class PyTorchChargingValueFunction:
             target_zoneids=target_zoneids,
             vehicle_idle_times=vehicle_idle_times,
             action_type_ids=[int(action_type_id)] * len(batch_inputs),
+            request_ids=[row.get("target_id", -1) for row in batch_inputs],
             post_action_distances=post_action_distances,
             post_action_durations=post_action_durations,
             post_action_zoneids=post_action_zoneids,
@@ -1842,10 +1867,15 @@ class PyTorchChargingValueFunction:
         return previous
 
     def store_experience(self, **kwargs):
+        if bool(getattr(self.env, "evaluatemode", False)):
+            return
         experience = copy.deepcopy(dict(kwargs))
         action = self._replay_collection_context
         metadata = getattr(action, "metadata", None)
         if metadata is not None:
+            request_snapshot = getattr(metadata, "request_snapshot", None)
+            if request_snapshot is not None:
+                experience.setdefault("request_id", request_snapshot.request_id)
             experience.setdefault("transition_id", metadata.transition_id)
             experience.setdefault("stage_id", int(metadata.stage_id))
             experience.setdefault("acceptance_outcome", metadata.acceptance_outcome)
@@ -1925,6 +1955,7 @@ class PyTorchChargingValueFunction:
             float(experience.get("target_distance", 0.0) or 0.0),
             float(experience.get("post_action_distance", 0.0) or 0.0),
         )
+        experience["acceptance_probability"] = self.acceptance_from_experience(experience)
         self.experience_buffer.append(experience)
         self._replay_collection_context = None
 
@@ -2140,6 +2171,7 @@ class PyTorchChargingValueFunction:
                 if post_demand_feature is None
                 else np.asarray([float(post_demand_feature)], dtype=np.float32)
             ),
+            acceptance_probabilities=[self.acceptance_from_experience(exp, candidate, next_state=next_state)],
         )
         g = self._myopic_score(
             action_id,
@@ -2224,6 +2256,7 @@ class PyTorchChargingValueFunction:
             "target_station_id": edge.station_id,
             "queue_features": edge.queue_features,
             "post_demand_feature": edge.post_demand_feature,
+            "acceptance_probability": edge.acceptance_probability,
             "state_snapshot": graph.state,
             "state_variant": state_variant,
         }
@@ -3351,6 +3384,7 @@ class PyTorchChargingValueFunction:
         )
         return {
             "critic2_state_dict": self.critic2.state_dict(),
+            "ev_acceptance": self.acceptance_checkpoint_state(),
             "target_critic2_state_dict": self.target_critic2.state_dict(),
             "graph_encoder_state_dict": self.graph_encoder.state_dict(),
             "target_graph_encoder_state_dict": self.target_graph_encoder.state_dict(),
@@ -3393,6 +3427,7 @@ class PyTorchChargingValueFunction:
         }
 
     def load_extra_checkpoint_state(self, state: dict[str, Any]) -> None:
+        self.load_acceptance_checkpoint_state(state)
         if not state:
             return
         if "critic2_state_dict" in state:

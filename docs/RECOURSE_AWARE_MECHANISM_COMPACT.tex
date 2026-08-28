@@ -1,33 +1,45 @@
 \subsubsection{Recourse-Aware Mechanism}
 \label{sec:recourse_aware_mechanism}
 
-Each decision epoch contains two sequential decision states. The pre-recourse state $S_t^1$ is observed before the human-driven electric vehicle (HEV) assignment, whereas the realized residual state $\bar S_t^2$ is observed only after the HEV acceptance and rejection outcomes are known. The phase-augmented state space and within-epoch transition are
+Each decision epoch contains two sequential decision states. The pre-recourse state $S_t^1\in\mathcal S^1$ is observed before the human-driven electric vehicle (HEV) assignment, and the realized residual state $\bar S_t^2\in\mathcal S^2$ is observed after the HEV acceptance and rejection outcomes are known. Let $X_t$ and $Y_t$ denote the first- and second-stage actions, $R_t^1$ and $R_t^2$ their realized rewards, and $\pi=(\pi_1,\pi_2)$ a deterministic two-stage policy. The factor $\gamma^{\Delta t_t}$ discounts the continuation value over the elapsed time $\Delta t_t$ from epoch $t$ to epoch $t+1$; no discount is applied between the two stages within the same epoch. The phase-augmented state space and transition are
 \begin{equation}\mathcal S=\mathcal S^1\mathbin{\dot\cup}\mathcal S^2,\qquad S_t^1\xrightarrow{\,X_t\,}\bar S_t^2\xrightarrow{\,Y_t\,}S_{t+1}^1.\label{eq:recourse_state_sequence}\end{equation}
+The information available after the first-stage action and after the realized second-stage action is, respectively,
+\begin{equation}\mathcal H_t^1:=\sigma(S_t^1,X_t),\qquad \mathcal H_t^2:=\sigma(S_t^1,X_t,\bar S_t^2,Y_t),\qquad \mathcal H_t^1\subseteq\mathcal H_t^2,\qquad Y_t=\pi_2(\bar S_t^2).\label{eq:recourse_information_sets}\end{equation}
+Let $\mathbb E^\pi$ denote expectation under $\pi$, and let $\mathbb P_t^\pi(\mathrm d s^2\mid S_t^1,X_t)$ denote the conditional law of the endogenous residual state $\bar S_t^2$. With $Q_{1,t}^\pi$ and $Q_{2,t}^\pi$ denoting the first- and second-stage action values, the coupled recursion is
+\begin{equation}\begin{aligned}Q_{1,t}^{\pi}(S_t^1,X_t)&:=\mathbb E^\pi\!\left[R_t^1+Q_{2,t}^{\pi}\!\left(\bar S_t^2,\pi_2(\bar S_t^2)\right)\mid S_t^1,X_t\right],\\ Q_{2,t}^{\pi}(\bar S_t^2,Y_t)&:=\mathbb E^\pi\!\left[R_t^2+\gamma^{\Delta t_t}Q_{1,t+1}^{\pi}\!\left(S_{t+1}^1,\pi_1(S_{t+1}^1)\right)\mid\bar S_t^2,Y_t\right].\end{aligned}\label{eq:recourse_coupled_recursion}\end{equation}
 
-Let $h\in\mathcal V_t^{\mathrm{HEV}}$ and $m\in\mathcal V_t^{\mathrm{AEV}}$ index an HEV and an autonomous electric vehicle (AEV), respectively. In the first stage, $x_{jht}=1$ means that request $j$ is offered to HEV $h$, while $n_{ht}=1$ sends an HEV receiving no request to the driver-side relocation process. Collecting these variables in $\boldsymbol x_t$ and $\boldsymbol n_t$ gives
+We next specify the actions, residual state, and rewards entering this recursion. Let $h\in\mathcal V_t^{\mathrm{HEV}}$ and $m\in\mathcal V_t^{\mathrm{AEV}}$ index an HEV and an autonomous electric vehicle (AEV), respectively. In the first stage, $x_{jht}=1$ means that request $j$ is offered to HEV $h$, while $n_{ht}=1$ sends an HEV receiving no request to the driver-side relocation process. Collecting these variables in $\boldsymbol x_t$ and $\boldsymbol n_t$ gives
 \begin{equation}X_t=(\boldsymbol x_t,\boldsymbol n_t)\in\mathcal F_t^1(S_t^1).\label{eq:recourse_stage1_action}\end{equation}
 
-After $X_t$ is executed, the random outcome $\xi_t$ partitions the affected requests into accepted, rejected, and unassigned sets, denoted by $\mathcal J_t^{\mathrm{acc}}$, $\mathcal J_t^{\mathrm{rej}}$, and $\mathcal J_t^{\mathrm{rem}}$. Accepted requests leave the available-request pool, and the realized residual state is
+After $X_t$ is executed, the random outcome $\xi_t$ partitions the affected requests into accepted, rejected, and previously unassigned sets, denoted by $\mathcal J_t^{\mathrm{acc}}$, $\mathcal J_t^{\mathrm{rej}}$, and $\mathcal J_t^{\mathrm{rem}}$. Accepted requests leave the available-request pool, and the realized residual state is
 \begin{equation}\bar S_t^2=\Phi_t(S_t^1,X_t,\xi_t).\label{eq:recourse_residual_state}\end{equation}
-The AEV stage operates on the residual request set; a rejected request becomes a recourse request only if it is actually assigned to an AEV:
+The AEV stage operates on the residual request set. A rejected request becomes a recourse request only if it is actually assigned to an AEV:
 \begin{equation}\mathcal J_t^2=\mathcal J_t^{\mathrm{rej}}\mathbin{\dot\cup}\mathcal J_t^{\mathrm{rem}},\qquad \mathcal J_t^{\mathrm{rec}}(Y_t)=\left\{j\in\mathcal J_t^{\mathrm{rej}}:\sum_{m\in\mathcal V_t^{\mathrm{AEV}}}u_{jmt}=1\right\}.\label{eq:recourse_request_sets}\end{equation}
 
-The realized first-stage reward contains accepted-service, rejection, and HEV-relocation components:
+The realized first-stage reward comprises service, rejection, and relocation components:
 \begin{equation}R_t^1=R_t^{1,\mathrm{acc}}+R_t^{1,\mathrm{rej}}+R_t^{1,\mathrm{rel}}.\label{eq:recourse_stage1_reward}\end{equation}
 
-In the second stage, $u_{jmt}$, $c_{mct}$, $a_{mzt}$, and $w_{mt}$ indicate that AEV $m$ serves request $j$, charges at station $c$, relocates to zone $z$, or waits, respectively. Collecting the four decision arrays in $\boldsymbol u_t$, $\boldsymbol c_t$, $\boldsymbol a_t$, and $\boldsymbol w_t$ gives
+In the second stage, $u_{jmt}$, $c_{mct}$, $a_{mzt}$, and $w_{mt}$ indicate that AEV $m$ serves request $j$, charges at station $c$, relocates to zone $z$, or waits, respectively. Thus,
 \begin{equation}Y_t=(\boldsymbol u_t,\boldsymbol c_t,\boldsymbol a_t,\boldsymbol w_t)\in\mathcal F_t^2(\bar S_t^2).\label{eq:recourse_stage2_action}\end{equation}
-Its reward contains recourse service, service of previously unassigned requests, charging, relocation, and waiting; the recourse term is part of the AEV reward and is not added again elsewhere:
+The second-stage reward contains recourse service, service of previously unassigned requests, charging, relocation, and waiting. The recourse term is part of the AEV reward and is not added again elsewhere:
 \begin{equation}R_t^2=R_t^{2,\mathrm{rec}}+R_t^{2,\mathrm{rem}}+R_t^{2,\mathrm{chg}}+R_t^{2,\mathrm{rel}}+R_t^{2,\mathrm{wait}}.\label{eq:recourse_stage2_reward}\end{equation}
 
-For policy $\pi=(\pi_1,\pi_2)$, the first-stage action value backs up the value of the residual state generated by $X_t$:
-\begin{equation}Q_{1,t}^{\pi}(S_t^1,X_t)=\mathbb E^{\pi}\!\left[R_t^1+Q_{2,t}^{\pi}\!\left(\bar S_t^2,\pi_2(\bar S_t^2)\right)\mid S_t^1,X_t\right],\qquad \bar S_t^2=\Phi_t(S_t^1,X_t,\xi_t).\label{eq:recourse_q1}\end{equation}
-The second-stage action value contains the transition to the next decision epoch:
-\begin{equation}Q_{2,t}^{\pi}(\bar S_t^2,Y_t)=\mathbb E^{\pi}\!\left[R_t^2+\gamma^{\Delta t_t}Q_{1,t+1}^{\pi}\!\left(S_{t+1}^1,\pi_1(S_{t+1}^1)\right)\mid \bar S_t^2,Y_t\right].\label{eq:recourse_q2}\end{equation}
-No discount is applied between the two stages of the same epoch. Substitution gives the closed stage-1 recursion
+For the detailed conditional-expectation derivation, define the second-stage reward plus discounted continuation value by
+\begin{equation}Z_t^\pi:=R_t^2+\gamma^{\Delta t_t}Q_{1,t+1}^{\pi}\!\left(S_{t+1}^1,\pi_1(S_{t+1}^1)\right).\label{eq:recourse_continuation}\end{equation}
+Assume that $(\bar S_t^2,Y_t)$ is Markov sufficient for the second-stage transition. Then
+\begin{equation}\mathbb E^\pi\!\left[Z_t^\pi\mid\mathcal H_t^2\right]=\mathbb E^\pi\!\left[Z_t^\pi\mid\bar S_t^2,Y_t\right]=Q_{2,t}^{\pi}(\bar S_t^2,Y_t).\label{eq:stage2_markov_sufficiency}\end{equation}
+Because $\mathcal H_t^1\subseteq\mathcal H_t^2$, the conditional law of total expectation yields
+\begin{equation}\mathbb E^\pi\!\left[Q_{2,t}^{\pi}\!\left(\bar S_t^2,\pi_2(\bar S_t^2)\right)\mid\mathcal H_t^1\right]=\mathbb E^\pi\!\left[\mathbb E^\pi\!\left[Z_t^\pi\mid\mathcal H_t^2\right]\mid\mathcal H_t^1\right]=\mathbb E^\pi\!\left[Z_t^\pi\mid\mathcal H_t^1\right].\label{eq:recourse_conditional_total_expectation}\end{equation}
+Equivalently, the residual state can be marginalized explicitly through its conditional transition law:
+\begin{equation}\mathbb E^\pi\!\left[Q_{2,t}^{\pi}\!\left(\bar S_t^2,\pi_2(\bar S_t^2)\right)\mid S_t^1,X_t\right]=\int_{\mathcal S^2}Q_{2,t}^{\pi}\!\left(s^2,\pi_2(s^2)\right)\,\mathbb P_t^\pi\!\left(\mathrm d s^2\mid S_t^1,X_t\right).\label{eq:recourse_residual_marginalization}\end{equation}
+For a discrete residual-state space, the integral in~\eqref{eq:recourse_residual_marginalization} is replaced by a sum over $s^2\in\mathcal S^2$.
+
+Substituting the information-form expression for $Q_{2,t}^\pi$ into the first-stage recursion and applying the tower property step by step gives
+\begin{align}Q_{1,t}^{\pi}(S_t^1,X_t)&=\mathbb E^\pi\!\left[R_t^1+Q_{2,t}^{\pi}(\bar S_t^2,Y_t)\mid\mathcal H_t^1\right]\nonumber\\ &=\mathbb E^\pi\!\left[R_t^1+\mathbb E^\pi\!\left[Z_t^\pi\mid\mathcal H_t^2\right]\mid\mathcal H_t^1\right]\nonumber\\ &=\mathbb E^\pi\!\left[R_t^1\mid\mathcal H_t^1\right]+\mathbb E^\pi\!\left[\mathbb E^\pi\!\left[Z_t^\pi\mid\mathcal H_t^2\right]\mid\mathcal H_t^1\right]\nonumber\\ &=\mathbb E^\pi\!\left[R_t^1\mid\mathcal H_t^1\right]+\mathbb E^\pi\!\left[Z_t^\pi\mid\mathcal H_t^1\right]\nonumber\\ &=\mathbb E^\pi\!\left[R_t^1+Z_t^\pi\mid\mathcal H_t^1\right].\label{eq:q1_tower_derivation}\end{align}
+Finally, substituting the definition of $Z_t^\pi$ and using $\mathcal H_t^1=\sigma(S_t^1,X_t)$ gives the core closed stage-1 recursion:
 \begin{equation}Q_{1,t}^{\pi}(S_t^1,X_t)=\mathbb E^{\pi}\!\left[R_t^1+R_t^2+\gamma^{\Delta t_t}Q_{1,t+1}^{\pi}\!\left(S_{t+1}^1,\pi_1(S_{t+1}^1)\right)\mid S_t^1,X_t\right].\label{eq:recourse_q1_expanded}\end{equation}
 
-The central distinction from independently evaluating two stage-specific states is the endogenous residual state $\bar S_t^2$: it is generated by the first-stage decision and its realized rejection outcome, rather than supplied as an unrelated second state. Consequently, $Q_{1,t}^{\pi}$ learns the expected AEV recourse value through $Q_{2,t}^{\pi}$, including the value of serving HEV-rejected requests. The two value functions therefore form a conditional recursion, not two parallel values to be computed independently or added after optimization. Feasibility and cross-vehicle coupling remain enforced by $\mathcal F_t^1(S_t^1)$ and $\mathcal F_t^2(\bar S_t^2)$.
+The residual state $\bar S_t^2$ has not been removed from the model: it is generated endogenously by the first-stage decision and the realized rejection outcome, then marginalized through $\mathbb P_t^\pi(\mathrm d s^2\mid S_t^1,X_t)$ when conditioning on $(S_t^1,X_t)$. Consequently, $Q_{1,t}^{\pi}$ learns the expected AEV recourse value through $Q_{2,t}^{\pi}$, including the value of serving HEV-rejected requests. The two value functions form a conditional recursion rather than two parallel values that can be optimized independently and added afterward. Feasibility and cross-vehicle coupling remain enforced by $\mathcal F_t^1(S_t^1)$ and $\mathcal F_t^2(\bar S_t^2)$.
 
 The corresponding stage policies are
 \begin{equation}\pi_1(S_t^1)\in\operatorname*{arg\,max}_{X_t\in\mathcal F_t^1(S_t^1)}Q_{1,t}^{\pi}(S_t^1,X_t).\label{eq:recourse_policy1}\end{equation}

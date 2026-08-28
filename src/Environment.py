@@ -4903,6 +4903,8 @@ class ChargingIntegratedEnvironment(Environment):
                 target_zoneids=[0] * len(rows),
                 vehicle_idle_times=[float(row.get('vehicle_idle_time', 0.0)) for row in rows],
                 action_type_ids=action_ids,
+                **({"request_ids": [row.get('target_id', -1) for row in rows]}
+                   if getattr(value_function, 'supports_ev_acceptance_feature', False) else {}),
                 post_action_distances=post_action_distances,
                 post_action_durations=post_action_durations,
                 post_action_zoneids=[0] * len(rows),
@@ -5738,6 +5740,10 @@ class ChargingIntegratedEnvironment(Environment):
                     structured_q_value = self.generate_vehicle_qvalue_withoutqnetwork(
                         vehicles_to_rebalance
                     )
+                    # Matrix/solver preparation removes stale charging queue
+                    # entries. Freeze that actual decision state, before any
+                    # selected offer is answered, not the earlier dirty queue.
+                    pending_transition.pre_state = StateSnapshotBuilder.build(self)
                     integrated_graph = StateSnapshotBuilder.feasible_graph_from_matrix(
                         self,
                         vehicles_to_rebalance,

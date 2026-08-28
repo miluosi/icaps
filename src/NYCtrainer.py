@@ -126,6 +126,8 @@ class NYCTrainer:
             return "_standard_masac_gat_total_q"
         if effective_zone_distribution_mode == "optimization_anchored_residual":
             return "_optimization_anchored_residual"
+        if effective_zone_distribution_mode == "integrated_directq":
+            return "_integrated_directq"
         if effective_zone_distribution_mode == "standard_masac_gat_greedy_alpha":
             return "_standard_masac_gat_greedy_alpha"
         if effective_zone_distribution_mode == "standard_masac_gat_fixed_alpha":
@@ -841,6 +843,12 @@ class NYCTrainer:
         common_random_numbers: bool = False,
         state_variant: str = "joint_state_separate_critics",
         learner_variant: str = "legacy",
+        ev_acceptance_feature: str = "off",
+        ev_acceptance_model: str | None = None,
+        battery_consumption_ratio: float = 1.0,
+        initial_battery_mean: float = 0.875,
+        charge_wait_bool: bool = True,
+        human_ev_charge_decision_interval_minutes: float = 120.0,
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -898,6 +906,12 @@ class NYCTrainer:
             rejection_logit_shift=rejection_logit_shift,
             common_random_numbers=common_random_numbers,
             only_manhattan_zones=only_manhattan_zones,
+            battery_consumption_ratio=battery_consumption_ratio,
+            initial_battery_mean=initial_battery_mean,
+            charge_wait_bool=charge_wait_bool,
+            human_ev_charge_decision_interval_minutes=(
+                human_ev_charge_decision_interval_minutes
+            ),
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -915,9 +929,18 @@ class NYCTrainer:
         env.evaluatemode = not trainnetwork
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
+        from src.acceptance_features import configure_acceptance_feature
+        configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model)
+        if ev_acceptance_feature == "predicted":
+            import hashlib, json
+            predictor_id = hashlib.sha256(json.dumps(env.ev_acceptance_model.to_dict(), sort_keys=True).encode()).hexdigest()[:12]
+            checkpoint_suffix = (checkpoint_suffix or "") + f"_evaccept-{predictor_id}"
         shared_critic = uses_shared_critic(state_variant)
 
         effective_zone_distribution_mode = self._resolve_zone_distribution_mode(zone_distribution_mode)
+        if learner_variant == "legacy" and effective_zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
+            learner_variant = effective_zone_distribution_mode
+            env.learner_variant = learner_variant
         print(f"Path transformer self-attention: {'enabled' if iftransformer else 'disabled'}")
         use_neural_network = self._trainer_helper._should_train_value_function(
             adpvalue,
@@ -1177,6 +1200,12 @@ class NYCTrainer:
         total_station_capacity = sum(station.max_capacity for station in env.charging_manager.stations.values())
         print(f"✓ NYCEnvironment: {num_vehicles} vehicles, {env.NUM_ZONES} zones")
         print(f"✓ Charging stations: {len(env.charging_manager.stations)} stations, capacity={total_station_capacity}, scale={station_capacity_scale}")
+        print(
+            "✓ Human EV charge-decision interval: "
+            f"{env.human_ev_charge_decision_interval_minutes:g} min "
+            f"({env.human_ev_charge_decision_interval_epochs} epochs; "
+            "SOC <= 0.20 safety bypass)"
+        )
         if env.useauction:
             print(f"✓ MCMF solver: AUCTION ({'GPU' if env.auction_use_gpu else 'CPU'})")
         elif env.mcmf_solver == "exact":

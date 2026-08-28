@@ -783,6 +783,10 @@ class ADPTrainer:
                     checkpoint_path, map_location=value_function.device
                 )
             
+            if hasattr(value_function, 'load_acceptance_checkpoint_state'):
+                value_function.load_acceptance_checkpoint_state(
+                    checkpoint.get('extra_value_function_state', {})
+                )
             # 选择要加载的state_dict
             # if 'target_network_state_dict' in checkpoint:
             #     state_dict_to_load = checkpoint['target_network_state_dict']
@@ -989,6 +993,8 @@ class ADPTrainer:
         common_random_numbers: bool = False,
         state_variant: str = "joint_state_separate_critics",
         learner_variant: str = "legacy",
+        ev_acceptance_feature: str = "off",
+        ev_acceptance_model: str | None = None,
     ):
         """完整迁移的集成测试（含神经网络训练与梯度更新）。"""
 
@@ -1062,6 +1068,8 @@ class ADPTrainer:
         episode_days = None if episode_length is None else max(1, int(np.ceil(episode_length / max(simulation_period, 1))))
 
         effective_zone_distribution_mode = zone_distribution_mode or ("bayes" if encoder else "none")
+        if learner_variant == "legacy" and effective_zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
+            learner_variant = effective_zone_distribution_mode
         encoder_enabled = effective_zone_distribution_mode in {"bayes", "bayes_simple"}
 
         def get_distribution_suffix() -> str:
@@ -1085,6 +1093,8 @@ class ADPTrainer:
                 suffix = "_st_masac_gat_post_demand_direct"
             elif effective_zone_distribution_mode == "st_masac_gat_queue_demand_gurobi":
                 suffix = "_st_masac_gat_queue_demand_gurobi"
+            elif effective_zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
+                suffix = "_" + effective_zone_distribution_mode
             elif effective_zone_distribution_mode == "standard_masac_gat":
                 suffix = "_standard_masac_gat"
             elif effective_zone_distribution_mode == "standard_masac_gat_total_q":
@@ -1154,6 +1164,12 @@ class ADPTrainer:
         )
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
+        from src.acceptance_features import configure_acceptance_feature
+        configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model)
+        if ev_acceptance_feature == "predicted":
+            import hashlib, json
+            predictor_id = hashlib.sha256(json.dumps(env.ev_acceptance_model.to_dict(), sort_keys=True).encode()).hexdigest()[:12]
+            checkpoint_scenario_suffix += f"_evaccept-{predictor_id}"
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
         env.useauction = bool(useauction or getattr(env, 'ifsolveauctioncuda', False))

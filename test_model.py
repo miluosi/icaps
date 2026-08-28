@@ -156,6 +156,9 @@ def _drop_all_zero_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trained Q-network checkpoints across ILP, MCMF, and heuristic backends")
+    from src.acceptance_features import add_acceptance_arguments
+    add_acceptance_arguments(parser)
+    parser.add_argument('--checkpoint-suffix', default='', help='Experiment namespace printed by the training CLI, excluding the auto-added EV predictor hash')
     parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes per seed")
     parser.add_argument("--num-vehicles", type=int, default=200, help="Total vehicles")
     parser.add_argument("--num-ev", type=int, default=100, help="EV vehicles")
@@ -228,6 +231,7 @@ def parse_args():
         default="st_masac_gat_queue_demand_gurobi",
         choices=[
             "bayes", "time-only", "none",
+            "integrated_directq", "optimization_anchored_residual",
             "st_masac_gat_post_demand_direct",
             "st_masac_gat_queue_demand_gurobi",
         ],
@@ -307,6 +311,8 @@ def get_distribution_suffix(distribution_mode: str) -> str:
         return "_st_masac_gat_post_demand_direct"
     if distribution_mode == "st_masac_gat_queue_demand_gurobi":
         return "_st_masac_gat_queue_demand_gurobi"
+    if distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
+        return "_" + distribution_mode
     if distribution_mode == "standard_masac_gat":
         return "_standard_masac_gat"
     if distribution_mode == "standard_masac_gat_total_q":
@@ -372,7 +378,13 @@ def main():
             else args.synthetic_demand_scale
         ),
     )
-    if zone_distribution_mode == "elbo":
+    checkpoint_scenario_suffix = '_'.join(part for part in (checkpoint_scenario_suffix, args.checkpoint_suffix) if part)
+    from src.acceptance_features import acceptance_checkpoint_suffix
+    checkpoint_lookup_suffix = checkpoint_scenario_suffix + acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model)
+    if zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
+        from src.value_function_registry import get_value_function_class
+        adp_trainer_module.PyTorchChargingValueFunction = get_value_function_class(zone_distribution_mode)
+    elif zone_distribution_mode == "elbo":
         from src.ValueFunction_pytorch_elbo import PyTorchChargingValueFunction as ELBOPyTorchChargingValueFunction
         adp_trainer_module.PyTorchChargingValueFunction = ELBOPyTorchChargingValueFunction
     elif zone_distribution_mode == "bayes_simple":
@@ -454,12 +466,12 @@ def main():
                     key = (mode, intense, checkpoint_tag)
                     ev_dir = build_checkpoint_dir(
                         mode, args.num_ev, intense, "ev",
-                        zone_distribution_mode, checkpoint_scenario_suffix,
+                        zone_distribution_mode, checkpoint_lookup_suffix,
                         assign_tag=checkpoint_tag,
                     )
                     aev_dir = build_checkpoint_dir(
                         mode, args.num_ev, intense, "aev",
-                        zone_distribution_mode, checkpoint_scenario_suffix,
+                        zone_distribution_mode, checkpoint_lookup_suffix,
                         assign_tag=checkpoint_tag,
                     )
                     ev_checkpoint, aev_checkpoint = ADPTrainer.find_checkpoint_pair(
@@ -542,6 +554,8 @@ def main():
                         aev_initial_battery_scale=args.aev_initial_battery_scale,
                         critical_charging_battery=args.critical_charging_battery,
                         zone_distribution_mode=zone_distribution_mode,
+                        ev_acceptance_feature=args.ev_acceptance_feature,
+                        ev_acceptance_model=args.ev_acceptance_model,
                         post_demand_q_weight=args.post_demand_q_weight,
                         post_demand_head_lr_multiplier=args.post_demand_head_lr_multiplier,
                         masac_target_entropy_ratio=args.masac_target_entropy_ratio,

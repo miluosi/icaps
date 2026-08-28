@@ -32,7 +32,8 @@ def _expand_mlp_input(
     device: torch.device,
 ) -> _MLP:
     """Insert a zero-weight input while preserving every existing output."""
-    expanded = _MLP(input_dim, hidden_dim=128).to(device)
+    with torch.random.fork_rng(devices=[]):
+        expanded = _MLP(input_dim, hidden_dim=128).to(device)
     with torch.no_grad():
         source_first = source.net[0]
         expanded_first = expanded.net[0]
@@ -263,6 +264,8 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         return value
 
     def store_experience(self, **kwargs):
+        if bool(getattr(self.env, "evaluatemode", False)):
+            return
         super().store_experience(**kwargs)
         observed_post_demand = kwargs.get("observed_post_demand")
         if observed_post_demand is None:
@@ -339,6 +342,7 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         graph_snapshot=None,
         target_context: bool = False,
         vehicle_types=None,
+        acceptance_probabilities=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         graph = self._graph_context(graph_snapshot, target=target_context)
         source_embeddings = self._vehicle_source_embeddings(
@@ -401,6 +405,7 @@ class PyTorchChargingValueFunction(_BaseMASAC):
                 battery_level=float(battery_levels[index]),
                 vehicle_type=vehicle_type,
                 queue_wait_feature=float(queue_wait_features[index]),
+                acceptance_probability=(0.0 if acceptance_probabilities is None else acceptance_probabilities[index]),
             )
             local.append(float(post_demand_features[index]))
             source_h = source_embeddings[int(vehicle_ids[index])]

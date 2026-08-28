@@ -245,6 +245,30 @@ For full-month or multi-day experiments, replace `--parquet-path` and the date r
 
 ## Outputs
 
+For supervised binary driver-acceptance training on ordinary MCMF offers,
+see [MCMF acceptance model](docs/MCMF_ACCEPTANCE_MODEL.md). The standalone
+`train_acceptance_model.py` runner supports both synthetic and NYC environments,
+keeps train/validation/test simulation seeds separate, and reports probability
+calibration against a constant-rate baseline without changing the dispatcher.
+For a separate NYC 200-vehicle loss-history, rejection-classification and
+pure-MCMF noninterference audit, run `check_nyc_mcmf_acceptance.py`; see
+[NYC probability check](docs/NYC_MCMF_ACCEPTANCE_CHECK.md).
+The current predictor is a 30-input PyTorch MLP (not logistic regression); see
+[neural acceptance model](docs/NEURAL_ACCEPTANCE_MODEL.md). NYC now defaults to
+`reject_uniform=True` and a **2 km pickup radius**. To verify these settings, add
+`--require-random-rejection --expected-assignment-range-km 2` to the audit command.
+Legacy regression checkpoints require new full-feature data and neural retraining.
+For the explicitly configured, historical `reject_uniform=False` branch, use
+`check_nyc_deterministic_rejection.py`; see
+[deterministic rejection check](docs/NYC_DETERMINISTIC_REJECTION_CHECK.md).
+It verifies the fixed threshold and reports missing rejection labels without
+claiming a successful binary fit on single-class data.
+
+For using that frozen probability as an optional EV Q/residual input and running
+paired 200-vehicle Integrated learning experiments, see
+[EV acceptance learning ablation](docs/EV_ACCEPTANCE_LEARNING_ABLATION.md).
+The feature flag is shared by all registered learners and both simulators.
+
 Training creates `checkpoints/`, `results/`, and statistical output files as needed. These paths are ignored by Git. The clean project contains no historical experimental results or model weights.
 
 ## Paper resources

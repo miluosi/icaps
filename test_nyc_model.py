@@ -77,6 +77,9 @@ def _json_dumps(value) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trained Q-network checkpoints across ILP, MCMF, and heuristic backends")
+    from src.acceptance_features import add_acceptance_arguments
+    add_acceptance_arguments(parser)
+    parser.add_argument('--checkpoint-suffix', default='', help='Experiment namespace printed by the training CLI, excluding the auto-added EV predictor hash')
     parser.add_argument("--paper-parameter-preset", action="store_true",
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
@@ -113,6 +116,12 @@ def parse_args():
                         help="Stop hour of simulation window")
     parser.add_argument("--epoch-length", type=float, default=30.0,
                         help="Epoch length in seconds")
+    parser.add_argument(
+        "--human-ev-charge-decision-interval-minutes",
+        type=float,
+        default=120.0,
+        help="Minimum Human EV charge-decision interval; SOC <= 0.20 bypasses it.",
+    )
     parser.add_argument("--checkpoint-trained-start-hour", type=float, default=0.0,
                         help="Start hour used when the loaded checkpoint was trained")
     parser.add_argument("--checkpoint-trained-stop-hour", type=float, default=24.0,
@@ -173,6 +182,8 @@ def parse_args():
             "st_masac_gat",
             "st_masac_gat_post_demand",
             "st_masac_gat_post_demand_direct",
+            "integrated_directq",
+            "optimization_anchored_residual",
             "st_masac_gat_frozen",
             "st_masac_gat_neighbour_frozen",
             "st-masac-gat",
@@ -576,6 +587,7 @@ def build_checkpoint_dir(
     distribution_mode: str,
     only_manhattan_zones: bool = False,
     full_demand: bool = False,
+    checkpoint_suffix: str = '',
 ) -> str:
     """Checkpoint dir matching NYCTrainer save/load convention."""
     if vtype not in {"ev", "aev"}:
@@ -590,6 +602,7 @@ def build_checkpoint_dir(
         zone_distribution_mode=normalize_distribution_mode(distribution_mode),
         only_manhattan_zones=only_manhattan_zones,
         full_demand=full_demand,
+        checkpoint_suffix=checkpoint_suffix,
     )
     return ev_dir if vtype == "ev" else aev_dir
 
@@ -610,6 +623,8 @@ def resolve_dataset_dates(start_date: str, end_date: str | None) -> tuple[str, s
 def main():
     args = apply_paper_parameter_preset(parse_args())
     zone_distribution_mode = normalize_distribution_mode(args.distribution_mode)
+    from src.acceptance_features import acceptance_checkpoint_suffix
+    acceptance_lookup_suffix = acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model)
     intense = True
     expected_steps = max(1, int(((args.stop_hour - args.start_hour) * 3600) / args.epoch_length))
     if args.test_steps_per_episode != expected_steps:
@@ -710,6 +725,7 @@ def main():
                         zone_distribution_mode,
                         args.only_manhattan_zones,
                         args.full_demand,
+                        checkpoint_suffix=(args.checkpoint_suffix + acceptance_lookup_suffix),
                     )
                     latest = ADPTrainer.find_latest_checkpoint(
                         ckpt_dir,
@@ -793,7 +809,13 @@ def main():
                     stop_hour=args.stop_hour,
                     epoch_length=args.epoch_length,
                     zone_distribution_mode=zone_distribution_mode,
+                    ev_acceptance_feature=args.ev_acceptance_feature,
+                    ev_acceptance_model=args.ev_acceptance_model,
+                    checkpoint_suffix=args.checkpoint_suffix,
                     only_manhattan_zones=args.only_manhattan_zones,
+                    human_ev_charge_decision_interval_minutes=(
+                        args.human_ev_charge_decision_interval_minutes
+                    ),
                     load_checkpoint_assign_tag=(
                         checkpoint_assign_tag if strat["load_ckpt"] else None
                     ),

@@ -49,12 +49,15 @@ class RequestSnapshot:
     travel_time: float
     trip_distance_km: float | None = None
     pickup_zone_id: int | None = None
+    surge_bonus: float | None = None
 
     @classmethod
     def from_request(cls, request: Any) -> "RequestSnapshot":
         pickup = int(getattr(request, "pickup", 0))
         return cls(
             request_id=int(getattr(request, "request_id")),
+            surge_bonus=(None if getattr(request, "surge_bonus", None) is None
+                         else float(request.surge_bonus)),
             pickup=pickup,
             dropoff=int(getattr(request, "dropoff", pickup)),
             value=float(getattr(request, "value", 0.0) or 0.0),
@@ -109,6 +112,7 @@ class VehicleSnapshot:
     relocation_target: int | None = None
     remaining_relocation_time: float = 0.0
     stationary_duration_left: float = 0.0
+    penalty_timer: float = 0.0
 
     @classmethod
     def from_vehicle(
@@ -191,6 +195,7 @@ class VehicleSnapshot:
             location=location,
             battery=float(vehicle.get("battery", 1.0) or 0.0),
             idle_time=float(vehicle.get("idle_timer", 0.0) or 0.0),
+            penalty_timer=float(vehicle.get("penalty_timer", 0.0) or 0.0),
             online=bool(vehicle.get("is_online", True)),
             assigned_request=assigned_request,
             passenger_onboard=passenger_onboard,
@@ -347,6 +352,7 @@ class FeasibleEdgeSnapshot:
     post_action_zoneid: int = 0
     queue_features: tuple[float, ...] = ()
     post_demand_feature: float | None = None
+    acceptance_probability: float | None = None
     metadata: tuple[tuple[str, float | int | str | bool | None], ...] = ()
 
     def candidate_dict(self) -> dict[str, Any]:
@@ -363,6 +369,7 @@ class FeasibleEdgeSnapshot:
             "target_station_id": self.station_id,
             "queue_features": self.queue_features,
             "post_demand_feature": self.post_demand_feature,
+            "acceptance_probability": self.acceptance_probability,
         }
 
 

@@ -58,6 +58,41 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # NYCEnvironment
 # ============================================================================
 
+DEFAULT_INITIAL_BATTERY_MEAN = 0.875
+DEFAULT_INITIAL_BATTERY_HALF_WIDTH = 0.075
+
+
+def initial_battery_bounds(
+    mean: float,
+    half_width: float = DEFAULT_INITIAL_BATTERY_HALF_WIDTH,
+) -> tuple[float, float]:
+    """Return a symmetric initial-SOC interval with the requested mean."""
+    mean = float(mean)
+    half_width = float(half_width)
+    if not math.isfinite(mean) or not 0.0 < mean <= 1.0:
+        raise ValueError("initial_battery_mean must be finite and in (0, 1]")
+    if not math.isfinite(half_width) or half_width < 0.0:
+        raise ValueError("initial battery half-width must be finite and nonnegative")
+    effective_half_width = min(half_width, mean, 1.0 - mean)
+    return mean - effective_half_width, mean + effective_half_width
+
+
+def charge_decision_interval_epochs(
+    interval_minutes: float,
+    epoch_length_sec: float,
+) -> int:
+    """Convert a real-time Human EV decision interval to simulator epochs."""
+    interval_minutes = float(interval_minutes)
+    epoch_length_sec = float(epoch_length_sec)
+    if not math.isfinite(interval_minutes) or interval_minutes < 0.0:
+        raise ValueError(
+            "human_ev_charge_decision_interval_minutes must be finite and nonnegative"
+        )
+    if not math.isfinite(epoch_length_sec) or epoch_length_sec <= 0.0:
+        raise ValueError("epoch_length_sec must be finite and positive")
+    return max(0, int(math.ceil(interval_minutes * 60.0 / epoch_length_sec)))
+
+
 class NYCEnvironment:
     """
     Grid-free NYC environment operating on official TLC taxi-zone geometry.
@@ -151,6 +186,10 @@ class NYCEnvironment:
         rejection_penalty_per_km: float = 0.35,
         rejection_penalty_final_value_ratio: float | None = 0.25,
         operating_cost_per_km: float = 0.08,
+        battery_consumption_ratio: float = 1.0,
+        initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
+        charge_wait_bool: bool = True,
+        human_ev_charge_decision_interval_minutes: float = 120.0,
     ):
         # --- base directory of data files ---
         _base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "nyedata", "nye_simulation")
@@ -228,6 +267,22 @@ class NYCEnvironment:
         self.num_vehicles = num_vehicles
         self.ev_num_vehicles = ev_num_vehicles if ev_num_vehicles is not None else num_vehicles // 2
         self.num_stations = num_stations
+        self.charge_wait_bool = bool(charge_wait_bool)
+        self.human_ev_charge_decision_interval_minutes = float(
+            human_ev_charge_decision_interval_minutes
+        )
+        self.human_ev_charge_decision_interval_epochs = charge_decision_interval_epochs(
+            self.human_ev_charge_decision_interval_minutes,
+            self.EPOCH_LENGTH,
+        )
+        self.initial_battery_mean = float(initial_battery_mean)
+        (
+            self.initial_battery_low,
+            self.initial_battery_high,
+        ) = initial_battery_bounds(self.initial_battery_mean)
+        self.realized_initial_battery_mean = 0.0
+        self.realized_initial_battery_mean_human_ev = 0.0
+        self.realized_initial_battery_mean_aev = 0.0
         self.station_capacity_scale = max(0.0, float(1.0 if station_capacity_scale is None else station_capacity_scale))
 
         # --- flags ---
@@ -280,7 +335,17 @@ class NYCEnvironment:
         self.ev_model_basis = "Tesla Model 3 standard range"
         self.battery_capacity_kwh = 51.25
         self.battery_degradation = 0.10
-        self.ev_consumption_wh_per_mile = 230.0
+        self.base_ev_consumption_wh_per_mile = 230.0
+        self.battery_consumption_ratio = float(battery_consumption_ratio)
+        if (
+            not math.isfinite(self.battery_consumption_ratio)
+            or self.battery_consumption_ratio <= 0.0
+        ):
+            raise ValueError("battery_consumption_ratio must be finite and positive")
+        self.ev_consumption_wh_per_mile = (
+            self.base_ev_consumption_wh_per_mile
+            * self.battery_consumption_ratio
+        )
         self.ev_consumption_kwh_per_km = (self.ev_consumption_wh_per_mile / 1000.0) / 1.609344
         self.average_velocity_mph = 11.21
         self.average_velocity_kmph = self.average_velocity_mph * 1.609344
@@ -347,7 +412,7 @@ class NYCEnvironment:
         self.decision_mode = "integrated"
         self.decision_mode_set = {"integrated", "aev_first", "ev_first"}
         self.use_range_requests = True  # True: range-based, False: all feasible
-        self.assignmentrange = 5.0  # radius in km for range-based request filtering
+        self.assignmentrange = 2.0  # pickup radius in km; not passenger trip length
         self.request_top_k = 128  # cap per-vehicle feasible requests to keep q-value batches bounded
         self.charge_action_range_km = 5
         self.zone_action_range_km = 10.0
@@ -428,6 +493,10 @@ class NYCEnvironment:
         self.rebalancing_assignments_per_step: list = []
         self.rebalancing_whole: list = []
         self.total_rebalancing_calls = 0
+        self.mcmf_action_counts_by_type = self._empty_mcmf_action_counts_by_type()
+        self.mcmf_action_counts_by_type_soc_bin = (
+            self._empty_mcmf_action_counts_by_type_soc_bin()
+        )
         self.current_online = 0
         self.daily_online_history: list = []
         self.period_dropout_counts: list = []
@@ -477,6 +546,7 @@ class NYCEnvironment:
         else:
             self.rejection_penalty_final_value_ratio = float(rejection_penalty_final_value_ratio)
         self.rejection_reward_total = 0.0
+        self.reject_uniform = True  # sample the actual Bernoulli driver response
         self.rejection_reward_count = 0
         self.step_rejection_reward_total = 0.0
         self.step_rejection_reward_count = 0
@@ -1248,7 +1318,10 @@ class NYCEnvironment:
                 'location': zone,
                 'coordinates': self.zone_coords[zone],  # (lat, lon) for viz
             'zone_id': zone,
-                'battery': random.uniform(0.8, 0.95),
+                'battery': random.uniform(
+                    self.initial_battery_low,
+                    self.initial_battery_high,
+                ),
                 'charging_station': None,
                 'charging_time_left': 0,
                 'charging_session_start_time': None,
@@ -1283,6 +1356,21 @@ class NYCEnvironment:
             }
             self.storeactions[i] = None
             self.storeactions_ev[i] = None
+
+        initial_batteries = [float(vehicle['battery']) for vehicle in self.vehicles.values()]
+        human_ev_batteries = [
+            float(vehicle['battery'])
+            for vehicle in self.vehicles.values()
+            if vehicle.get('type') == 1
+        ]
+        aev_batteries = [
+            float(vehicle['battery'])
+            for vehicle in self.vehicles.values()
+            if vehicle.get('type') == 2
+        ]
+        self.realized_initial_battery_mean = float(np.mean(initial_batteries)) if initial_batteries else 0.0
+        self.realized_initial_battery_mean_human_ev = float(np.mean(human_ev_batteries)) if human_ev_batteries else 0.0
+        self.realized_initial_battery_mean_aev = float(np.mean(aev_batteries)) if aev_batteries else 0.0
 
         random.setstate(saved_state)
         np.random.set_state(saved_np)
@@ -1337,6 +1425,10 @@ class NYCEnvironment:
         self.rebalancing_assignments_per_step = []
         self.rebalancing_whole = []
         self.total_rebalancing_calls = 0
+        self.mcmf_action_counts_by_type = self._empty_mcmf_action_counts_by_type()
+        self.mcmf_action_counts_by_type_soc_bin = (
+            self._empty_mcmf_action_counts_by_type_soc_bin()
+        )
         self.storeactions = {}
         self.storeactions_ev = {}
         self.request_generation_history = []
@@ -1397,6 +1489,8 @@ class NYCEnvironment:
         self._same_epoch_blocked_request_ids = set()
         self._ensure_recourse_runtime()
         self.request_lifecycle.reset()
+        self.charge_wait_bool = bool(getattr(self, 'charge_wait_bool', True))
+        self.charge_index = int(getattr(self, 'charge_index', 5))
         self.recourse_coordinator.pending = None
         self._last_offer_realizations = {}
         self._pending_recourse_actions = {}
@@ -1806,7 +1900,7 @@ class NYCEnvironment:
             return np.zeros((len(vehicle_ids), len(requests)), dtype=bool)
 
         use_range = getattr(self, 'use_range_requests', False)
-        range_radius = getattr(self, 'assignmentrange', 5.0)
+        range_radius = getattr(self, 'assignmentrange', 2.0)
         vehicle_locations = np.array([self.vehicles[vid]['location'] for vid in vehicle_ids], dtype=np.int32)
         vehicle_battery = np.array([self.vehicles[vid]['battery'] for vid in vehicle_ids], dtype=np.float32)
         pickup_ids = np.array([req.pickup for req in requests], dtype=np.int32)
@@ -2234,6 +2328,56 @@ class NYCEnvironment:
             and vehicle.get('passenger_onboard') is None
             and vehicle.get('charging_station') is None
         )
+
+
+    def _reachable_current_charging_capacity(self, vehicle: dict) -> list[tuple[float, int, int]]:
+        """Return ``(distance, station_id, vacancy)`` for reachable stations."""
+
+        if not vehicle or not self.charging_manager.stations:
+            return []
+        location = int(vehicle['location'])
+        battery = max(0.0, float(vehicle.get('battery', 0.0)) - 0.01)
+        consumption_per_km = float(getattr(self, 'battery_consum', 0.0))
+        if consumption_per_km <= 0.0:
+            battery_supported_distance = math.inf
+        else:
+            battery_supported_distance = battery / consumption_per_km
+        configured_range = getattr(self, 'charge_action_range_km', None)
+        if configured_range is not None and float(configured_range) > 0.0:
+            battery_supported_distance = min(
+                battery_supported_distance,
+                float(configured_range),
+            )
+
+        reachable = []
+        for station_id, station in self.charging_manager.stations.items():
+            distance = float(self.get_distance_km(location, int(station.location)))
+            if distance > battery_supported_distance + 1e-9:
+                continue
+            reserved = (
+                len(station.current_vehicles)
+                + len(station.charging_queue_notarrived)
+            )
+            vacancy = max(0, int(station.max_capacity) - reserved)
+            if vacancy > 0:
+                reachable.append((distance, int(station_id), vacancy))
+        return sorted(reachable, key=lambda item: (item[0], item[1]))
+
+    def generate_capacity_charge(self, vehicle: dict) -> int:
+        """Return the current vacant charger capacity reachable by a vehicle.
+
+        Reachability uses the distance supported by the vehicle's current SOC
+        after the same 0.01 reserve used by the charging-action matrix.  The
+        configured charging-action range is also respected, so this capacity
+        calculation and ``generate_vehicle_chargerange`` expose the same set
+        of stations to MCMF.
+        """
+
+        return int(sum(
+            vacancy
+            for _distance, _station_id, vacancy
+            in self._reachable_current_charging_capacity(vehicle)
+        ))
 
     def _refresh_daily_driver_states(self):
         previous_period_dropout_count = self.current_period_dropout_count
@@ -2675,7 +2819,10 @@ class NYCEnvironment:
         rejection_probability = self._calculate_rejection_probabilityreal(
             vehicle_id, request
         )
-        acceptance_uniform = self._acceptance_uniform(vehicle_id, request)
+        if self.reject_uniform:
+            acceptance_uniform = self._acceptance_uniform(vehicle_id, request)
+        else:
+            acceptance_uniform = 0.5
         rejected = acceptance_uniform < rejection_probability
         self._last_offer_realizations[(self._epoch_id(), int(vehicle_id), int(request.request_id))] = {
             "acceptance_probability": 1.0 - float(rejection_probability),
@@ -4984,6 +5131,58 @@ class NYCEnvironment:
         key = self.current_time
         self.reject_number[key] = self.reject_number.get(key, 0) + int(amount)
 
+    @staticmethod
+    def _empty_mcmf_action_counts_by_type():
+        action_names = ("request", "charge", "wait", "relocate", "other")
+        return {
+            fleet_type: {action_name: 0 for action_name in action_names}
+            for fleet_type in ("human_ev", "aev")
+        }
+
+    @staticmethod
+    def _empty_mcmf_action_counts_by_type_soc_bin():
+        action_names = ("request", "charge", "wait", "relocate", "other")
+        soc_bins = ("soc_le_0p15", "soc_0p15_0p20", "soc_0p20_0p30", "soc_gt_0p30")
+        return {
+            fleet_type: {
+                soc_bin: {action_name: 0 for action_name in action_names}
+                for soc_bin in soc_bins
+            }
+            for fleet_type in ("human_ev", "aev")
+        }
+
+    @staticmethod
+    def _mcmf_action_name(target_request):
+        if isinstance(target_request, Request):
+            return "request"
+        if isinstance(target_request, str):
+            if target_request.startswith("charge_"):
+                return "charge"
+            if target_request == "waiting":
+                return "wait"
+            if target_request.startswith("idle_at_") or target_request.startswith("reloc"):
+                return "relocate"
+        return "other"
+
+    @staticmethod
+    def _soc_bin_name(battery: float):
+        battery = float(battery)
+        if battery <= 0.15:
+            return "soc_le_0p15"
+        if battery <= 0.20:
+            return "soc_0p15_0p20"
+        if battery <= 0.30:
+            return "soc_0p20_0p30"
+        return "soc_gt_0p30"
+
+    def _record_mcmf_action_selection(self, vehicle_id: int, target_request):
+        vehicle = self.vehicles[vehicle_id]
+        fleet_type = "human_ev" if self._is_ev(vehicle_id) else "aev"
+        action_name = self._mcmf_action_name(target_request)
+        soc_bin = self._soc_bin_name(float(vehicle.get("battery", 0.0)))
+        self.mcmf_action_counts_by_type[fleet_type][action_name] += 1
+        self.mcmf_action_counts_by_type_soc_bin[fleet_type][soc_bin][action_name] += 1
+
     def _process_integrated_assignments(self, rebalancing_assignments, actions,
                                          storeactions, storeactions_ev):
         """Process rebalancing_assignments dict for integrated / AEV-phase mode.
@@ -4994,6 +5193,7 @@ class NYCEnvironment:
 
         for vid, target_request in rebalancing_assignments.items():
             vehicle = self.vehicles[vid]
+            self._record_mcmf_action_selection(vid, target_request)
             vehicle_location = vehicle['location']
             vehicle_battery = vehicle['battery']
             vehicle['needs_emergency_charging'] = False
@@ -5258,8 +5458,26 @@ class NYCEnvironment:
         for vid, v in self.vehicles.items():
             if (v.get('is_online', True) and self._is_ev(vid) and v['charging_station'] is None and v['assigned_request'] is None
                     and v['passenger_onboard'] is None and v['idle_target'] is None and v['target_location'] is None):
+                # The interval controls when a Human EV driver may make the
+                # next stochastic charge decision; it does not alter either
+                # the Binary Logit probability or the station-choice MNL.
+                # SOC <= 0.20 bypasses the interval for charging safety.
+                if (
+                    float(v.get('battery', 1.0)) > 0.2
+                    and float(v.get('no_charge_cooldown_until', 0.0))
+                    > float(self.current_time)
+                ):
+                    continue
                 p_charge, station_probs = self.compute_ev_charge_probability(vid)
                 station_probs = self._reachable_charging_station_probs(vid, station_probs)
+                v['no_charge_cooldown_until'] = (
+                    float(self.current_time)
+                    + int(getattr(
+                        self,
+                        'human_ev_charge_decision_interval_epochs',
+                        5,
+                    ))
+                )
                 must_charge = float(v.get('battery', 1.0)) <= float(
                     getattr(self, 'must_charge_battery_threshold', self.rebalance_battery_threshold)
                 )
@@ -5283,8 +5501,6 @@ class NYCEnvironment:
                     self._move_vehicle_to_charging_station(vid, chosen_station)
                     actions[vid] = ChargingAction([], chosen_station, self._charge_duration_for_vehicle(vid), vloc, vbat)
                     self._update_storeaction(vid, actions[vid], storeactions_ev, is_ev=True)
-                else:
-                    v['no_charge_cooldown_until'] = self.current_time + 5
 
     def _begin_joint_collection(self, mode: str):
         self._ensure_recourse_runtime()
@@ -5964,7 +6180,7 @@ class NYCEnvironment:
         if not vehicle_ids or not avail:
             return mat
         use_range = getattr(self, 'use_range_requests', False)
-        range_radius = getattr(self, 'assignmentrange', 5.0)
+        range_radius = getattr(self, 'assignmentrange', 2.0)
         vehicle_locations = np.array([self.vehicles[vid]['location'] for vid in vehicle_ids], dtype=np.int32)
         vehicle_battery = np.array([self.vehicles[vid]['battery'] for vid in vehicle_ids], dtype=np.float32)
         pickup_ids = np.array([req.pickup for req in avail], dtype=np.int32)
@@ -6057,10 +6273,56 @@ class NYCEnvironment:
         return mat
 
     def generate_vehicle_wait(self, vehicle_ids, rebalance_num=0):
-        """Return the real stationary/outside action for every row."""
+        """Build the binary wait-feasibility column for the MCMF rows.
 
+        Human EVs retain their outside action because their charging choice is
+        handled before MCMF.  With ``charge_wait_bool`` enabled, current
+        charging capacity is reserved virtually for the lowest-SOC reachable
+        AEVs; those rows receive wait=0.  Capacity is decremented during this
+        construction so the shared MCMF graph retains a feasible full flow.
+        Disabling the interface restores the legacy all-one wait column.
+        """
         del rebalance_num
-        return np.ones((len(vehicle_ids), 1), dtype=np.float32)
+        wait = np.ones((len(vehicle_ids), 1), dtype=np.float32)
+        self._last_wait_forced_charge_station = {}
+        if not bool(getattr(self, 'charge_wait_bool', True)):
+            return wait
+        remaining_capacity = {
+            int(station_id): max(
+                0,
+                int(station.max_capacity)
+                - len(station.current_vehicles)
+                - len(station.charging_queue_notarrived),
+            )
+            for station_id, station in self.charging_manager.stations.items()
+        }
+        aev_rows = sorted(
+            (
+                (row, int(vehicle_id))
+                for row, vehicle_id in enumerate(vehicle_ids)
+                if not self._is_ev(vehicle_id)
+            ),
+            key=lambda item: (
+                float(self.vehicles[item[1]].get('battery', 0.0)),
+                item[1],
+            ),
+        )
+        for row, vehicle_id in aev_rows:
+            reachable = [
+                (distance, station_id)
+                for distance, station_id, _vacancy
+                in self._reachable_current_charging_capacity(
+                    self.vehicles[vehicle_id]
+                )
+                if remaining_capacity.get(station_id, 0) > 0
+            ]
+            if not reachable:
+                continue
+            _distance, station_id = min(reachable, key=lambda item: (item[0], item[1]))
+            wait[row, 0] = 0.0
+            remaining_capacity[station_id] -= 1
+            self._last_wait_forced_charge_station[vehicle_id] = station_id
+        return wait
 
     def _active_gat_neighbour_number(self) -> int:
         neighbour_numbers = []
@@ -6433,15 +6695,28 @@ class NYCEnvironment:
                 )
         return self._round_assignment_qvalues(q)
 
+    @staticmethod
+    def _value_function_ready_for_dispatch(value_function):
+        if value_function is None:
+            return False
+        return bool(
+            getattr(value_function, 'acceptance_input_enabled', False)
+            or getattr(value_function, 'learner_variant', 'legacy') in {
+                'integrated_directq', 'optimization_anchored_residual'
+            }
+            or max(int(getattr(value_function, 'training_step', 0) or 0),
+                   int(getattr(value_function, 'joint_training_step', 0) or 0)) > 0
+        )
+
     def generate_vehicle_qvalue(self, vehicles_to_rebalance, onlyev=False, prior_features=None):
         del prior_features
         vf = self.value_function_ev if onlyev else self.value_function
-        if vf is None or int(getattr(vf, 'training_step', 0) or 0) <= 0:
+        if not self._value_function_ready_for_dispatch(vf):
             return self.generate_vehicle_qvalue_withoutqnetwork(vehicles_to_rebalance)
         vf_ev_for_split = self.value_function_ev if (
             not onlyev
             and self.value_function_ev is not None
-            and int(getattr(self.value_function_ev, 'training_step', 0) or 0) > 0
+            and self._value_function_ready_for_dispatch(self.value_function_ev)
         ) else None
 
         assigned = set()
@@ -6709,6 +6984,11 @@ class NYCEnvironment:
                     '_last_vehicle_action_graph_neighbours',
                     {},
                 )
+            if getattr(net, 'supports_ev_acceptance_feature', False):
+                forward_kwargs['request_ids'] = [
+                    avail[int(edge_cols[i])].request_id if int(action_type_ids[i]) == 2 else -1
+                    for i in sel_idx
+                ]
             out = net.batch_get_mixed_q_values(**forward_kwargs)
             q_vals[sel_idx] = np.asarray(out, dtype=np.float32)
 
@@ -6942,6 +7222,18 @@ class NYCEnvironment:
 
         ev_vehicles = [v for v in self.vehicles.values() if v['type'] == 1]
         aev_vehicles = [v for v in self.vehicles.values() if v['type'] == 2]
+        avg_battery_human_ev = (
+            float(np.mean([v['battery'] for v in ev_vehicles])) if ev_vehicles else 0.0
+        )
+        avg_battery_aev = (
+            float(np.mean([v['battery'] for v in aev_vehicles])) if aev_vehicles else 0.0
+        )
+        total_distance_km_human_ev = float(
+            sum(float(v.get('total_distance', 0.0)) for v in ev_vehicles)
+        )
+        total_distance_km_aev = float(
+            sum(float(v.get('total_distance', 0.0)) for v in aev_vehicles)
+        )
         ev_rej = sum(v['rejected_requests'] for v in ev_vehicles)
         aev_rej = sum(v['rejected_requests'] for v in aev_vehicles)
         ev_offers = int(getattr(self, 'ev_offer_count', 0))
@@ -7178,6 +7470,45 @@ class NYCEnvironment:
             'avg_request_value': avg_val,
             'avg_battery': avg_bat,
             'charge_finished': self.charge_finished,
+            'charging_station_count': int(len(self.charging_manager.stations)),
+            'charging_total_capacity': int(sum(
+                int(station.max_capacity)
+                for station in self.charging_manager.stations.values()
+            )),
+            'charging_station_csv': str(self.station_csv),
+            'battery_consumption_ratio': self.battery_consumption_ratio,
+            'ev_consumption_wh_per_mile': self.ev_consumption_wh_per_mile,
+            'ev_consumption_kwh_per_km': self.ev_consumption_kwh_per_km,
+            'battery_capacity_kwh': self.battery_capacity_kwh,
+            'configured_initial_battery_mean': self.initial_battery_mean,
+            'charge_wait_bool': bool(self.charge_wait_bool),
+            'human_ev_charge_decision_interval_minutes': float(
+                self.human_ev_charge_decision_interval_minutes
+            ),
+            'human_ev_charge_decision_interval_epochs': int(
+                self.human_ev_charge_decision_interval_epochs
+            ),
+            'initial_battery_low': self.initial_battery_low,
+            'initial_battery_high': self.initial_battery_high,
+            'realized_initial_battery_mean': self.realized_initial_battery_mean,
+            'realized_initial_battery_mean_human_ev': self.realized_initial_battery_mean_human_ev,
+            'realized_initial_battery_mean_aev': self.realized_initial_battery_mean_aev,
+            'final_battery_mean_human_ev': avg_battery_human_ev,
+            'final_battery_mean_aev': avg_battery_aev,
+            'total_distance_km_human_ev': total_distance_km_human_ev,
+            'total_distance_km_aev': total_distance_km_aev,
+            'mcmf_action_counts_by_type': {
+                fleet_type: dict(counts)
+                for fleet_type, counts in self.mcmf_action_counts_by_type.items()
+            },
+            'mcmf_action_counts_by_type_soc_bin': {
+                fleet_type: {
+                    soc_bin: dict(counts)
+                    for soc_bin, counts in fleet_counts.items()
+                }
+                for fleet_type, fleet_counts
+                in self.mcmf_action_counts_by_type_soc_bin.items()
+            },
             **self._charging_session_stats(),
             'charging_wait_penalty_total': float(self.charging_wait_penalty_total),
             'charging_wait_steps': int(self.charging_wait_steps),
@@ -7343,6 +7674,8 @@ class NYCEnvironment:
 
     def get_stats(self):
         avg_bat = sum(v['battery'] for v in self.vehicles.values()) / max(1, len(self.vehicles))
+        ev_vehicles = [v for v in self.vehicles.values() if v.get('type') == 1]
+        aev_vehicles = [v for v in self.vehicles.values() if v.get('type') == 2]
         return {
             'vehicles': len(self.vehicles),
             'online_vehicles': sum(1 for v in self.vehicles.values() if v.get('is_online', True)),
@@ -7367,6 +7700,47 @@ class NYCEnvironment:
             ),
             'avg_battery': avg_bat,
             'average_battery': avg_bat,
+            'battery_consumption_ratio': self.battery_consumption_ratio,
+            'ev_consumption_wh_per_mile': self.ev_consumption_wh_per_mile,
+            'ev_consumption_kwh_per_km': self.ev_consumption_kwh_per_km,
+            'battery_capacity_kwh': self.battery_capacity_kwh,
+            'configured_initial_battery_mean': self.initial_battery_mean,
+            'charge_wait_bool': bool(self.charge_wait_bool),
+            'human_ev_charge_decision_interval_minutes': float(
+                self.human_ev_charge_decision_interval_minutes
+            ),
+            'human_ev_charge_decision_interval_epochs': int(
+                self.human_ev_charge_decision_interval_epochs
+            ),
+            'initial_battery_low': self.initial_battery_low,
+            'initial_battery_high': self.initial_battery_high,
+            'realized_initial_battery_mean': self.realized_initial_battery_mean,
+            'realized_initial_battery_mean_human_ev': self.realized_initial_battery_mean_human_ev,
+            'realized_initial_battery_mean_aev': self.realized_initial_battery_mean_aev,
+            'final_battery_mean_human_ev': (
+                float(np.mean([v['battery'] for v in ev_vehicles])) if ev_vehicles else 0.0
+            ),
+            'final_battery_mean_aev': (
+                float(np.mean([v['battery'] for v in aev_vehicles])) if aev_vehicles else 0.0
+            ),
+            'total_distance_km_human_ev': float(
+                sum(float(v.get('total_distance', 0.0)) for v in ev_vehicles)
+            ),
+            'total_distance_km_aev': float(
+                sum(float(v.get('total_distance', 0.0)) for v in aev_vehicles)
+            ),
+            'mcmf_action_counts_by_type': {
+                fleet_type: dict(counts)
+                for fleet_type, counts in self.mcmf_action_counts_by_type.items()
+            },
+            'mcmf_action_counts_by_type_soc_bin': {
+                fleet_type: {
+                    soc_bin: dict(counts)
+                    for soc_bin, counts in fleet_counts.items()
+                }
+                for fleet_type, fleet_counts
+                in self.mcmf_action_counts_by_type_soc_bin.items()
+            },
             **self._charging_session_stats(),
         }
 

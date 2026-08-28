@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.NYCEnvironment import NYCEnvironment
+from src.NYCEnvironment import DEFAULT_INITIAL_BATTERY_MEAN, NYCEnvironment
 from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
@@ -38,6 +38,8 @@ def _get_value_function_class(distribution_mode: str):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run NYC zone-based ADP training")
+    from src.acceptance_features import add_acceptance_arguments
+    add_acceptance_arguments(parser)
     parser.add_argument("--paper-parameter-preset", action="store_true",
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
@@ -83,6 +85,34 @@ def parse_args():
                         help="Total vehicles")
     parser.add_argument("--num-ev", type=int, default=25,
                         help="EV vehicles")
+    parser.add_argument(
+        "--initial-battery-mean",
+        type=float,
+        default=DEFAULT_INITIAL_BATTERY_MEAN,
+        help=(
+            "Requested mean initial vehicle SOC. The legacy default 0.875 "
+            "corresponds to Uniform(0.80, 0.95)."
+        ),
+    )
+    parser.add_argument(
+        "--charge-wait-bool",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When enabled, reserve reachable current charger capacity for "
+            "the lowest-SOC AEV rows and make their wait actions infeasible. "
+            "Use --no-charge-wait-bool to restore an all-one wait column."
+        ),
+    )
+    parser.add_argument(
+        "--human-ev-charge-decision-interval-minutes",
+        type=float,
+        default=120.0,
+        help=(
+            "Minimum real-time interval between stochastic Human EV charge "
+            "decisions. SOC <= 0.20 bypasses the interval for safety."
+        ),
+    )
     parser.add_argument("--transportation-mode", type=str, nargs="+", default=["integrated"],
                         choices=["integrated", "evfirst", "aevfirst"],
                         help="One or more transportation modes")
@@ -632,6 +662,10 @@ def _create_nyc_environment(
     rejection_logit_shift: float = 0.0,
     common_random_numbers: bool = False,
     only_manhattan_zones: bool = False,
+    battery_consumption_ratio: float = 1.0,
+    initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
+    charge_wait_bool: bool = True,
+    human_ev_charge_decision_interval_minutes: float = 120.0,
 ):
     print(f"NYCEnvironment zone filter flag: ifonlymanhatten={only_manhattan_zones}")
     env = NYCEnvironment(
@@ -676,6 +710,10 @@ def _create_nyc_environment(
         rejection_penalty_final_value_ratio=rejection_penalty_final_value_ratio,
         ifonlymanhatten=only_manhattan_zones,
         random_seed=random_seed,
+        battery_consumption_ratio=battery_consumption_ratio,
+        initial_battery_mean=initial_battery_mean,
+        charge_wait_bool=charge_wait_bool,
+        human_ev_charge_decision_interval_minutes=human_ev_charge_decision_interval_minutes,
     )
     env.configure_recourse_experiment(
         recourse_variant,
@@ -852,6 +890,12 @@ def run_nyc_training(
     common_random_numbers: bool = False,
     state_variant: str = "joint_state_separate_critics",
     learner_variant: str = "legacy",
+    ev_acceptance_feature: str = "off",
+    ev_acceptance_model: str | None = None,
+    battery_consumption_ratio: float = 1.0,
+    initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
+    charge_wait_bool: bool = True,
+    human_ev_charge_decision_interval_minutes: float = 120.0,
 ):
     """Compatibility wrapper that delegates NYC training to src.NYCtrainer.NYCTrainer."""
 
@@ -936,6 +980,12 @@ def run_nyc_training(
         common_random_numbers=common_random_numbers,
         state_variant=state_variant,
         learner_variant=learner_variant,
+        ev_acceptance_feature=ev_acceptance_feature,
+        ev_acceptance_model=ev_acceptance_model,
+        battery_consumption_ratio=battery_consumption_ratio,
+        initial_battery_mean=initial_battery_mean,
+        charge_wait_bool=charge_wait_bool,
+        human_ev_charge_decision_interval_minutes=human_ev_charge_decision_interval_minutes,
     )
 
 
@@ -1251,6 +1301,13 @@ def main():
             common_random_numbers=args.common_random_numbers,
             state_variant=args.state_variant,
             learner_variant=args.learner_variant,
+            ev_acceptance_feature=args.ev_acceptance_feature,
+            ev_acceptance_model=args.ev_acceptance_model,
+            initial_battery_mean=args.initial_battery_mean,
+            charge_wait_bool=args.charge_wait_bool,
+            human_ev_charge_decision_interval_minutes=(
+                args.human_ev_charge_decision_interval_minutes
+            ),
         )
 
         print(f"\nFinished: {len(results.get('episode_rewards', []))} episodes")

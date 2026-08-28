@@ -298,7 +298,10 @@ class PyTorchRewardPlusDelay(PyTorchValueFunction):
         pass
 
 
-class PyTorchChargingValueFunction(PyTorchValueFunction):
+from src.acceptance_features import AcceptanceFeatureMixin, insert_zero_input
+
+
+class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction):
     """Neural network-based value function for ChargingIntegratedEnvironment using PyTorchPathBasedNetwork"""
     
     def __init__(self, grid_size: int = 10, num_vehicles: int = 8, 
@@ -316,6 +319,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         self.max_requests = max_requests      # 最大预期请求数
         self.num_locations = grid_size * grid_size
         self.env = env  # 存储环境引用
+        self._init_acceptance_feature()
         self.iftransformer = bool(iftransformer)
         self.zone_distribution_mode = zone_distribution_mode or ("bayes" if encoder else "time-only")
         if self.zone_distribution_mode not in {"bayes", "time-only", "none"}:
@@ -356,6 +360,11 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # Copy weights from main network to target network
         self.target_network.load_state_dict(self.network.state_dict())
+        for module in (self.network, self.target_network):
+            module.acceptance_input_enabled = self.acceptance_input_enabled
+            if self.acceptance_input_enabled:
+                layer = module.state_embedding[0]
+                module.state_embedding[0] = insert_zero_input(layer, layer.in_features)
         self.target_update_frequency = 500  # Update target network every 100 steps
         
         # Ensure all parameters require gradients
@@ -1133,11 +1142,16 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         post_action_distances=None,
         post_action_durations=None,
         post_action_zoneids=None,
+        post_action_locations=None,
+        target_station_ids=None,
+        request_ids=None,
+        acceptance_probabilities=None,
     ):
         if len(vehicle_ids) == 0:
             return []
 
         batch_size = len(vehicle_ids)
+        acceptance = self.acceptance_for_live_edges(vehicle_ids, action_type_ids, request_ids, acceptance_probabilities)
         action_type_ids = np.asarray(action_type_ids, dtype=np.int64)
         vehicle_locations = np.asarray(vehicle_locations, dtype=np.int64)
         target_locations = np.asarray(target_locations, dtype=np.int64)
@@ -1230,6 +1244,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         with torch.no_grad():
             batch_q_values = self.network(
                 path_locations=path_locations,
+                acceptance_probability=torch.as_tensor(acceptance, device=self.device).unsqueeze(1),
                 path_delays=path_delays,
                 current_time=current_time_tensor,
                 other_agents=other_agents_tensor,
@@ -1262,6 +1277,15 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         """
         # 将action_type字符串转换为数值编码
         action_type = str(action_type)
+        if self.acceptance_input_enabled:
+            kind = 2 if action_type.startswith('assign') else (3 if action_type.startswith('charge') else 1)
+            target_id = int(action_type.split('_', 1)[1]) if kind == 2 and '_' in action_type else -1
+            return self._acceptance_batch_assignment([dict(
+                vehicle_id=vehicle_id, target_id=target_id, vehicle_location=vehicle_location,
+                target_location=target_location, current_time=current_time,
+                other_vehicles=other_vehicles, num_requests=num_requests,
+                battery_level=battery_level, request_value=request_value,
+            )], action_id=kind)[0]
         if action_type == 'idle' or action_type == 'reloc' or action_type.startswith('reloc'):
             action_type_id = 1
         elif action_type.startswith('assign'):
@@ -1623,12 +1647,38 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             return []
         
         # 🚀 多GPU并行处理
+        if self.acceptance_input_enabled:
+            return self._acceptance_batch_assignment(batch_inputs)
         if multi_gpu_devices and len(multi_gpu_devices) > 1 and all('cuda' in d for d in multi_gpu_devices):
             return self._multi_gpu_batch_process(batch_inputs, multi_gpu_devices)
         
         # 单GPU/CPU处理
         return self._single_device_batch_process(batch_inputs)
     
+    def _acceptance_batch_assignment(self, rows, action_id=2):
+        self.network.eval()
+        return self.batch_get_mixed_q_values(
+            vehicle_ids=[r['vehicle_id'] for r in rows], request_ids=[r.get('target_id', -1) for r in rows],
+            vehicle_locations=[r['vehicle_location'] for r in rows], target_locations=[r['target_location'] for r in rows],
+            current_times=[r.get('current_time', 0.0) for r in rows],
+            other_vehicles=[r.get('other_vehicles', 0) for r in rows], num_requests=[r.get('num_requests', 0) for r in rows],
+            battery_levels=[r.get('battery_level', 1.0) for r in rows], request_values=[r.get('request_value', 0.0) for r in rows],
+            target_distances=[r.get('pickup_dist') or self.env._manhattan_distance_loc(
+                r['vehicle_location'], r['target_location']) for r in rows],
+            target_zoneids=[r.get('pick_zone') or _env_zone_index(self.env, r['target_location']) for r in rows],
+            vehicle_idle_times=[r.get('vehicle_idle_time', self.env.vehicles[r['vehicle_id']].get('idle_timer', 0.0)) for r in rows],
+            action_type_ids=[action_id] * len(rows),
+            post_action_distances=[r.get('post_action_distance') or 0.0 for r in rows],
+            post_action_durations=[r.get('post_action_duration') or 0.0 for r in rows],
+            post_action_zoneids=[r.get('post_action_zoneid') or 0 for r in rows],
+        )
+
+    def extra_checkpoint_state(self):
+        return {"ev_acceptance": self.acceptance_checkpoint_state()}
+
+    def load_extra_checkpoint_state(self, state):
+        self.load_acceptance_checkpoint_state(state)
+
     def _multi_gpu_batch_process(self, batch_inputs, gpu_devices):
         """
         真正的多GPU并行处理 - 将数据分割到不同GPU上独立计算，增加总显存容量
@@ -2692,7 +2742,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                         next_post_action_distance: float = None,
                         next_post_action_duration: float = None,
                         next_post_action_zoneid: int = None,
-                        next_candidate_actions = None):
+                        next_candidate_actions = None, **feature_snapshots):
         """
         Store experience for training - 现在支持vehicle_id、battery、request_value、idle_time、持续时间和系统结束状态信息
         
@@ -2715,6 +2765,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             vehicle_idle_time: 车辆idle时间 (归一化0-1，默认0.0)
         """
         vehicle_info = self.env.vehicles.get(vehicle_id, {}) if hasattr(self, 'env') and hasattr(self.env, 'vehicles') else {}
+        if bool(getattr(self.env, 'evaluatemode', False)):
+            return
         vehicle_type = int(vehicle_info.get('type', self._vehicle_type_id(vehicle_id)))
         
         # 🔧 确保location是int类型，如果是tuple则转换为location ID
@@ -2853,6 +2905,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             'next_prior_features': next_prior_features,
             'next_hour_of_day': next_hour_of_day,
         }
+        experience.update(feature_snapshots)
         if action_metadata is not None:
             experience.update({
                 'schema_version': 1,
@@ -2870,6 +2923,21 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         experience.setdefault('mode', getattr(self.env, 'decision_mode', 'integrated'))
         experience.setdefault('recourse_variant', getattr(self.env, 'recourse_variant', 'legacy'))
         experience.setdefault('solver_backend', getattr(self.env, 'mcmf_backend', 'unknown'))
+        if request_obj is not None:
+            experience['request_id'] = request_obj.request_id
+        experience['acceptance_probability'] = self.acceptance_from_experience(experience)
+        if self.acceptance_input_enabled:
+            next_context = getattr(action_context, 'next_action', None)
+            next_metadata = getattr(next_context, 'metadata', None)
+            next_request = getattr(next_metadata, 'request_snapshot', None)
+            next_request_id = getattr(next_context, 'request_id', None)
+            if next_request is not None:
+                next_request_id = next_request.request_id
+            if next_request_id is not None:
+                experience['next_request_id'] = int(next_request_id)
+            if next_metadata is not None and next_metadata.state_snapshot is not None:
+                experience['next_state_snapshot'] = next_metadata.state_snapshot
+            experience['next_acceptance_probability'] = self.acceptance_from_experience(experience, next_state=True)
         self.experience_buffer.append(experience)
         self._replay_collection_context = None
         previous_total_seen = getattr(self, 'total_experiences_seen', max(0, len(self.experience_buffer) - 1))
@@ -3018,6 +3086,19 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
 
         experience_target_location = int(pickup_location)
         request_value = float(getattr(request_obj, 'final_value', 0.0))
+
+        if self.acceptance_input_enabled:
+            # The canonical ServiceAction replay already stores this reward
+            # with its pre-offer snapshot. Keep the auxiliary label, but do
+            # not create a duplicate, post-response TD transition here.
+            if not bool(getattr(self.env, 'evaluatemode', False)):
+                sample = dict(rejection_sample) if rejection_sample is not None else self._build_rejection_sample(
+                    vehicle_id, vehicle_location, pickup_location, current_time,
+                    distance=distance, request=request_obj, was_rejected=True,
+                )
+                sample['was_rejected'] = True
+                self.rejection_buffer.append(sample)
+            return
 
         vehicle = self.env.vehicles.get(vehicle_id) if hasattr(self, 'env') and self.env is not None else None
         if vehicle is not None:
@@ -3820,6 +3901,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                     zoneid_tensor,
                 ) = inputs
                 candidate_rows.append({
+                    'acceptance_probability': self.acceptance_from_experience(exp, candidate, next_state=True),
                     'path_locations': path_locations.squeeze(0),
                     'path_delays': path_delays.squeeze(0),
                     'current_time': time_tensor.squeeze(0),
@@ -3860,6 +3942,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         cand_action_types = torch.tensor([row['action_type_id'] for row in candidate_rows], dtype=torch.long, device=self.device).unsqueeze(1)
         cand_idle_times = torch.tensor([row['vehicle_idle_time'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
         cand_vehicle_types = torch.tensor([row['vehicle_type'] for row in candidate_rows], dtype=torch.long, device=self.device).unsqueeze(1)
+        cand_acceptance = torch.tensor([row['acceptance_probability'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
         cand_post_distances = torch.tensor([row['post_action_distance'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
         cand_post_durations = torch.tensor(
             [min(row['post_action_duration'], self.episode_length) / max(float(self.episode_length), 1.0) for row in candidate_rows],
@@ -3876,6 +3959,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             self.network.eval()
             self.target_network.eval()
             online_values = self.network(
+                acceptance_probability=cand_acceptance,
                 path_locations=cand_path_locations,
                 path_delays=cand_path_delays,
                 current_time=cand_current_time,
@@ -3897,6 +3981,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 time_zone_dist=cand_time_zone_dist,
             ).squeeze(1)
             target_values = self.target_network(
+                acceptance_probability=cand_acceptance,
                 path_locations=cand_path_locations,
                 path_delays=cand_path_delays,
                 current_time=cand_current_time,
@@ -4403,6 +4488,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # Current Q-values (with gradients) - 现在包含所有特征信息
         self.network.train()
         current_q_values = self.network(
+            acceptance_probability=self.acceptance_tensor(batch),
             path_locations=current_batch_path_locations,
             path_delays=current_batch_path_delays,
             current_time=current_batch_current_time,
@@ -4428,6 +4514,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         with torch.no_grad():
             self.target_network.eval()
             next_q_values = self.target_network(
+                acceptance_probability=self.acceptance_tensor(batch, next_state=True),
                 path_locations=next_batch_path_locations,
                 path_delays=next_batch_path_delays,
                 current_time=next_batch_current_time,
@@ -4732,7 +4819,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             num_requests_raw = len(getattr(env, 'active_requests', {}))
 
             # Prepare full set of inputs with battery/request value; tensors are already normalized as in other code paths
-            path_locations_b, path_delays_b, time_b, others_b, requests_b, battery_b, value_b = self._prepare_network_input_with_battery(
+            path_locations_b, path_delays_b, time_b, others_b, requests_b, battery_b, value_b, _, _ = self._prepare_network_input_with_battery(
                 veh_loc, tgt_loc, current_time, other_vehicles_raw, num_requests_raw, action_type, battery, request_value
             )
             # Package tensors in expected dict form
@@ -4749,6 +4836,11 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 'vehicle_type': torch.tensor([[self._vehicle_type_id(vehicle_id)]], dtype=torch.long, device=self.device)
             }
             inputs_list.append(sample)
+            kind = self._action_type_id(action_type)
+            rid = int(action_type.split('_', 1)[1]) if kind == 2 else -1
+            sample['acceptance_probability'] = torch.as_tensor(
+                self.acceptance_for_live_edges([vehicle_id], [kind], [rid]), device=self.device
+            ).unsqueeze(1)
             labels_list.append(label)
 
         # Fill samples from assignments
@@ -4800,6 +4892,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # All samples in this batch share the same env.current_time
         _hour_norm_supervised = self._get_hour_norm_tensor(env.current_time).expand(len(inputs_list), -1)
         preds = self.network(
+            acceptance_probability=_stack('acceptance_probability'),
             path_locations=_stack('path_locations'),
             path_delays=_stack('path_delays'),
             current_time=_current_time_stacked,
@@ -5514,7 +5607,8 @@ class PyTorchPathBasedNetwork(nn.Module):
                 post_action_zoneid: torch.Tensor = None,
                 prior_features: torch.Tensor = None,
                 prior_mask: torch.Tensor = None,
-                time_zone_dist: torch.Tensor = None) -> torch.Tensor:
+                time_zone_dist: torch.Tensor = None,
+                acceptance_probability: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass through the network
         
@@ -5714,6 +5808,13 @@ class PyTorchPathBasedNetwork(nn.Module):
         ]
         if self.encoder:
             feature_list.append(seq_context)   # [batch_size, context_dim]  (E_dist or zeros)
+        if getattr(self, 'acceptance_input_enabled', False):
+            if acceptance_probability is None:
+                if bool(((action_type == 2) & (vehicle_type == 1)).any()):
+                    raise ValueError("EV service network input is missing its acceptance probability")
+                acceptance_probability = torch.zeros_like(current_time)
+            mask = ((action_type == 2) & (vehicle_type == 1)).float()
+            feature_list.append(acceptance_probability.to(current_time) * mask)
         combined_features = torch.cat(feature_list, dim=1)  # [batch_size, total_features]
         
         # Get final value prediction
