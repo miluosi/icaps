@@ -351,6 +351,8 @@ def main():
                 learner_variant=args.learner_variant,
                 ev_acceptance_feature=args.ev_acceptance_feature,
                 ev_acceptance_model=args.ev_acceptance_model,
+                ev_response_anchor=args.ev_response_anchor,
+                ev_response_critic_input=args.ev_response_critic_input,
             )
 
             # Summary output

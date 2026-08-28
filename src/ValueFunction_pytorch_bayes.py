@@ -364,7 +364,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
             module.acceptance_input_enabled = self.acceptance_input_enabled
             if self.acceptance_input_enabled:
                 layer = module.state_embedding[0]
-                module.state_embedding[0] = insert_zero_input(layer, layer.in_features)
+                module.state_embedding[0] = insert_zero_input(layer, layer.in_features, count=2)
         self.target_update_frequency = 500  # Update target network every 100 steps
         
         # Ensure all parameters require gradients
@@ -1145,13 +1145,13 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         post_action_locations=None,
         target_station_ids=None,
         request_ids=None,
-        acceptance_probabilities=None,
+        rejection_probabilities=None,
     ):
         if len(vehicle_ids) == 0:
             return []
 
         batch_size = len(vehicle_ids)
-        acceptance = self.acceptance_for_live_edges(vehicle_ids, action_type_ids, request_ids, acceptance_probabilities)
+        acceptance = self.rejection_for_live_edges(vehicle_ids, action_type_ids, request_ids, rejection_probabilities)
         action_type_ids = np.asarray(action_type_ids, dtype=np.int64)
         vehicle_locations = np.asarray(vehicle_locations, dtype=np.int64)
         target_locations = np.asarray(target_locations, dtype=np.int64)
@@ -1244,7 +1244,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         with torch.no_grad():
             batch_q_values = self.network(
                 path_locations=path_locations,
-                acceptance_probability=torch.as_tensor(acceptance, device=self.device).unsqueeze(1),
+                rejection_probability=torch.as_tensor(acceptance, device=self.device).unsqueeze(1),
+                human_response_mask=torch.as_tensor(self.response_masks_for_live_edges(vehicle_ids, action_type_ids), device=self.device).unsqueeze(1),
                 path_delays=path_delays,
                 current_time=current_time_tensor,
                 other_agents=other_agents_tensor,
@@ -1674,7 +1675,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         )
 
     def extra_checkpoint_state(self):
-        return {"ev_acceptance": self.acceptance_checkpoint_state()}
+        return {"ev_response": self.acceptance_checkpoint_state()}
 
     def load_extra_checkpoint_state(self, state):
         self.load_acceptance_checkpoint_state(state)
@@ -2925,7 +2926,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         experience.setdefault('solver_backend', getattr(self.env, 'mcmf_backend', 'unknown'))
         if request_obj is not None:
             experience['request_id'] = request_obj.request_id
-        experience['acceptance_probability'] = self.acceptance_from_experience(experience)
+        q, mask = self.response_from_experience(experience)
+        experience.update(rejection_probability=q, human_response_mask=mask,
+                          response_model_hash=self.response_model_hash, response_schema_version=3)
         if self.acceptance_input_enabled:
             next_context = getattr(action_context, 'next_action', None)
             next_metadata = getattr(next_context, 'metadata', None)
@@ -2937,7 +2940,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
                 experience['next_request_id'] = int(next_request_id)
             if next_metadata is not None and next_metadata.state_snapshot is not None:
                 experience['next_state_snapshot'] = next_metadata.state_snapshot
-            experience['next_acceptance_probability'] = self.acceptance_from_experience(experience, next_state=True)
+            q_next, mask_next = self.response_from_experience(experience, next_state=True)
+            experience.update(next_rejection_probability=q_next, next_human_response_mask=mask_next)
         self.experience_buffer.append(experience)
         self._replay_collection_context = None
         previous_total_seen = getattr(self, 'total_experiences_seen', max(0, len(self.experience_buffer) - 1))
@@ -3901,7 +3905,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
                     zoneid_tensor,
                 ) = inputs
                 candidate_rows.append({
-                    'acceptance_probability': self.acceptance_from_experience(exp, candidate, next_state=True),
+                    'rejection_probability': self.rejection_from_experience(exp, candidate, next_state=True),
+                    'human_response_mask': self.response_mask_from_experience(exp, candidate, next_state=True),
                     'path_locations': path_locations.squeeze(0),
                     'path_delays': path_delays.squeeze(0),
                     'current_time': time_tensor.squeeze(0),
@@ -3942,7 +3947,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         cand_action_types = torch.tensor([row['action_type_id'] for row in candidate_rows], dtype=torch.long, device=self.device).unsqueeze(1)
         cand_idle_times = torch.tensor([row['vehicle_idle_time'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
         cand_vehicle_types = torch.tensor([row['vehicle_type'] for row in candidate_rows], dtype=torch.long, device=self.device).unsqueeze(1)
-        cand_acceptance = torch.tensor([row['acceptance_probability'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
+        cand_acceptance = torch.tensor([row['rejection_probability'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
+        cand_response_mask = torch.tensor([row['human_response_mask'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
         cand_post_distances = torch.tensor([row['post_action_distance'] for row in candidate_rows], dtype=torch.float32, device=self.device).unsqueeze(1)
         cand_post_durations = torch.tensor(
             [min(row['post_action_duration'], self.episode_length) / max(float(self.episode_length), 1.0) for row in candidate_rows],
@@ -3959,7 +3965,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
             self.network.eval()
             self.target_network.eval()
             online_values = self.network(
-                acceptance_probability=cand_acceptance,
+                rejection_probability=cand_acceptance,
+                human_response_mask=cand_response_mask,
                 path_locations=cand_path_locations,
                 path_delays=cand_path_delays,
                 current_time=cand_current_time,
@@ -3981,7 +3988,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
                 time_zone_dist=cand_time_zone_dist,
             ).squeeze(1)
             target_values = self.target_network(
-                acceptance_probability=cand_acceptance,
+                rejection_probability=cand_acceptance,
+                human_response_mask=cand_response_mask,
                 path_locations=cand_path_locations,
                 path_delays=cand_path_delays,
                 current_time=cand_current_time,
@@ -4488,7 +4496,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         # Current Q-values (with gradients) - 现在包含所有特征信息
         self.network.train()
         current_q_values = self.network(
-            acceptance_probability=self.acceptance_tensor(batch),
+            rejection_probability=self.rejection_tensor(batch),
+            human_response_mask=self.response_mask_tensor(batch),
             path_locations=current_batch_path_locations,
             path_delays=current_batch_path_delays,
             current_time=current_batch_current_time,
@@ -4514,7 +4523,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         with torch.no_grad():
             self.target_network.eval()
             next_q_values = self.target_network(
-                acceptance_probability=self.acceptance_tensor(batch, next_state=True),
+                rejection_probability=self.rejection_tensor(batch, next_state=True),
+                human_response_mask=self.response_mask_tensor(batch, next_state=True),
                 path_locations=next_batch_path_locations,
                 path_delays=next_batch_path_delays,
                 current_time=next_batch_current_time,
@@ -4838,9 +4848,11 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
             inputs_list.append(sample)
             kind = self._action_type_id(action_type)
             rid = int(action_type.split('_', 1)[1]) if kind == 2 else -1
-            sample['acceptance_probability'] = torch.as_tensor(
-                self.acceptance_for_live_edges([vehicle_id], [kind], [rid]), device=self.device
+            sample['rejection_probability'] = torch.as_tensor(
+                self.rejection_for_live_edges([vehicle_id], [kind], [rid]), device=self.device
             ).unsqueeze(1)
+            sample['human_response_mask'] = torch.as_tensor(
+                self.response_masks_for_live_edges([vehicle_id], [kind]), device=self.device).unsqueeze(1)
             labels_list.append(label)
 
         # Fill samples from assignments
@@ -4892,7 +4904,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         # All samples in this batch share the same env.current_time
         _hour_norm_supervised = self._get_hour_norm_tensor(env.current_time).expand(len(inputs_list), -1)
         preds = self.network(
-            acceptance_probability=_stack('acceptance_probability'),
+            rejection_probability=_stack('rejection_probability'),
+            human_response_mask=_stack('human_response_mask'),
             path_locations=_stack('path_locations'),
             path_delays=_stack('path_delays'),
             current_time=_current_time_stacked,
@@ -5608,7 +5621,8 @@ class PyTorchPathBasedNetwork(nn.Module):
                 prior_features: torch.Tensor = None,
                 prior_mask: torch.Tensor = None,
                 time_zone_dist: torch.Tensor = None,
-                acceptance_probability: torch.Tensor = None) -> torch.Tensor:
+                rejection_probability: torch.Tensor = None,
+                human_response_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass through the network
         
@@ -5809,12 +5823,19 @@ class PyTorchPathBasedNetwork(nn.Module):
         if self.encoder:
             feature_list.append(seq_context)   # [batch_size, context_dim]  (E_dist or zeros)
         if getattr(self, 'acceptance_input_enabled', False):
-            if acceptance_probability is None:
+            if rejection_probability is None or human_response_mask is None:
                 if bool(((action_type == 2) & (vehicle_type == 1)).any()):
-                    raise ValueError("EV service network input is missing its acceptance probability")
-                acceptance_probability = torch.zeros_like(current_time)
-            mask = ((action_type == 2) & (vehicle_type == 1)).float()
-            feature_list.append(acceptance_probability.to(current_time) * mask)
+                    raise ValueError("EV service network input is missing q_reject or response mask")
+                rejection_probability = torch.zeros_like(current_time)
+                human_response_mask = torch.zeros_like(current_time)
+            mask = human_response_mask.to(current_time)
+            eligible = ((action_type == 2) & (vehicle_type == 1)).float()
+            if not torch.all((mask == 0) | (mask == 1)) or torch.any(mask > eligible):
+                raise ValueError('Invalid human response mask')
+            q = rejection_probability.to(current_time)
+            if not torch.isfinite(q).all() or torch.any((q < 0) | (q > 1)) or torch.any(q * (1 - mask) != 0):
+                raise ValueError('Invalid rejection probability/mask pair')
+            feature_list.extend([q, mask])
         combined_features = torch.cat(feature_list, dim=1)  # [batch_size, total_features]
         
         # Get final value prediction

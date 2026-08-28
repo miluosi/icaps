@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.acceptance_features import predicted_acceptance
+from src.acceptance_features import predicted_rejection, human_response_mask
 from src.acceptance_inputs import offer_context
 
 from dataclasses import replace
@@ -321,6 +321,20 @@ class StateSnapshotBuilder:
                     except (TypeError, ValueError, RuntimeError):
                         queue_features = ()
                 edge_id = f"{stage_id}:{int(vehicle_id)}:{column}:{action_id}"
+                response_enabled = getattr(env, 'ev_acceptance_feature', 'off') == 'predicted'
+                response_mask = bool(response_enabled and request_id is not None and human_response_mask(vehicle))
+                q_reject = predicted_rejection(env, vehicle_id, request_map[request_id], vehicle=vehicle,
+                    context=acceptance_context, snapshot=state) if response_mask else 0.
+                success_score = float(structured_matrix[row, column])
+                expected_anchor = bool(getattr(value_function, 'response_anchor_enabled', False))
+                if expected_anchor:
+                    # Use precisely the live learner's success-score definition,
+                    # not the (different in NYC) plain-MCMF fare-only matrix.
+                    action_kind = 2 if action_type == ActionType.SERVICE else (3 if action_type == ActionType.CHARGE else 1)
+                    success_score = value_function._myopic_score(action_kind, request_value, target_distance, post_distance)
+                from src.rejection_anchor import expected_structured_score, rejection_score
+                reject_score = rejection_score(env, request_value=request_value, pickup_distance=target_distance) if response_mask else 0.
+                structured_score = expected_structured_score(success_score, reject_score, q_reject, response_mask) if expected_anchor else success_score
                 edges.append(
                     FeasibleEdgeSnapshot(
                         edge_id=edge_id,
@@ -335,7 +349,13 @@ class StateSnapshotBuilder:
                         resource_type=resource_type,
                         resource_id=resource_id,
                         resource_capacity=int(resource_capacity),
-                        structured_score=float(structured_matrix[row, column]),
+                        structured_score=structured_score,
+                        success_structured_score=success_score,
+                        rejection_structured_score=reject_score,
+                        rejection_probability=q_reject,
+                        human_response_mask=response_mask,
+                        expected_response_anchor=expected_anchor,
+                        response_model_hash=getattr(env, 'ev_response_model_hash', None),
                         collection_score=float(score_matrix[row, column]),
                         request_value=float(request_value),
                         target_distance=float(target_distance),
@@ -344,11 +364,6 @@ class StateSnapshotBuilder:
                         target_zoneid=target_zoneid,
                         post_action_zoneid=post_zoneid,
                         queue_features=queue_features,
-                        acceptance_probability=(
-                            predicted_acceptance(env, vehicle_id, request_map[request_id], vehicle=vehicle,
-                                                 context=acceptance_context, snapshot=state)
-                            if request_id is not None and vehicle.vehicle_type == 1 else 0.0
-                        ),
                         metadata=edge_metadata,
                     )
                 )
@@ -702,7 +717,10 @@ class StateSnapshotBuilder:
                     structured_score=structured_score,
                     collection_score=structured_score,
                     request_value=request_value,
-                    acceptance_probability=0.0,
+                    success_structured_score=structured_score,
+                    rejection_probability=0.0,
+                    human_response_mask=False,
+                    response_model_hash=getattr(env, 'ev_response_model_hash', None),
                     target_distance=float(distance),
                     post_action_distance=float(post_distance),
                     post_action_duration=float(post_duration),

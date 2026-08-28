@@ -2703,16 +2703,10 @@ class NYCEnvironment:
             vehicle_location = int(self.vehicles.get(vehicle_id, {}).get('location', pickup_location or 0))
         if pickup_location is None:
             pickup_location = vehicle_location
-        ratio = getattr(self, 'rejection_penalty_final_value_ratio', None)
-        if request is not None and ratio is not None:
-            final_value = float(getattr(request, 'final_value', getattr(request, 'value', 0.0)) or 0.0)
-            if final_value > 0.0:
-                return -float(ratio) * final_value
+        from src.rejection_anchor import rejection_score
+        final_value = float(getattr(request, 'final_value', getattr(request, 'value', 0.0)) or 0.0)
         distance_km = self.get_distance_km(int(vehicle_location), int(pickup_location))
-        return -float(
-            self.rejection_penalty_base
-            + self.rejection_penalty_per_km * distance_km
-        )
+        return rejection_score(self, request_value=final_value, pickup_distance=distance_km)
 
     def configure_recourse_experiment(
         self,
@@ -3161,6 +3155,9 @@ class NYCEnvironment:
 
         # Rejection is an observed outcome on a selected EV offer.  Persist
         # the offer in the lifecycle regardless of realization.
+        from src.acceptance_features import predicted_rejection
+        predicted_q = (predicted_rejection(self, vehicle_id, request)
+                       if getattr(self, 'ev_acceptance_feature', 'off') == 'predicted' else None)
         rejected = self._should_reject_request(vehicle_id, request)
         if self._is_ev(vehicle_id):
             self._ensure_recourse_runtime()
@@ -3190,6 +3187,8 @@ class NYCEnvironment:
                 acceptance_uniform=float(realization.get("uniform", 0.0)),
                 accepted=not rejected,
                 rejection_reason="driver_reject" if rejected else None,
+                predicted_rejection_probability=predicted_q,
+                response_model_hash=getattr(self, 'ev_response_model_hash', None),
             )
         if rejected:
             vehicle['rejected_requests'] += 1

@@ -3023,6 +3023,9 @@ class ChargingIntegratedEnvironment(Environment):
             # Vehicle must be completely free (both assigned_request AND passenger_onboard must be None)
             if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
                 # Check if the vehicle rejects the request
+                from src.acceptance_features import predicted_rejection
+                predicted_q = (predicted_rejection(self, vehicle_id, request)
+                               if getattr(self, 'ev_acceptance_feature', 'off') == 'predicted' else None)
                 was_rejected = self._should_reject_request(vehicle_id, request)
                 if int(vehicle.get('type', 1)) == 1:
                     self._ensure_recourse_runtime()
@@ -3055,6 +3058,8 @@ class ChargingIntegratedEnvironment(Environment):
                         rejection_reason=(
                             "driver_reject" if was_rejected else None
                         ),
+                        predicted_rejection_probability=predicted_q,
+                        response_model_hash=getattr(self, 'ev_response_model_hash', None),
                     )
                 if was_rejected:
                     vehicle['rejected_requests'] += 1
@@ -8439,10 +8444,8 @@ class ChargingIntegratedEnvironment(Environment):
                     rejection_reward = float(
                         getattr(action, 'dur_reward', 0.0) or 0.0
                     )
-                    if rejection_reward == 0.0:
-                        rejection_reward = -float(
-                            getattr(self, 'rejection_penalty_base', 1.0)
-                        )
+                    # Zero is a valid realized reward. Never fabricate a
+                    # rejection penalty only inside the supervised TD record.
                     next_action = getattr(action, 'next_action', None)
                     if isinstance(next_action, ServiceAction):
                         next_action_type = 'assign'

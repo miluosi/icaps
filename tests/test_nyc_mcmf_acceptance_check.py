@@ -16,19 +16,19 @@ def samples(count, seed):
     x = rng.normal(size=(count, 3))
     p = expit(0.8 + x @ np.array([-0.9, -0.5, 1.2]))
     y = rng.binomial(1, p)
-    return [dict({name: 0.0 for name in FEATURE_NAMES}, feature_version=FEATURE_VERSION,
+    return [dict({name: 0.0 for name in FEATURE_NAMES}, feature_version=FEATURE_VERSION, feature_variant='driver_offer_core',
                  feature_schema='nyc_minutes', idle_time=row[0], pickup_time=row[1],
-                 surge_bonus=row[2], accepted=int(label), oracle_acceptance_probability=float(probability))
+                 surge_bonus=row[2], rejected=int(label), oracle_rejection_probability=float(probability))
             for row, label, probability in zip(x, y, p)]
 
 
 def test_rejection_is_the_positive_class_and_average_precision_handles_ties():
     rows = [dict(accepted=y) for y in [0, 0, 1, 1]]
-    m = rejection_metrics(rows, [0.1, 0.6, 0.2, 0.9])
+    m = rejection_metrics(rows, [0.9, 0.4, 0.8, 0.1])
     assert [m[k] for k in ['tp', 'fp', 'fn', 'tn']] == [1, 1, 1, 1]
     assert m['rejection_recall'] == m['rejection_precision'] == m['accuracy'] == 0.5
     assert m['rejection_average_precision'] == pytest.approx(5 / 6)
-    constant = rejection_metrics(rows, [0.8] * 4)
+    constant = rejection_metrics(rows, [0.2] * 4)
     assert constant['rejection_average_precision'] == 0.5
     assert constant['rejection_precision'] is None
     assert constant['rejection_recall'] == 0
@@ -37,7 +37,7 @@ def test_rejection_is_the_positive_class_and_average_precision_handles_ties():
 
 def test_validation_threshold_can_identify_rare_rejections_below_point_five():
     rows = [dict(accepted=y) for y in [0, 1, 0, 1]]
-    p = [0.7, 0.9, 0.8, 0.95]
+    p = [0.3, 0.1, 0.2, 0.05]
     threshold, metrics = select_rejection_threshold(rows, p)
     assert threshold == pytest.approx(0.2)
     assert metrics['rejection_f1'] == 1

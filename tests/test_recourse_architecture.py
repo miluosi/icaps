@@ -514,4 +514,4 @@ def test_experiment_manifest_records_config_hashes_and_uncertainty(tmp_path):
     assert manifest["resolved_config"]["recourse_variant"] == "r4"
     assert manifest["data_hashes"][str(data_path)]
     assert manifest["uncertainty"]["reward"]["mean"] == 2.0
-    assert manifest["replay_schema_version"] == 2
+    assert manifest["replay_schema_version"] == 3

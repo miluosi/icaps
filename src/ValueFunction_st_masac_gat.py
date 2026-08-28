@@ -303,11 +303,12 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         self.log_alpha = nn.Parameter(torch.tensor(math.log(0.05), dtype=torch.float32, device=self.device))
 
         self.acceptance_input_index = self.edge_local_dim
+        self.rejection_input_index = self.edge_local_dim
         if self.acceptance_input_enabled:
-            for module in (self.network, self.critic2, self.target_network, self.target_critic2, self.actor):
-                module.net[0] = insert_zero_input(module.net[0], self.acceptance_input_index)
-            self.edge_local_dim += 1
-            self.edge_dim += 1
+            for module in (self.network, self.critic2, self.target_network, self.target_critic2):
+                module.net[0] = insert_zero_input(module.net[0], self.rejection_input_index, count=2)
+            self.edge_local_dim += 2
+            self.edge_dim += 2
 
         params = (
             [parameter for parameter in self.graph_encoder.parameters() if parameter.requires_grad]
@@ -549,7 +550,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         battery_level: float,
         vehicle_type: int,
         queue_wait_feature: float = 0.0,
-        acceptance_probability: float = 0.0,
+        rejection_probability: float = 0.0,
+        human_response_mask: float = 0.0,
     ) -> list[float]:
         action_type_id = int(action_type_id)
         post_soc = self._post_battery(float(battery_level), action_type_id, float(post_action_distance))
@@ -564,8 +566,18 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             1.0 + float(np.clip(float(queue_wait_feature), 0.0, 4.0)),
         ]
         if self.acceptance_input_enabled:
-            features.append(float(acceptance_probability) if vehicle_type == 1 and action_type_id == 2 else 0.0)
+            from src.rejection_anchor import expected_structured_score
+            expected_structured_score(0., 0., rejection_probability, human_response_mask)
+            if human_response_mask and (vehicle_type != 1 or action_type_id != 2):
+                raise ValueError('Only unanswered EV service edges can carry a response mask')
+            features.extend([float(rejection_probability), float(human_response_mask)])
         return features
+
+    def _actor_features(self, edges):
+        if not self.acceptance_input_enabled:
+            return edges
+        index = self.rejection_input_index
+        return torch.cat([edges[:, :index], edges[:, index + 2:]], dim=1)
 
     def _resolve_station(self, station_id: Any = None, target_location: Any = None):
         stations = getattr(getattr(self.env, "charging_manager", None), "stations", {}) if self.env is not None else {}
@@ -1266,7 +1278,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         target_context: bool = False,
         vehicle_types=None,
         post_demand_features=None,
-        acceptance_probabilities=None,
+        rejection_probabilities=None,
+        human_response_masks=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del post_demand_features
         graph = self._graph_context(graph_snapshot, target=target_context)
@@ -1319,7 +1332,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 battery_level=float(battery_levels[i]),
                 vehicle_type=vehicle_type,
                 queue_wait_feature=float(queue_wait_features[i]),
-                acceptance_probability=(0.0 if acceptance_probabilities is None else acceptance_probabilities[i]),
+                rejection_probability=(0.0 if rejection_probabilities is None else rejection_probabilities[i]),
+                human_response_mask=(0.0 if human_response_masks is None else human_response_masks[i]),
             )
             source_h = source_embeddings[int(vehicle_ids[i])]
             target_h = self._graph_embedding_for_location(graph, int(post_action_locations[i]))
@@ -1386,15 +1400,16 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         target_station_ids=None,
         vehicle_neighbour_candidates: dict[int, list[dict]] | None = None,
         request_ids=None,
-        acceptance_probabilities=None,
+        rejection_probabilities=None,
     ):
         del target_zoneids, post_action_zoneids
         size = len(vehicle_ids)
         if size == 0:
             return []
-        acceptance_probabilities = self.acceptance_for_live_edges(
-            vehicle_ids, action_type_ids, request_ids, acceptance_probabilities
+        rejection_probabilities = self.rejection_for_live_edges(
+            vehicle_ids, action_type_ids, request_ids, rejection_probabilities
         )
+        human_response_masks = self.response_masks_for_live_edges(vehicle_ids, action_type_ids)
         myopic_action_distances = (
             np.asarray(target_distances, dtype=np.float32)
             if post_action_distances is None
@@ -1441,6 +1456,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             ],
             dtype=np.float32,
         )
+        success_scores = g.copy()
+        for i in range(size):
+            g[i], _ = self.response_anchor(g[i], request_values[i], target_distances[i],
+                                           rejection_probabilities[i], human_response_masks[i])
         if self.planning_objective_mode == "structured_only":
             self._last_adp_score_stats = {
                 "mode": "structured_only",
@@ -1467,7 +1486,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 target_station_ids=target_station_ids,
                 queue_wait_features=queue_wait_features,
                 vehicle_neighbour_candidates=vehicle_neighbour_candidates,
-                acceptance_probabilities=acceptance_probabilities,
+                rejection_probabilities=rejection_probabilities,
+                human_response_masks=human_response_masks,
             )
             q1 = self.network(edge_t)
             q2 = self.critic2(edge_t)
@@ -1514,13 +1534,18 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 bounds,
             )
             if self.eta_pi != 0.0:
-                scores = scores + float(self.eta_pi) * F.logsigmoid(self.actor(edge_t))
+                scores = scores + float(self.eta_pi) * F.logsigmoid(self.actor(self._actor_features(edge_t)))
         values = scores.squeeze(1).cpu().numpy()
         self._last_adp_score_stats = {
             "mode": self.zone_distribution_mode,
             "g_mean": float(np.mean(g)),
             "beta": float(self._beta()),
             "score_mean": float(np.mean(values)),
+            "q_reject_mean": float(np.mean(rejection_probabilities)),
+            "human_response_edges": int(np.sum(human_response_masks)),
+            "success_score_mean": float(np.mean(success_scores)),
+            "risk_deduction_mean": float(np.mean(success_scores - g)),
+            "expected_anchor_mean": float(np.mean(g)),
             "queue_wait_feature_mean": float(np.mean(queue_wait_features)) if queue_wait_features.size else 0.0,
             "neighbour_count_mean": (
                 float(np.mean([
@@ -1857,7 +1882,15 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
     def store_recourse_transition(self, transition: RecourseTransition) -> None:
         if not bool(getattr(self, "_owns_joint_replay_payload", True)):
             return
+        self._validate_response_transition(transition)
         self.joint_replay_buffer.add(transition)
+
+    def _validate_response_transition(self, transition):
+        for graph in (transition.ev_stage_graph, transition.aev_stage_graph):
+            if graph is not None:
+                for edge in graph.edges:
+                    if edge.response_model_hash != self.response_model_hash:
+                        raise ValueError('Replay rejection predictor hash mismatch')
 
     def set_planning_objective_mode(self, mode: str) -> str:
         if mode not in {"learned", "structured_only"}:
@@ -1955,7 +1988,13 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             float(experience.get("target_distance", 0.0) or 0.0),
             float(experience.get("post_action_distance", 0.0) or 0.0),
         )
-        experience["acceptance_probability"] = self.acceptance_from_experience(experience)
+        q, mask = self.response_from_experience(experience)
+        experience.update(rejection_probability=q, human_response_mask=mask,
+                          response_model_hash=self.response_model_hash, response_schema_version=3)
+        experience['success_structured_score'] = experience['myopic_score']
+        experience['myopic_score'], experience['rejection_structured_score'] = self.response_anchor(
+            experience['myopic_score'], float(experience.get('request_value', 0.) or 0.),
+            float(experience.get('target_distance', 0.) or 0.), q, mask)
         self.experience_buffer.append(experience)
         self._replay_collection_context = None
 
@@ -2171,7 +2210,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 if post_demand_feature is None
                 else np.asarray([float(post_demand_feature)], dtype=np.float32)
             ),
-            acceptance_probabilities=[self.acceptance_from_experience(exp, candidate, next_state=next_state)],
+            rejection_probabilities=[self.rejection_from_experience(exp, candidate, next_state=next_state)],
+            human_response_masks=[self.response_mask_from_experience(exp, candidate, next_state=next_state)],
         )
         g = self._myopic_score(
             action_id,
@@ -2179,6 +2219,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             target_distance,
             post_distance,
         )
+        q, mask = self.response_from_experience(exp, candidate, next_state=next_state)
+        g, _ = self.response_anchor(g, request_value, target_distance, q, mask)
         return edge_t, type_w, g
 
     def set_joint_critic_router(
@@ -2256,7 +2298,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             "target_station_id": edge.station_id,
             "queue_features": edge.queue_features,
             "post_demand_feature": edge.post_demand_feature,
-            "acceptance_probability": edge.acceptance_probability,
+            "rejection_probability": edge.rejection_probability,
+            "human_response_mask": edge.human_response_mask,
+            "response_model_hash": edge.response_model_hash,
             "state_snapshot": graph.state,
             "state_variant": state_variant,
         }
@@ -2376,6 +2420,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         *,
         target_context: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if edge.response_model_hash != self.response_model_hash:
+            raise ValueError('Replay rejection predictor hash mismatch')
         exp = self._edge_experience(
             graph, edge, state_variant=self.state_variant
         )
@@ -2427,6 +2473,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         grouped: dict[int, tuple[Any, list[FeasibleEdgeSnapshot]]] = {}
         for edge in graph.edges:
             provider = self._provider_for_edge(edge)
+            if edge.response_model_hash != provider.response_model_hash:
+                raise ValueError('Replay rejection predictor hash mismatch')
             grouped.setdefault(id(provider), (provider, []))[1].append(edge)
 
         for provider, provider_edges in grouped.values():
@@ -2608,7 +2656,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             weights = torch.stack(type_ws)
             with torch.no_grad():
                 q_next = torch.minimum(target_net(edges), target_net2(edges)) * weights
-            logits = self.actor(edges).squeeze(1)
+            logits = self.actor(self._actor_features(edges)).squeeze(1)
             logp = F.log_softmax(logits, dim=0)
             probs = logp.exp()
             soft_value = torch.sum(probs * (q_next.squeeze(1) - self.alpha.detach() * logp))
@@ -3384,7 +3432,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         )
         return {
             "critic2_state_dict": self.critic2.state_dict(),
-            "ev_acceptance": self.acceptance_checkpoint_state(),
+            "ev_response": self.acceptance_checkpoint_state(),
             "target_critic2_state_dict": self.target_critic2.state_dict(),
             "graph_encoder_state_dict": self.graph_encoder.state_dict(),
             "target_graph_encoder_state_dict": self.target_graph_encoder.state_dict(),
@@ -3408,7 +3456,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             "beta_max": self.beta_max,
             "eta_pi": self.eta_pi,
             "residual_clip_rho": self.residual_clip_rho,
-            "joint_replay_schema_version": 2,
+            "joint_replay_schema_version": 3,
             "joint_replay_state_dict": joint_replay_state,
             "joint_replay_hash": joint_replay_state["content_hash"],
             "checkpoint_replay": self.checkpoint_replay,
@@ -3428,6 +3476,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
 
     def load_extra_checkpoint_state(self, state: dict[str, Any]) -> None:
         self.load_acceptance_checkpoint_state(state)
+        if state.get('joint_replay_schema_version', 3) != 3:
+            raise ValueError('Legacy joint replay schema; rejected=1 v3 checkpoint required')
         if not state:
             return
         if "critic2_state_dict" in state:
@@ -3517,6 +3567,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         joint_replay_state = state.get("joint_replay_state_dict")
         if joint_replay_state is not None:
             self.joint_replay_buffer.load_state_dict(joint_replay_state)
+            for transition in self.joint_replay_buffer:
+                self._validate_response_transition(transition)
 
     def add_to_logs(self, *args, **kwargs):
         return None

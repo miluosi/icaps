@@ -79,6 +79,8 @@ class RequestLifecycleTracker:
         accepted: bool,
         rejection_reason: str | None = None,
         selected_by_stage1: bool = True,
+        predicted_rejection_probability: float | None = None,
+        response_model_hash: str | None = None,
     ) -> OfferAttempt:
         request_snapshot = (
             request
@@ -104,13 +106,15 @@ class RequestLifecycleTracker:
             request_id=request_snapshot.request_id,
             ev_id=int(ev_id),
             selected_by_stage1=bool(selected_by_stage1),
-            acceptance_probability=float(acceptance_probability),
+            oracle_rejection_probability=1.0 - float(acceptance_probability),
             acceptance_uniform=float(acceptance_uniform),
             accepted=bool(accepted),
             rejected=not bool(accepted),
             rejection_reason=None if accepted else (rejection_reason or "driver_reject"),
             request_snapshot=request_snapshot,
             vehicle_snapshot=vehicle_snapshot,
+            predicted_rejection_probability=predicted_rejection_probability,
+            response_model_hash=response_model_hash,
         )
         self._offers.append(offer)
         state = self._requests.setdefault(

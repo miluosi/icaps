@@ -995,6 +995,8 @@ class ADPTrainer:
         learner_variant: str = "legacy",
         ev_acceptance_feature: str = "off",
         ev_acceptance_model: str | None = None,
+        ev_response_anchor: str = 'auto',
+        ev_response_critic_input: str = 'q_mask',
     ):
         """完整迁移的集成测试（含神经网络训练与梯度更新）。"""
 
@@ -1165,11 +1167,12 @@ class ADPTrainer:
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
         from src.acceptance_features import configure_acceptance_feature
-        configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model)
+        configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model,
+                                     anchor=ev_response_anchor, critic_input=ev_response_critic_input)
         if ev_acceptance_feature == "predicted":
-            import hashlib, json
-            predictor_id = hashlib.sha256(json.dumps(env.ev_acceptance_model.to_dict(), sort_keys=True).encode()).hexdigest()[:12]
-            checkpoint_scenario_suffix += f"_evaccept-{predictor_id}"
+            from src.acceptance_features import acceptance_checkpoint_suffix
+            checkpoint_scenario_suffix += acceptance_checkpoint_suffix(ev_acceptance_feature, ev_acceptance_model,
+                anchor=ev_response_anchor, critic_input=ev_response_critic_input)
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
         env.useauction = bool(useauction or getattr(env, 'ifsolveauctioncuda', False))

@@ -24,8 +24,8 @@ def verify(directory):
     config = summary['configuration']
     model = BinaryAcceptanceModel.load(directory / 'model.json')
     assert model.to_dict() == summary['model']
-    assert model.VERSION == 2 and model.MODEL_TYPE == 'mlp_binary_acceptance'
-    assert len(FEATURE_NAMES) == 30 and not any(p.requires_grad for p in model.network.parameters())
+    assert model.VERSION == 3 and model.MODEL_TYPE == 'mlp_ev_rejection'
+    assert len(FEATURE_NAMES) == 3 and not any(p.requires_grad for p in model.network.parameters())
     for name, digest in summary['source_sha256'].items():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, f'Source changed: {name}'
     data = {split: read_rows(directory / f'{split}_offers.jsonl') for split in ('train', 'validation', 'test')}
@@ -37,11 +37,11 @@ def verify(directory):
         assert all(r['feature_version'] == FEATURE_VERSION for r in rows)
         assert set(r['accepted'] for r in rows) == {0, 1}, f'Missing class in {split}'
         assert all(r['reject_uniform'] is True for r in rows)
-        assert all(bool(not r['accepted']) == (r['response_uniform'] < 1 - r['oracle_acceptance_probability']) for r in rows)
+        assert all(bool(not r['accepted']) == (r['response_uniform'] < r['oracle_rejection_probability']) for r in rows)
         assert all(r['pickup_distance_km'] <= 2 + 1e-5 for r in rows)
-        model._features(rows)  # all thirty fields must be present and finite
+        model._features(rows)  # all required fields must be present and finite
     test_p = model.predict_proba(data['test'])
-    np.testing.assert_allclose(test_p, [r['fresh_p_accept'] for r in data['test']], rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(test_p, [r['fresh_p_reject'] for r in data['test']], rtol=1e-6, atol=1e-7)
     threshold, _ = select_rejection_threshold(data['validation'], model.predict_proba(data['validation']))
     saved_threshold = summary['frozen_validation_thresholds']['fresh']['threshold']
     assert threshold == saved_threshold
@@ -70,9 +70,9 @@ def verify(directory):
             assert episode['steps'] == expected_steps
         charging = episode['charging']
         assert charging['all_vehicle_charging_sessions'] == charging['human_ev_charging_sessions'] + charging['aev_charging_sessions']
-    q = 1 - test_p
+    q = test_p
     actual = np.asarray([r['accepted'] == 0 for r in data['test']])
-    oracle = np.asarray([1 - r['oracle_acceptance_probability'] for r in data['test']])
+    oracle = np.asarray([r['oracle_rejection_probability'] for r in data['test']])
     bins = []
     boundaries = [0, .01, .025, .05, .075, .1, .15, .2, .3, .5, 1.000001]
     for lower, upper in zip(boundaries[:-1], boundaries[1:]):
@@ -101,7 +101,7 @@ def main():
     result = verify(args.run_directory)
     save_json(args.run_directory / 'neural_verification.json', result)
     report = ['# 神经网络实验复核', '',
-              f'复核通过：{result["episodes"]} 轮仿真、{result["paired_test_seeds"]} 组配对测试，30 特征神经网络。',
+              f'复核通过：{result["episodes"]} 轮仿真、{result["paired_test_seeds"]} 组配对测试，v3 三特征拒单神经网络。',
               f'训练/验证/测试样本：{result["sample_counts"]}；测试真实拒单 {result["actual_test_rejections"]} 次。', '',
               '已核对：' + '；'.join(result['checks']) + '。', '',
               f'所有仿真累计充电次数（包含测试的两个对照臂）：{result["charging_sessions_all_episodes"]}。', '',

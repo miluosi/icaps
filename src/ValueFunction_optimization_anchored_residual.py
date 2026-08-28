@@ -1,8 +1,10 @@
 """Main optimization-anchored residual learner.
 
-This class keeps the exact structured edge score in the deployed objective
-and learns only its continuation correction.  Joint target selection and R4
-stage coupling are implemented in the shared ST-MASAC base.
+This class keeps the structured edge score in the deployed objective and learns
+its continuation correction. When an EV response model is enabled, unanswered
+human service edges use the calibrated rejection-mixture anchor. The ordinary
+single-stage Bellman reward remains the realized execution reward; existing
+optional recourse behavior in the shared base is not expanded here.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from src.ValueFunction_st_masac_gat_post_demand_direct import (
 class PyTorchChargingValueFunction(_PostDemandResidual):
     learner_variant = "optimization_anchored_residual"
     uses_solver_consistent_targets = True
+    uses_response_aware_anchor = True
 
     def __init__(self, *args, **kwargs):
         # These experiment-manifest fields describe this learner but are not

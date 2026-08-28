@@ -380,7 +380,8 @@ def main():
     )
     checkpoint_scenario_suffix = '_'.join(part for part in (checkpoint_scenario_suffix, args.checkpoint_suffix) if part)
     from src.acceptance_features import acceptance_checkpoint_suffix
-    checkpoint_lookup_suffix = checkpoint_scenario_suffix + acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model)
+    checkpoint_lookup_suffix = checkpoint_scenario_suffix + acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model,
+        anchor=args.ev_response_anchor, critic_input=args.ev_response_critic_input)
     if zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
         from src.value_function_registry import get_value_function_class
         adp_trainer_module.PyTorchChargingValueFunction = get_value_function_class(zone_distribution_mode)
@@ -556,6 +557,8 @@ def main():
                         zone_distribution_mode=zone_distribution_mode,
                         ev_acceptance_feature=args.ev_acceptance_feature,
                         ev_acceptance_model=args.ev_acceptance_model,
+                ev_response_anchor=args.ev_response_anchor,
+                ev_response_critic_input=args.ev_response_critic_input,
                         post_demand_q_weight=args.post_demand_q_weight,
                         post_demand_head_lr_multiplier=args.post_demand_head_lr_multiplier,
                         masac_target_entropy_ratio=args.masac_target_entropy_ratio,

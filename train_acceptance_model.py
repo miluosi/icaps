@@ -1,14 +1,16 @@
-"""Collect plain-MCMF offers and evaluate binary driver acceptance learning."""
+"""Train calibrated EV rejection probabilities from mixed feasible real offers."""
 
 from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+from copy import copy
 from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
 import subprocess
+import tarfile
 import time
 
 import numpy as np
@@ -17,6 +19,8 @@ from src.acceptance_model import (
     BinaryAcceptanceModel, FEATURE_NAMES, collect_offers, probability_metrics,
 )
 from src.charging_metrics import charging_session_metrics
+from src.rejection_collection import mixed_feasible_offers, parse_mixture
+from src.acceptance_inputs import FEATURE_VARIANTS
 from src import synthetic_scenario as scenario
 
 
@@ -39,6 +43,14 @@ def parse_args(argv=None):
     parser.add_argument("--parquet-path", type=Path, default=ROOT / "nyedata/nye_simulation/parquet/yellow_tripdata_2025-12-18_sample.parquet")
     parser.add_argument("--station-csv", type=Path, default=ROOT / "nyedata/nyc_all_charging_stations.csv")
     parser.add_argument("--date", default="2025-12-18")
+    for split in ('train', 'validation', 'test'):
+        parser.add_argument(f'--{split}-dates', nargs='+', default=None)
+    parser.add_argument('--ev-response-target', choices=['rejection'], default='rejection')
+    parser.add_argument('--ev-response-feature-variant', choices=list(FEATURE_VARIANTS), default='driver_offer_core')
+    parser.add_argument('--ev-response-calibration', choices=['temperature', 'platt', 'none'], default='temperature')
+    parser.add_argument('--ev-response-behavior-policy-mixture', default='0.8,0.1,0.1',
+                        help='MCMF,stratified,random probabilities; test always uses pure MCMF')
+    parser.add_argument('--max-pickup-distance-km', type=float, default=2.)
     parser.add_argument("--start-hour", type=float, default=8.0)
     parser.add_argument("--stop-hour", type=float, default=10.0)
     parser.add_argument("--epoch-length", type=float, default=30.0)
@@ -47,6 +59,17 @@ def parse_args(argv=None):
     parser.add_argument('--nn-seed', type=int, default=42)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
+    try:
+        parse_mixture(args.ev_response_behavior_policy_mixture)
+    except ValueError as exc:
+        parser.error(str(exc))
+    date_groups = [getattr(args, split + '_dates') for split in ('train', 'validation', 'test')]
+    if any(date_groups):
+        if not all(date_groups):
+            parser.error('Provide all three date splits or none (explicit same-day response holdout)')
+        dates = [day for group in date_groups for day in group]
+        if len(dates) != len(set(dates)):
+            parser.error('Whole train/validation/test dates must be disjoint')
     groups = [args.train_seeds, args.validation_seeds, args.test_seeds]
     flat = [seed for group in groups for seed in group]
     if len(flat) != len(set(flat)):
@@ -59,6 +82,8 @@ def parse_args(argv=None):
         parser.error("Require 0 <= start-hour < stop-hour <= 24")
     if min(args.nn_epochs, args.nn_patience) <= 0:
         parser.error('Neural epochs and patience must be positive')
+    if not np.isfinite(args.max_pickup_distance_km) or args.max_pickup_distance_km <= 0:
+        parser.error('Pickup radius must be finite and positive')
     return args
 
 
@@ -97,6 +122,9 @@ def make_environment(args, seed):
     # Evaluation here disables RL updates only; our passive offer collector
     # still collects labels for supervised fitting after all episodes finish.
     env.adp_value = 0.0
+    env.reject_uniform = True
+    if args.environment == 'nyc':
+        env.assignmentrange = args.max_pickup_distance_km
     env.evaluatemode = True
     env.reset()
     return env
@@ -104,14 +132,22 @@ def make_environment(args, seed):
 
 def collect_split(args, split, seeds, output):
     all_rows, episodes = [], []
-    for seed in seeds:
+    dates = getattr(args, split + '_dates', None) or [args.date if args.environment == 'nyc' else 'synthetic']
+    feasible_rows = []
+    for day, seed in ((day, seed) for day in dates for seed in seeds):
         started = time.perf_counter()
-        episode_id = f"{args.environment}:{split}:seed-{seed}"
+        episode_id = f"{args.environment}:{split}:{day}:seed-{seed}"
         solver_calls, backends = 0, set()
-        with (output / f"{split}-{seed}.log").open("w", encoding="utf-8") as log:
+        with (output / f"{split}-{day}-{seed}.log").open("w", encoding="utf-8") as log:
             with redirect_stdout(log):
-                env = make_environment(args, seed)
-                with collect_offers(env, episode_id=episode_id, seed=seed) as rows:
+                episode_args = copy(args)
+                episode_args.date = day
+                env = make_environment(episode_args, seed)
+                mixture = (1., 0., 0.) if split == 'test' else parse_mixture(args.ev_response_behavior_policy_mixture)
+                with mixed_feasible_offers(env, seed=seed, mixture=mixture,
+                        feature_variant=args.ev_response_feature_variant) as support, collect_offers(
+                        env, episode_id=episode_id, seed=seed, day_id=day,
+                        feature_variant=args.ev_response_feature_variant) as rows:
                     for _ in range(env.episode_length):
                         previous_result = getattr(env, "mcmf_last_result", None)
                         actions, stored, stored_ev = env.simulate_motion(
@@ -133,11 +169,13 @@ def collect_split(args, split, seeds, output):
         if not solver_calls:
             raise RuntimeError("No exact MCMF solves were observed in this episode")
         all_rows.extend(rows)
+        feasible_rows.extend(support['feasible_rows'])
         episode = {"episode_id": episode_id, "seed": seed, "offers": len(rows),
                    "accepted": sum(row["accepted"] for row in rows),
                    "mcmf_calls": solver_calls, "mcmf_backends": sorted(backends),
                    "elapsed_seconds": time.perf_counter() - started,
-                   "charging": charge_metrics}
+                   "charging": charge_metrics, "day_id": day,
+                   "behavior_policy_counts": support['policy_counts']}
         episodes.append(episode)
         print(f"{episode_id}: offers={len(rows)}, accepted={episode['accepted']}, "
               f"MCMF={solver_calls}, seconds={episode['elapsed_seconds']:.1f}", flush=True)
@@ -146,6 +184,9 @@ def collect_split(args, split, seeds, output):
             stream.write(json.dumps(row) + "\n")
     if not all_rows:
         raise RuntimeError(f"No human-driver offers in {split}; increase simulation coverage")
+    with (output / f'{split}_feasible_features.jsonl').open('w', encoding='utf-8') as stream:
+        for row in feasible_rows:
+            stream.write(json.dumps(row) + '\n')
     return all_rows, episodes
 
 
@@ -179,14 +220,21 @@ def main(argv=None):
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     print(f"Output: {output}", flush=True)
+    source_paths = sorted([ROOT / 'train_acceptance_model.py', *ROOT.glob('src/**/*.py')])
+    source_hashes = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
+    with tarfile.open(output / 'source_archive.tar.gz', 'w:gz') as archive:
+        for path in source_paths:
+            archive.add(path, arcname=str(path.relative_to(ROOT)))
     data, episode_stats = {}, {}
     for split, seeds in (("train", args.train_seeds), ("validation", args.validation_seeds)):
         data[split], episode_stats[split] = collect_split(args, split, seeds, output)
     candidates = []
     for l2 in (0.0, 1e-5, 1e-4, 1e-3):
         model = BinaryAcceptanceModel(l2=l2, max_epochs=args.nn_epochs, patience=args.nn_patience,
+                                      feature_variant=args.ev_response_feature_variant,
+                                      calibration=args.ev_response_calibration,
                                       seed=args.nn_seed).fit(data["train"], validation_rows=data['validation'])
-        validation_loss = model.loss_history[model.selected_epoch]['validation_binary_cross_entropy']
+        validation_loss = model.calibration['validation_nll_after']
         candidates.append((validation_loss, model))
     _, model = min(candidates, key=lambda item: item[0])
     model.save(output / "model.json")
@@ -202,48 +250,56 @@ def main(argv=None):
             raise AssertionError("Saved-model inference differs from training-time inference")
         metrics[split] = {
             "model": probability_metrics(rows, predictions),
-            "constant_train_rate": probability_metrics(rows, np.full(len(rows), model.training_acceptance_rate)),
-            "simulator_oracle": probability_metrics(rows, [row["oracle_acceptance_probability"] for row in rows]),
+            "constant_train_rate": probability_metrics(rows, np.full(len(rows), model.training_rejection_rate)),
+            "simulator_oracle": probability_metrics(rows, [row["oracle_rejection_probability"] for row in rows]),
+            "selected_support": model.support_diagnostics(rows),
+            "feasible_support": model.support_diagnostics([json.loads(line) for line in
+                (output / f'{split}_feasible_features.jsonl').read_text().splitlines()]),
         }
     test_p = model.predict_proba(data["test"])
-    confidence = clustered_improvement_intervals(data["test"], test_p, model.training_acceptance_rate)
+    confidence = clustered_improvement_intervals(data["test"], test_p, model.training_rejection_rate)
     with (output / "test_predictions.jsonl").open("w", encoding="utf-8") as stream:
         for row, probability in zip(data["test"], test_p):
-            stream.write(json.dumps({**row, "predicted_acceptance_probability": float(probability)}) + "\n")
+            stream.write(json.dumps({**row, "predicted_rejection_probability": float(probability),
+                "rejection_logit": float(model.predict_logits([row])[0])}) + "\n")
     summary = {
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-        "collection": "integrated / plain exact MCMF / ADP=0 / knownreject=False / recourse=legacy",
-        "label": "Actual Bernoulli response: accepted=1, rejected=0; no class balancing",
+        "collection": "integrated / mixed feasible proposals + exact MCMF / test pure MCMF / ADP=0 / knownreject=False / recourse=legacy",
+        "label": "Actual Bernoulli response: rejected=1, accepted=0; no class balancing",
         "oracle_usage": "Evaluation only; excluded from features, fitting and model selection",
-        "split": "Disjoint simulation seeds; NYC splits reuse the same fixed demand day, not held-out real-driver data",
+        "split": "disjoint whole dates" if args.train_dates else "same-demand-day stochastic-response holdout; not cross-date generalization",
         "model": model.to_dict(), "metrics": metrics, "episodes": episode_stats,
         "validation_selection": [{"l2": candidate.l2, "log_loss": loss} for loss, candidate in candidates],
         "test_seed_clustered_95pct_ci": confidence,
         "checkpoint_prediction_roundtrip_exact": True,
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        "source_sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-                          for name in ("train_acceptance_model.py", "src/acceptance_model.py", "src/acceptance_inputs.py", "src/Environment.py", "src/NYCEnvironment.py")},
+        "source_sha256": source_hashes,
     }
+    if source_hashes != {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}:
+        raise RuntimeError('Source changed during rejection training; do not attribute the run to a single version')
     (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     test = metrics["test"]["model"]
     baseline = metrics["test"]["constant_train_rate"]
-    report = ["# MCMF 人类司机接单概率验证", "",
-              f"环境：{args.environment}；采集策略：普通 exact MCMF，未使用真实接单概率。", "",
-              "模型：30→64→32→1 神经网络（ReLU / sigmoid）；标签 1=接单、0=拒单；保持实际类别比例。",
-              f"特征：{', '.join(FEATURE_NAMES)}；单位模式：{model.feature_schema}。",
+    report = ["# EV 拒单概率 v3 验证", "",
+              f"环境：{args.environment}；训练/验证混合可行提案，测试纯 MCMF；未使用 oracle 打分。", "",
+              f"模型：{len(model.feature_names)}→{model.hidden_dims[0]}→{model.hidden_dims[1]}→1；标签 1=拒单；保持自然比例。",
+              f"特征：{', '.join(model.feature_names)}；单位模式：{model.feature_schema}。",
+              f"验证集校准：{model.calibration}；数据划分：{summary['split']}。",
               "损失 BCEWithLogitsLoss + 权重 L2；Adam 优化。训练/验证/测试按种子分离；仅验证 BCE 选正则强度并早停。",
               f"训练 {model.epochs_run} epochs，恢复最佳 epoch {model.selected_epoch}；无逻辑回归回退。", "",
               f"样本量：训练 {len(data['train'])}，验证 {len(data['validation'])}，测试 {len(data['test'])}。", "",
-              "| 测试指标 | Binary 模型 | 训练集接单率常数基线 |", "|---|---:|---:|"]
-    for key in ("log_loss", "brier_score", "roc_auc", "accuracy_at_0_5", "predicted_acceptance_rate", "ece_10_bins", "oracle_probability_mae"):
+              "| 测试指标 | 拒单网络 | 训练集拒单率常数基线 |", "|---|---:|---:|"]
+    for key in ("log_loss", "brier_score", "roc_auc", "accuracy_at_0_5", "predicted_rejection_rate", "ece_10_bins", "oracle_probability_mae"):
         report.append(f"| {key} | {test[key]} | {baseline[key]} |")
-    report.extend(["", f"测试实际接单率：{test['acceptance_rate']:.4%}。",
+    report.extend(["", f"测试实际拒单率：{test['rejection_rate']:.4%}。",
                    f"按种子重采样的改进量 95% CI（正数表示优于常数基线）：{confidence}。", "",
                    "已验证保存/重新加载模型后的概率与保存前逐项一致。原有充电次数统计保留在 summary.json。", "",
                    "## 结论边界", "",
                    "这是对仿真司机响应规律的预测验证，不是对真实人类司机的外部验证。随机响应不能被逐单确定性预测。",
-                   "NYC 使用真实订单，但司机标签仍是仿真生成；不同种子复用同一天需求，不能据此声称跨日期泛化。",
-                   "模型尚未接入 MCMF 打分，采集时不会改变原始分配或使用模型自生成标签。", ""])
+                   f"NYC 使用真实订单、仿真司机标签；本次划分：{summary['split']}。",
+                   "训练/验证的混合行为策略会改变所选报价；测试使用纯 MCMF。所有标签来自实际执行的报价，不对未选边生成回答。",
+                   "selection_probability 仅在可计算时记录条件提案概率；它不是整条轨迹或最终边的边际 propensity，未用于加权 BCE。",
+                   "独立监督训练不调用 Q/residual 更新；部署是否改善平台性能需要另外的单阶段学习实验。", ""])
     (output / "report.md").write_text("\n".join(report), encoding="utf-8")
     print(json.dumps({"test": test, "baseline": baseline, "ci": confidence}, indent=2), flush=True)
     print(f"Model and report saved: {output}", flush=True)

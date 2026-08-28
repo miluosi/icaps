@@ -1,4 +1,13 @@
-# 神经网络 EV 接单概率模型
+# EV 概率模型：当前 v3 与历史 v2
+
+当前代码已升级为 `EVRejectionProbabilityModel`：默认三输入 `3→16→8→1`，
+`rejected=1`，直接输出校准拒单概率，并以 `q_reject + human_response_mask` 接入 critic。
+主 residual 同时使用拒单期望结构化基准；没有新增多阶段 ADP。
+
+当前接口、逐条修改和测试说明见 [EV_REJECTION_V3_CHANGELOG_AND_TESTS.md](EV_REJECTION_V3_CHANGELOG_AND_TESTS.md)。
+旧 v1/v2 模型和 replay 不能用于当前 v3。下文保留用于追溯的旧说明及原有本地结果，**不描述当前接口**。
+
+## 历史 v2：神经网络 EV 接单概率模型
 
 `BinaryAcceptanceModel` 已替换为 PyTorch MLP，不再有逻辑回归训练、推理或回退路径。
 `Binary` 指二元标签，而不是只能输出 0/1。输出是连续的 `p_accept`，`p_reject = 1 - p_accept`。
@@ -81,3 +90,17 @@ python verify_neural_acceptance_run.py results/acceptance_checks/NEW_NEURAL_RUN
 输出 `neural_verification.json/md`，包含全部复核项和固定拒单概率区间的实测校准表。
 
 这是概率预测验证，不是把模型加入分配打分后的性能消融，也不是跨日期或真实司机外部验证。
+
+## 已完成的本地结果
+
+2026-08-28：288 项测试通过；NYC 完成 92 轮完整仿真，训练/验证/测试分别 23,148 / 6,979 / 11,612 次邀约。
+训练 BCE 从 0.174220 降至 0.121102，验证 BCE 从 0.176885 降至 0.129517。
+留出 Log loss 为 0.118744（常数基线 0.166249），ROC-AUC 为 0.887955。
+验证阈值 0.108071 下拒单召回 76.86%、精确率 16.36%；0.5 阈值下仍无报拒单，不能以总体准确率代替拒单识别。
+
+- [模型与实验报告](../results/acceptance_checks/nyc-neural-2km-200-100ev-100aev-20260828/report.md)
+- [验收记录、误报/漏报和充电统计](../results/acceptance_checks/nyc-neural-2km-200-100ev-100aev-20260828/verification.md)
+- [新神经网络 checkpoint](../results/acceptance_checks/nyc-neural-2km-200-100ev-100aev-20260828/model.json)
+
+DirectQ/residual 的 200 车短程训练、概率列梯度、重载冻结推理及四组独立轨迹重放均通过。
+短程接口检查使用单独的冒烟模型，不是上述完整训练模型的平台性能消融。

@@ -624,7 +624,8 @@ def main():
     args = apply_paper_parameter_preset(parse_args())
     zone_distribution_mode = normalize_distribution_mode(args.distribution_mode)
     from src.acceptance_features import acceptance_checkpoint_suffix
-    acceptance_lookup_suffix = acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model)
+    acceptance_lookup_suffix = acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model,
+        anchor=args.ev_response_anchor, critic_input=args.ev_response_critic_input)
     intense = True
     expected_steps = max(1, int(((args.stop_hour - args.start_hour) * 3600) / args.epoch_length))
     if args.test_steps_per_episode != expected_steps:
@@ -811,6 +812,8 @@ def main():
                     zone_distribution_mode=zone_distribution_mode,
                     ev_acceptance_feature=args.ev_acceptance_feature,
                     ev_acceptance_model=args.ev_acceptance_model,
+                ev_response_anchor=args.ev_response_anchor,
+                ev_response_critic_input=args.ev_response_critic_input,
                     checkpoint_suffix=args.checkpoint_suffix,
                     only_manhattan_zones=args.only_manhattan_zones,
                     human_ev_charge_decision_interval_minutes=(

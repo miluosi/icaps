@@ -244,18 +244,11 @@ class PrioritizedJointReplayBuffer:
 
     def load_state_dict(self, state: dict) -> None:
         version = int(state.get("schema_version", -1))
-        if version not in {1, REPLAY_SCHEMA_VERSION}:
+        if version != REPLAY_SCHEMA_VERSION:
             raise ValueError(
                 f"incompatible replay schema {version}; expected {REPLAY_SCHEMA_VERSION}"
             )
-        items = [
-            (
-                replace(item, schema_version=REPLAY_SCHEMA_VERSION)
-                if getattr(item, "schema_version", 1) == 1
-                else item
-            )
-            for item in state.get("items", ())
-        ]
+        items = list(state.get("items", ()))
         priorities = list(state.get("priorities", ()))
         if len(items) != len(priorities):
             raise ValueError("replay items/priorities length mismatch")

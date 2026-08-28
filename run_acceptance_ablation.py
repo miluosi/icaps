@@ -21,6 +21,7 @@ import torch
 
 from src.acceptance_features import configure_acceptance_feature
 from src.acceptance_model import collect_offers
+from src.rejection_anchor import response_graph_diagnostics
 from src.recourse.critics import wire_recourse_critics
 from src.value_function_registry import get_value_function_class
 from train_acceptance_model import make_environment, parse_args as environment_args
@@ -43,7 +44,9 @@ def parse_args(argv=None):
     parser.add_argument('--torch-threads', type=int, default=1)
     parser.add_argument('--max-steps', type=int, default=None, help='Smoke tests only; formal runs use complete episodes')
     parser.add_argument('--acceptance-model', type=Path, required=True,
-                        help='Explicit neural acceptance v2 checkpoint; historical regression models are unsupported')
+                        help='Explicit calibrated rejected=1 neural v3 checkpoint; older models require retraining')
+    parser.add_argument('--ev-response-anchor', choices=['auto', 'off', 'expected_immediate'], default='auto')
+    parser.add_argument('--ev-response-critic-input', choices=['q_mask', 'none'], default='q_mask')
     parser.add_argument('--output-dir', type=Path)
     args = parser.parse_args(argv)
     if min(args.episodes, args.train_every, args.batch_size, args.torch_threads) <= 0:
@@ -71,7 +74,8 @@ def build_env(args, seed, arm, learner, training):
     request_seeder = getattr(env, 'set_request_generation_seed', None)
     if callable(request_seeder):
         request_seeder(seed)
-    configure_acceptance_feature(env, arm, args.acceptance_model if arm == 'predicted' else None)
+    configure_acceptance_feature(env, arm, args.acceptance_model if arm == 'predicted' else None,
+        anchor=args.ev_response_anchor, critic_input=args.ev_response_critic_input)
     env.configure_recourse_experiment('legacy', common_random_numbers=True)
     env.state_variant = 'joint_state_separate_critics'
     env.learner_variant = learner
@@ -119,7 +123,7 @@ def weight_hash(pair, *, remove_acceptance=False):
                 tensor = value.detach().cpu()
                 if remove_acceptance and vf.acceptance_input_enabled and module_name in {'network', 'critic2'} and name.endswith('net.0.weight'):
                     i = vf.acceptance_input_index
-                    tensor = torch.cat([tensor[:, :i], tensor[:, i+1:]], 1)
+                    tensor = torch.cat([tensor[:, :i], tensor[:, i+2:]], 1)
                 digest.update(module_name.encode() + name.encode() + tensor.numpy().tobytes())
     return digest.hexdigest()
 
@@ -149,11 +153,15 @@ def rollout(args, env, pair, *, training, seed, directory):
     losses = []
     demand_rows = {}
     acceptance_inputs = []
+    response_diagnostics = []
     def check_input(module, inputs):
         if pair[1].acceptance_input_enabled:
             p = inputs[0][:, pair[1].acceptance_input_index].detach().cpu().numpy()
+            mask = inputs[0][:, pair[1].acceptance_input_index + 1].detach().cpu().numpy()
             if not np.isfinite(p).all() or np.any((p < 0) | (p > 1)):
                 raise AssertionError('Invalid EV probability feature')
+            if np.any((mask != 0) & (mask != 1)) or np.any(p[mask == 0] != 0):
+                raise AssertionError('Invalid EV response mask')
             acceptance_inputs.extend(p[p > 0].tolist())
     hook = pair[1].network.register_forward_pre_hook(check_input)
     try:
@@ -164,6 +172,9 @@ def rollout(args, env, pair, *, training, seed, directory):
                 previous_result = getattr(env, 'mcmf_last_result', None)
                 actions, stored, stored_ev = env.simulate_motion(
                     agents=[], current_requests=list(env.active_requests.values()), rebalance=True)
+                graph = getattr(env, '_last_feasible_graph_snapshot', None)
+                if graph is not None:
+                    response_diagnostics.append(response_graph_diagnostics(graph))
                 result = getattr(env, 'mcmf_last_result', None)
                 if result is not None and result is not previous_result:
                     if not result['optimal'] or result['solver_fallback_used']:
@@ -203,6 +214,7 @@ def rollout(args, env, pair, *, training, seed, directory):
             stream.write(json.dumps(row) + '\n')
     stats_path = directory / f'stats-{seed}.json'
     stats_path.write_text(json.dumps(stats, indent=2, default=json_default) + '\n')
+    (directory / f'response-diagnostics-{seed}.json').write_text(json.dumps(response_diagnostics, indent=2) + '\n')
     row = dict(seed=seed, training=training, steps=step + 1, reward=reward,
                generated_requests=generated, ev_offers=len(offers), ev_accepted_offers=len(offers)-len(rejected),
                rejected_offers=len(rejected), unique_rejected_requests=len(rejected_ids),
@@ -282,7 +294,7 @@ def main():
     manifest = dict(arguments=vars(args), git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                     source_sha256={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
                     predictor_sha256=hashlib.sha256(args.acceptance_model.read_bytes()).hexdigest(),
-                    target='Integrated, no sequential recourse; EV probability input only; current reward unchanged')
+                    target='Integrated single-stage; calibrated rejection q+mask; residual expected anchor; realized reward unchanged')
     (args.output_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2, default=json_default) + '\n')
     for learner in args.learners:
         for train_seed in args.train_seeds:
@@ -319,11 +331,17 @@ def main():
                 check = dict(learner=learner, train_seed=train_seed, arm=arm,
                              initial_common_weights_hash=comparable_hash, trained_weights_hash=after_hash,
                              aev_joint_updates=pair[0].optimizer_steps_joint, ev_joint_updates=pair[1].optimizer_steps_joint)
-                if arm == 'predicted':
+                if arm == 'predicted' and pair[1].acceptance_input_enabled:
                     net = getattr(pair[1].network, 'base', pair[1].network)
                     check['ev_acceptance_weight_norm'] = float(net.net[0].weight[:, pair[1].acceptance_input_index].norm().item())
                     if check['ev_acceptance_weight_norm'] == 0:
                         raise AssertionError('Probability feature received no learning update')
+                    check['ev_response_mask_weight_norm'] = float(net.net[0].weight[:, pair[1].acceptance_input_index + 1].norm().item())
+                    if check['ev_response_mask_weight_norm'] == 0:
+                        raise AssertionError('Response mask received no learning update')
+                    check['predictor_frozen'] = all(p.grad is None and not p.requires_grad for p in pair[1].response_model.network.parameters())
+                    if not check['predictor_frozen']:
+                        raise AssertionError('TD optimization modified the rejection predictor')
                 training_checks.append(check)
                 checkpoint = directory / 'checkpoint.pt'
                 save_pair(pair, checkpoint, check)
@@ -351,11 +369,12 @@ def main():
     comparisons = summarize(all_rows)
     summary = dict(manifest=manifest, comparisons=comparisons, training_checks=training_checks, episodes=all_rows)
     (args.output_dir / 'summary.json').write_text(json.dumps(summary, indent=2, default=json_default)+'\n')
-    report = ['# Integrated EV 接单概率特征消融', '',
+    report = ['# Integrated EV 拒单概率 v3 接口检查', '',
               f'车队：{args.num_vehicles} 辆，EV {args.num_ev}、AEV {args.num_vehicles-args.num_ev}。',
               f'环境：{args.environment}；每组 {len(args.train_seeds)} 个独立训练种子、每种子 {args.episodes} 轮训练，'
               f'随后用 {len(args.test_seeds)} 个独立环境种子冻结评估。', '',
-              '使用预训练二分类概率作为 EV 分配边的一个输入。没有读取真实接单概率、没有改变奖励或手工乘概率；'
+              '使用独立校准的 q_reject＋human_response_mask 作为 critic 输入。residual 默认同时使用期望结构化基准；'
+              '未读取 oracle，未更改实际执行奖励。'
               '没有 EV-first/AEV-first 二阶段 recourse。所有执行分配使用 exact primal_dual MCMF。', '',
               '| 学习器 | 指标（每评估轮均值） | 不加概率 | 加概率 | 加－不加 |',
               '|---|---|---:|---:|---:|']

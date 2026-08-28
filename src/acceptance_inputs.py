@@ -10,9 +10,10 @@ from collections.abc import Mapping
 import math
 
 
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 SCHEMAS = {"synthetic_steps", "nyc_minutes"}
-FEATURE_NAMES = (
+FEATURE_NAMES = ("idle_time", "pickup_time", "surge_bonus")
+CONTEXT_FEATURE_NAMES = (
     "idle_time", "pickup_time", "surge_bonus", "pickup_distance", "trip_distance",
     "trip_time", "base_fare", "offered_fare", "surge_multiplier", "battery_level",
     "request_age", "pickup_slack", "dropoff_slack", "time_of_day_sin", "time_of_day_cos",
@@ -21,6 +22,14 @@ FEATURE_NAMES = (
     "pickup_pending_requests", "pickup_available_vehicles", "dropoff_pending_requests",
     "dropoff_available_vehicles", "pickup_demand_supply_ratio", "dropoff_demand_supply_ratio",
 )
+FEATURE_VARIANTS = {"driver_offer_core": FEATURE_NAMES, "platform_context": CONTEXT_FEATURE_NAMES}
+
+
+def feature_names(variant="driver_offer_core"):
+    try:
+        return FEATURE_VARIANTS[variant]
+    except KeyError as exc:
+        raise ValueError(f"Unknown EV response feature variant: {variant}") from exc
 
 
 def vehicle_value(vehicle, key, default=None):
@@ -77,12 +86,31 @@ def _coordinates(env, location, nyc):
     return float(int(location) % width), float(int(location) // width)
 
 
-def offer_features(env, vehicle_id, request, *, vehicle=None, context=None, snapshot=None):
+def offer_features(env, vehicle_id, request, *, vehicle=None, context=None, snapshot=None,
+                   feature_variant="driver_offer_core"):
     """Build every feature before the driver's response; fail on missing schema.
 
     A snapshot vehicle requires the full snapshot/context, since dynamic market
     features cannot safely be reconstructed from today's environment.
     """
+    names = feature_names(feature_variant)
+    if vehicle is None:
+        vehicle = (next(v for v in snapshot.vehicles if v.vehicle_id == int(vehicle_id))
+                   if snapshot is not None else env.vehicles[int(vehicle_id)])
+    nyc = callable(getattr(env, 'get_travel_time_minutes', None))
+    conversion = float(env.EPOCH_LENGTH) / 60.0 if nyc else 1.0
+    location, pickup = int(vehicle_value(vehicle, 'location')), int(request.pickup)
+    core = dict(feature_version=FEATURE_VERSION, feature_variant=feature_variant,
+                feature_schema='nyc_minutes' if nyc else 'synthetic_steps',
+                idle_time=float(vehicle_value(vehicle, 'idle_timer', 0.0)) * conversion,
+                pickup_time=float(env.get_travel_time_minutes(location, pickup)) if nyc else
+                    float(env._manhattan_distance_loc(location, pickup)),
+                surge_bonus=float(env._request_surge_bonus(request)))
+    if not all(math.isfinite(core[name]) for name in FEATURE_NAMES):
+        raise ValueError('Pre-offer neural features must all be finite')
+    if feature_variant == 'driver_offer_core':
+        # Do not even read dropoff/fare/deadline/supply for the restricted model.
+        return core
     if context is None:
         if vehicle is not None and not isinstance(vehicle, Mapping) and snapshot is None:
             raise ValueError('Snapshot vehicle requires pre-offer snapshot/context')
@@ -122,7 +150,8 @@ def offer_features(env, vehicle_id, request, *, vehicle=None, context=None, snap
     demand, supply = context['demand'], context['supply']
     pz, dz = _zone(env, pickup), _zone(env, dropoff)
     row = dict(
-        feature_version=FEATURE_VERSION, feature_schema='nyc_minutes' if nyc else 'synthetic_steps',
+        feature_version=FEATURE_VERSION, feature_variant=feature_variant,
+        feature_schema='nyc_minutes' if nyc else 'synthetic_steps',
         idle_time=float(vehicle_value(vehicle, 'idle_timer', 0.0)) * conversion,
         pickup_time=pickup_time, surge_bonus=float(env._request_surge_bonus(request)),
         pickup_distance=pickup_distance, trip_distance=float(trip_distance),
@@ -139,6 +168,6 @@ def offer_features(env, vehicle_id, request, *, vehicle=None, context=None, snap
         pickup_demand_supply_ratio=float(demand.get(pz, 0)) / max(1, supply.get(pz, 0)),
         dropoff_demand_supply_ratio=float(demand.get(dz, 0)) / max(1, supply.get(dz, 0)),
     )
-    if not all(math.isfinite(row[name]) for name in FEATURE_NAMES):
+    if not all(math.isfinite(row[name]) for name in names):
         raise ValueError('Pre-offer neural features must all be finite')
     return row

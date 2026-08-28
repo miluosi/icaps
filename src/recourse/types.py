@@ -13,7 +13,7 @@ from enum import IntEnum
 from typing import Any, Iterable, Mapping
 
 
-REPLAY_SCHEMA_VERSION = 2
+REPLAY_SCHEMA_VERSION = 3
 STATE_VARIANTS = (
     "joint_state_shared_critic",
     "joint_state_separate_critics",
@@ -352,8 +352,24 @@ class FeasibleEdgeSnapshot:
     post_action_zoneid: int = 0
     queue_features: tuple[float, ...] = ()
     post_demand_feature: float | None = None
-    acceptance_probability: float | None = None
+    success_structured_score: float | None = None
+    rejection_structured_score: float = 0.0
+    rejection_probability: float = 0.0
+    human_response_mask: bool = False
+    expected_response_anchor: bool = False
+    response_model_hash: str | None = None
     metadata: tuple[tuple[str, float | int | str | bool | None], ...] = ()
+
+    def __post_init__(self):
+        from src.rejection_anchor import expected_structured_score
+        success = self.structured_score if self.success_structured_score is None else self.success_structured_score
+        expected = expected_structured_score(success, self.rejection_structured_score,
+                                            self.rejection_probability, self.human_response_mask)
+        if self.human_response_mask and (self.vehicle_type != 1 or self.action_type != ActionType.SERVICE
+                                         or dict(self.metadata).get('continuing', False)):
+            raise ValueError('Only unanswered EV service edges may have a response mask')
+        if self.expected_response_anchor and abs(expected - self.structured_score) > 1e-5 * max(1., abs(expected)):
+            raise ValueError('Snapshot structured score differs from its frozen expected anchor')
 
     def candidate_dict(self) -> dict[str, Any]:
         return {
@@ -369,7 +385,9 @@ class FeasibleEdgeSnapshot:
             "target_station_id": self.station_id,
             "queue_features": self.queue_features,
             "post_demand_feature": self.post_demand_feature,
-            "acceptance_probability": self.acceptance_probability,
+            "rejection_probability": self.rejection_probability,
+            "human_response_mask": self.human_response_mask,
+            "response_model_hash": self.response_model_hash,
         }
 
 
@@ -453,13 +471,15 @@ class OfferAttempt:
     request_id: int
     ev_id: int
     selected_by_stage1: bool
-    acceptance_probability: float
+    oracle_rejection_probability: float
     acceptance_uniform: float
     accepted: bool
     rejected: bool
     rejection_reason: str | None
     request_snapshot: RequestSnapshot
     vehicle_snapshot: VehicleSnapshot
+    predicted_rejection_probability: float | None = None
+    response_model_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -579,6 +599,12 @@ class RecourseTransition:
             )
         if self.mode not in {"integrated", "ev_first", "aev_first"}:
             raise ValueError(f"invalid transition mode: {self.mode}")
+        for graph, action in ((self.ev_stage_graph, self.ev_joint_action), (self.aev_stage_graph, self.aev_joint_action)):
+            if graph is None or action is None or not any(edge.response_model_hash for edge in graph.edges):
+                continue
+            expected = JointActionSnapshot.from_graph(graph, action.selected_edge_ids)
+            if abs(action.structured_value - expected.structured_value) > 1e-5 * max(1., abs(expected.structured_value)):
+                raise ValueError('Joint structured value is not the sum of selected frozen anchors')
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

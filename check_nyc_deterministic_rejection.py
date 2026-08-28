@@ -33,7 +33,7 @@ def parse_args(argv=None):
     parser.add_argument('--test-seeds', type=int, nargs='+', default=list(range(5300, 5320)))
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--max-steps', type=int, default=None, help='Smoke checks only; omit for full episodes')
-    parser.add_argument('--reference-run', type=Path, default=None, help='Optional NEURAL v2 reference run; no regression loading')
+    parser.add_argument('--reference-run', type=Path, default=None, help='Optional rejected=1 NEURAL v3 reference run')
     parser.add_argument('--parquet-path', type=Path, default=ROOT / 'nyedata/nye_simulation/parquet/yellow_tripdata_2025-12-18_sample.parquet')
     parser.add_argument('--station-csv', type=Path, default=ROOT / 'nyedata/nyc_all_charging_stations.csv')
     parser.add_argument('--date', default='2025-12-18')
@@ -68,13 +68,13 @@ def deterministic_rows(rows):
         raise ValueError('No observed offers')
     result = []
     for row in rows:
-        score = float(row['oracle_acceptance_probability'])
+        score = float(row['oracle_rejection_probability'])
         if not np.isfinite(score) or not 0 <= score <= 1:
-            raise ValueError('Invalid latent acceptance score')
-        if row['accepted'] not in (0, 1) or int(row['accepted']) != int(score >= 0.5):
+            raise ValueError('Invalid latent rejection score')
+        if row['rejected'] not in (0, 1) or int(row['rejected']) != int(score > 0.5):
             raise ValueError('Actual response does not match reject_uniform=False')
-        result.append(dict(row, latent_acceptance_score=score,
-                           oracle_acceptance_probability=float(score >= 0.5),
+        result.append(dict(row, accepted=1 - int(row['rejected']), latent_acceptance_score=1. - score,
+                           oracle_rejection_probability=float(score > 0.5),
                            response_rule='deterministic_threshold', response_threshold=0.5))
     return result
 
@@ -96,6 +96,7 @@ def deterministic_episode(args, seed, split, model_states=None):
 
     def guarded_factory(settings, episode_seed):
         env = original_factory(settings, episode_seed)
+        env.reject_uniform = False  # This explicitly named deterministic audit only.
         assert env.reject_uniform is False, 'This audit requires an explicitly configured deterministic branch'
         assert env.ride_acceptance_noise_std == 0.0, 'Default behavior noise must remain zero'
         assert env.rejection_logit_shift == 0.0 and env.ifreject
@@ -158,7 +159,7 @@ def fit_if_identifiable(train, validation):
     candidates, histories = [], {}
     for l2 in [0.0, 1e-5, 1e-4, 1e-3]:
         model = BinaryAcceptanceModel(l2=l2).fit(train, validation_rows=validation)
-        score = model.loss_history[model.selected_epoch]['validation_binary_cross_entropy']
+        score = model.calibration['validation_nll_after']
         histories[str(l2)] = audit.loss_trace(model, validation)
         candidates.append((score, model))
     score, model = min(candidates, key=lambda item: item[0])
@@ -277,10 +278,10 @@ def main(argv=None):
     metrics = {}
     for name, fitted in models.items():
         p = fitted.predict_proba(data['test'])
-        np.testing.assert_allclose(p, [r[f'{name}_p_accept'] for r in data['test']], rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(p, [r[f'{name}_p_reject'] for r in data['test']], rtol=1e-6, atol=1e-7)
         metrics[name] = evaluate(data['test'], p, thresholds[name])
-        for row, acceptance_p in zip(data['test'], p):
-            q = 1 - float(acceptance_p)
+        for row, rejection_p in zip(data['test'], p):
+            q = float(rejection_p)
             row[f'{name}_p_reject'] = q
             for choice in ('default', 'validation_f1'):
                 selected = thresholds[name][choice]
@@ -290,7 +291,7 @@ def main(argv=None):
                 row[f'{name}_{choice}_predict_reject'] = predicted
                 row[f'{name}_{choice}_outcome'] = ('FP' if row['accepted'] else 'TP') if predicted else ('TN' if row['accepted'] else 'FN')
     metrics['deterministic_oracle'] = evaluate(data['test'],
-        [r['oracle_acceptance_probability'] for r in data['test']], {'default': {'threshold': 0.5}})
+        [r['oracle_rejection_probability'] for r in data['test']], {'default': {'threshold': 0.5}})
     audit.save_rows(args.output_dir / 'test_predictions.jsonl', data['test'])
     if current_path is not None:
         assert hashlib.sha256(current_path.read_bytes()).hexdigest() == original_hash

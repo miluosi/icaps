@@ -845,6 +845,8 @@ class NYCTrainer:
         learner_variant: str = "legacy",
         ev_acceptance_feature: str = "off",
         ev_acceptance_model: str | None = None,
+        ev_response_anchor: str = 'auto',
+        ev_response_critic_input: str = 'q_mask',
         battery_consumption_ratio: float = 1.0,
         initial_battery_mean: float = 0.875,
         charge_wait_bool: bool = True,
@@ -930,11 +932,13 @@ class NYCTrainer:
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
         from src.acceptance_features import configure_acceptance_feature
-        configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model)
+        configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model,
+                                     anchor=ev_response_anchor, critic_input=ev_response_critic_input)
         if ev_acceptance_feature == "predicted":
-            import hashlib, json
-            predictor_id = hashlib.sha256(json.dumps(env.ev_acceptance_model.to_dict(), sort_keys=True).encode()).hexdigest()[:12]
-            checkpoint_suffix = (checkpoint_suffix or "") + f"_evaccept-{predictor_id}"
+            from src.acceptance_features import acceptance_checkpoint_suffix
+            checkpoint_suffix = (checkpoint_suffix or "") + acceptance_checkpoint_suffix(
+                ev_acceptance_feature, ev_acceptance_model,
+                anchor=ev_response_anchor, critic_input=ev_response_critic_input)
         shared_critic = uses_shared_critic(state_variant)
 
         effective_zone_distribution_mode = self._resolve_zone_distribution_mode(zone_distribution_mode)

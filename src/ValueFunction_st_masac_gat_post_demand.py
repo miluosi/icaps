@@ -86,7 +86,8 @@ class PyTorchChargingValueFunction(_BaseMASAC):
             base_target_critic2, self.edge_dim, self.post_demand_input_index, self.device
         )
         self.actor = _expand_mlp_input(
-            base_actor, self.edge_dim, self.post_demand_input_index, self.device
+            base_actor, self.edge_dim - (2 if self.acceptance_input_enabled else 0),
+            self.post_demand_input_index - (2 if self.acceptance_input_enabled else 0), self.device
         )
 
         self.post_demand_predictor = _MLP(
@@ -342,7 +343,8 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         graph_snapshot=None,
         target_context: bool = False,
         vehicle_types=None,
-        acceptance_probabilities=None,
+        rejection_probabilities=None,
+        human_response_masks=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         graph = self._graph_context(graph_snapshot, target=target_context)
         source_embeddings = self._vehicle_source_embeddings(
@@ -405,7 +407,8 @@ class PyTorchChargingValueFunction(_BaseMASAC):
                 battery_level=float(battery_levels[index]),
                 vehicle_type=vehicle_type,
                 queue_wait_feature=float(queue_wait_features[index]),
-                acceptance_probability=(0.0 if acceptance_probabilities is None else acceptance_probabilities[index]),
+                rejection_probability=(0.0 if rejection_probabilities is None else rejection_probabilities[index]),
+                human_response_mask=(0.0 if human_response_masks is None else human_response_masks[index]),
             )
             local.append(float(post_demand_features[index]))
             source_h = source_embeddings[int(vehicle_ids[index])]

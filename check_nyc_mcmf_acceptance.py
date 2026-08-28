@@ -95,7 +95,7 @@ def parse_args(argv=None):
 
 
 def rejection_metrics(rows, probabilities, threshold=0.5):
-    """Treat REJECTION as positive, unlike the model's accepted=1 labels."""
+    """Both model output and positive class are rejection (q_reject)."""
     accepted = np.asarray([row['accepted'] for row in rows])
     p = np.asarray(probabilities, dtype=float)
     if not len(rows) or p.shape != accepted.shape or not np.isfinite(p).all():
@@ -105,7 +105,7 @@ def rejection_metrics(rows, probabilities, threshold=0.5):
     if not np.isfinite(threshold) or not 0 <= threshold <= 1:
         raise ValueError('Rejection threshold must be in [0,1]')
     actual = accepted == 0
-    score = 1.0 - p
+    score = p
     predicted = score >= threshold
     tp = int(np.sum(actual & predicted))
     fp = int(np.sum(~actual & predicted))
@@ -132,7 +132,7 @@ def rejection_metrics(rows, probabilities, threshold=0.5):
 
 def select_rejection_threshold(validation_rows, probabilities):
     """Maximize rejection F1 on VALIDATION only; prefer precision on ties."""
-    score = 1.0 - np.asarray(probabilities, dtype=float)
+    score = np.asarray(probabilities, dtype=float)
     labels = np.asarray([row['accepted'] == 0 for row in validation_rows])
     # Validate before sorting; no test labels are accepted by this interface.
     rejection_metrics(validation_rows, probabilities)
@@ -173,16 +173,16 @@ def evaluate_model(model, train_rows, validation_rows, test_rows, *, validation_
     validation_threshold_metrics = rejection_metrics(
         validation_rows, model.predict_proba(validation_rows), threshold)
     p = model.predict_proba(test_rows)
-    baseline = np.full(len(test_rows), np.mean([r['accepted'] for r in train_rows]))
+    baseline = np.full(len(test_rows), np.mean([r['rejected'] for r in train_rows]))
     probability = probability_metrics(test_rows, p)
-    probability['predicted_acceptance_range'] = [float(p.min()), float(p.max())]
-    probability['predicted_rejection_range'] = [float(1 - p.max()), float(1 - p.min())]
+    probability['predicted_acceptance_range'] = [float(1 - p.max()), float(1 - p.min())]
+    probability['predicted_rejection_range'] = [float(p.min()), float(p.max())]
     return dict(probability=probability,
                 constant_baseline=probability_metrics(test_rows, baseline),
                 default_threshold=rejection_metrics(test_rows, p, 0.5),
                 validation_f1_threshold=rejection_metrics(test_rows, p, threshold),
                 validation_threshold_metrics=validation_threshold_metrics,
-                always_accept=rejection_metrics(test_rows, np.ones(len(test_rows)), 0.5),
+                always_accept=rejection_metrics(test_rows, np.zeros(len(test_rows)), 0.5),
                 probability_gain_clustered_95=clustered_improvement_intervals(test_rows, p, float(baseline[0])))
 
 
@@ -259,14 +259,14 @@ def run_episode(args, seed, split, directory, model_states=None):
             def predict_then_answer(vid, request):
                 human = env.vehicles[vid]['type'] == 1
                 distance = env.get_distance_km(env.vehicles[vid]['location'], request.pickup) if human else None
-                predictions = {name: model.predict_acceptance_probability(env, vid, request)
+                predictions = {name: model.predict_rejection_probability(env, vid, request)
                                for name, model in models.items()} if human else {}
                 response = original(vid, request)
                 if human:
                     key = (env._epoch_id(), int(vid), int(request.request_id))
                     offers[-1].update(verify_offer_response(
                         env._last_offer_realizations[key], response, configuration, distance))
-                    offers[-1].update({f'{name}_p_accept': p for name, p in predictions.items()})
+                    offers[-1].update({f'{name}_p_reject': p for name, p in predictions.items()})
                 return response
             env._should_reject_request = predict_then_answer
             for step in range(min(env.episode_length, args.max_steps or env.episode_length)):
@@ -288,7 +288,7 @@ def run_episode(args, seed, split, directory, model_states=None):
     if not calls or not offers:
         raise AssertionError('No exact dispatches or actual EV offers observed')
     for name, model in models.items():
-        np.testing.assert_allclose(model.predict_proba(offers), [r[f'{name}_p_accept'] for r in offers], rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(model.predict_proba(offers), [r[f'{name}_p_reject'] for r in offers], rtol=1e-6, atol=1e-7)
     rejected = [r for r in offers if not r['accepted']]
     uniforms = [r['response_uniform'] for r in offers]
     summary = dict(seed=seed, split=split, shadow_prediction=bool(models), steps=step + 1,
@@ -323,7 +323,7 @@ def episode_job(args, seed, split, model_states):
         assert baseline[key] == shadow[key], f'Passive prediction changed {key} for seed {seed}'
     base_rows = read_rows(directory / 'baseline/offers.jsonl')
     shadow_rows = read_rows(directory / 'shadow/offers.jsonl')
-    stripped = [{k: v for k, v in row.items() if not k.endswith('_p_accept')} for row in shadow_rows]
+    stripped = [{k: v for k, v in row.items() if not k.endswith('_p_reject')} for row in shadow_rows]
     assert base_rows == stripped, 'Actual offer sequence/outcomes changed'
     return dict(baseline=baseline, shadow=shadow, identical_trajectory=True)
 
@@ -356,11 +356,11 @@ def build_report(result):
               f'{environment["assignmentrange"]:g} km（不是乘客行程长度），范围过滤={environment["use_range_requests"]}。',
               '只有普通 exact MCMF：ADP=0、knownreject=False、无 sequential recourse。概率只旁路预测，不进入分配打分。', '',
               '## 函数与损失', '',
-              '`src/acceptance_model.py::BinaryAcceptanceModel.predict_proba()` 返回连续接单概率；'
-              '`predict_rejection_probability()` 返回其补数。',
-              f'神经网络：{len(FEATURE_NAMES)}→64→32→1，两层 ReLU，输出 sigmoid；没有逻辑回归预测路径。',
-              r'\(p_i=\sigma(f_\theta((x_i-\mu)/s)),\quad P(\mathrm{reject})=1-p_i.\)',
-              f'完整的分配前输入：{", ".join(FEATURE_NAMES)}。accepted=1、rejected=0；不读取真实概率、随机数或回答后状态。',
+              '`src/acceptance_model.py::BinaryAcceptanceModel.predict_proba()` 返回校准后的连续拒单概率；'
+              '`predict_rejection_probability()` 返回同一拒单概率。',
+              f'神经网络：{len(FEATURE_NAMES)}→16→8→1，两层 ReLU，输出 sigmoid；没有逻辑回归预测路径。',
+              r'\(p_i=\sigma(f_\theta((x_i-\mu)/s)),\quad P(\mathrm{reject})=p_i.\)',
+              f'完整的分配前输入：{", ".join(FEATURE_NAMES)}。rejected=1、accepted=0；不读取真实概率、随机数或回答后状态。',
               r'\(L=\mathrm{BCEWithLogitsLoss}(f_\theta(x),y)+\frac{\lambda}{2}\sum_\ell\lVert W_\ell\rVert_F^2.\)',
               '训练集标准化；权重 L2、偏置不罚；自然类别比例；Adam 优化，验证 BCE 早停并恢复最佳 epoch；不是 Q/residual TD loss。', '',
               '## 损失是否下降', '',
@@ -371,7 +371,7 @@ def build_report(result):
         report.append(f'| {label} | {start:.8f} | {end:.8f} |')
     report += ['', f'选择的 L2={result["model"]["l2"]}，仅以验证集 log loss 选择。'
                f'记录 {len(trace) - 1} 个训练 epoch（另有初始值），恢复 epoch {result["model"]["selected_epoch"]}。',
-               '这是重新采集完整特征后训练的神经网络；旧回归模型和三特征数据未加载。', '',
+               '这是重新采集完整特征后训练的神经网络；旧 v1/v2 回归或接单概率模型未加载。', '',
                'Adam 的训练目标和验证 BCE 都可能逐步波动；验证 BCE 不参与梯度更新。'
                f'本次验证 BCE 上升的迭代步数为 {result["loss_diagnostics"]["validation_binary_cross_entropy"]["increasing_steps"]}。', '',
                '## 新的留出测试：概率质量', '',
@@ -434,7 +434,7 @@ def main(argv=None):
     for l2 in [0.0, 1e-5, 1e-4, 1e-3]:
         candidate = BinaryAcceptanceModel(l2=l2, max_epochs=args.nn_epochs,
             patience=args.nn_patience, seed=args.nn_seed).fit(train, validation_rows=validation)
-        score = candidate.loss_history[candidate.selected_epoch]['validation_binary_cross_entropy']
+        score = candidate.calibration['validation_nll_after']
         candidates.append((score, candidate))
         histories[str(l2)] = loss_trace(candidate, validation)
     score, model = min(candidates, key=lambda item: item[0])
@@ -448,7 +448,7 @@ def main(argv=None):
     # strictly a diagnostic comparator, never a fitting target or a feature.
     thresholds = {}
     for name, p in [('fresh', model.predict_proba(validation)),
-                    ('simulator_oracle', [r['oracle_acceptance_probability'] for r in validation])]:
+                    ('simulator_oracle', [r['oracle_rejection_probability'] for r in validation])]:
         threshold, metrics = select_rejection_threshold(validation, p)
         thresholds[name] = dict(threshold=threshold, validation_metrics=metrics)
     save_json(args.output_dir / 'decision_thresholds.json', thresholds)
@@ -458,15 +458,14 @@ def main(argv=None):
                                       {'fresh': model.to_dict()})
     fresh_metrics = evaluate_model(model, train, validation, test,
                                    validation_threshold=thresholds['fresh']['threshold'])
-    oracle_p = np.asarray([r['oracle_acceptance_probability'] for r in test])
+    oracle_p = np.asarray([r['oracle_rejection_probability'] for r in test])
     oracle_metrics = dict(probability=probability_metrics(test, oracle_p),
         default_threshold=rejection_metrics(test, oracle_p),
         validation_f1_threshold=rejection_metrics(test, oracle_p, thresholds['simulator_oracle']['threshold']))
-    baseline = np.full(len(test), np.mean([r['accepted'] for r in train]))
+    baseline = np.full(len(test), np.mean([r['rejected'] for r in train]))
     constant = dict(probability=probability_metrics(test, baseline), default_threshold=rejection_metrics(test, baseline))
     for row in test:
         for name, metrics in [('fresh', fresh_metrics)]:
-            row[f'{name}_p_reject'] = 1 - row[f'{name}_p_accept']
             row[f'{name}_predict_reject_0_5'] = row[f'{name}_p_reject'] >= 0.5
             row[f'{name}_predict_reject_validation_threshold'] = row[f'{name}_p_reject'] >= metrics['validation_f1_threshold']['threshold']
     save_rows(args.output_dir / 'test_predictions.jsonl', test)

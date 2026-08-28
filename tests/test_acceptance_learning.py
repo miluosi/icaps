@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from src.acceptance_features import (
-    acceptance_checkpoint_suffix, configure_acceptance_feature, predicted_acceptance,
+    acceptance_checkpoint_suffix, configure_acceptance_feature, predicted_rejection,
 )
 from src.acceptance_model import BinaryAcceptanceModel, offer_features
 from src.recourse.state_snapshot import StateSnapshotBuilder
@@ -25,7 +25,7 @@ def env():
     features = offer_features(env, vid, env.active_requests[991])
     rows = [dict(features, idle_time=features['idle_time'] + i % 10,
                  pickup_time=features['pickup_time'] + i % 4,
-                 surge_bonus=features['surge_bonus'] + i % 7, accepted=int(i % 5 != 0))
+                 surge_bonus=features['surge_bonus'] + i % 7, rejected=int(i % 5 == 0))
             for i in range(200)]
     model = BinaryAcceptanceModel(max_epochs=30).fit(rows)
     configure_acceptance_feature(env, 'predicted', model_state=model.to_dict())
@@ -42,7 +42,7 @@ def test_every_registered_learner_receives_probability_and_roundtrips(env, mode)
     value = make_value(env, mode)
     vid = next(k for k, v in env.vehicles.items() if v['type'] == 1)
     req = next(iter(env.active_requests.values()))
-    expected = predicted_acceptance(env, vid, req)
+    expected = predicted_rejection(env, vid, req)
     seen = []
     handle = value.network.register_forward_pre_hook(
         lambda module, args, kwargs: seen.append((args, kwargs)), with_kwargs=True)
@@ -54,12 +54,12 @@ def test_every_registered_learner_receives_probability_and_roundtrips(env, mode)
     assert len(out) == 1 and np.isfinite(out).all()
     args, kwargs = seen[-1]
     actual = (args[0][0, value.acceptance_input_index].item() if args
-              else kwargs['acceptance_probability'].item())
+              else kwargs['rejection_probability'].item())
     assert actual == pytest.approx(expected)
     assert 0 < actual < 1
     state = value.extra_checkpoint_state()
     value.load_extra_checkpoint_state(state)
-    bad = {**state, 'ev_acceptance': {'mode': 'off', 'model': None}}
+    bad = {**state, 'ev_response': {'mode': 'off', 'model': None}}
     with pytest.raises(ValueError, match='mismatch'):
         value.load_extra_checkpoint_state(bad)
 
@@ -71,7 +71,7 @@ def test_replay_probability_is_pre_offer_not_live_or_outcome(env, mode):
     vid = next(v.vehicle_id for v in state.vehicles if v.vehicle_type == 1)
     req = state.requests[0]
     row = dict(vehicle_id=vid, vehicle_type=1, action_type=f'assign_{req.request_id}', state_snapshot=state)
-    before = value.acceptance_from_experience(row)
+    before = value.rejection_from_experience(row)
     env.vehicles[vid]['idle_timer'] = 1000
     env.vehicles[vid]['location'] = (env.vehicles[vid]['location'] + 40) % (env.grid_size ** 2)
     env.active_requests.clear()
@@ -80,13 +80,13 @@ def test_replay_probability_is_pre_offer_not_live_or_outcome(env, mode):
         vehicle['battery'] = .01
         vehicle['is_online'] = False
     row.update(accepted=0, acceptance_outcome='rejected', reward=-9999)
-    assert value.acceptance_from_experience(row) == before
+    assert value.rejection_from_experience(row) == before
     row['next_state_snapshot'] = replace(state, vehicles=tuple(
         replace(v, idle_time=123) if v.vehicle_id == vid else v for v in state.vehicles))
-    next_value = value.acceptance_from_experience(row, {'action_type': row['action_type']}, next_state=True)
+    next_value = value.rejection_from_experience(row, {'action_type': row['action_type']}, next_state=True)
     assert next_value != before
     with pytest.raises(ValueError, match='snapshot'):
-        value.acceptance_from_experience({**row, 'state_snapshot': None})
+        value.rejection_from_experience({**row, 'state_snapshot': None})
 
 
 def test_probability_masks_and_schema_validation(env):
@@ -94,10 +94,10 @@ def test_probability_masks_and_schema_validation(env):
     ev = next(k for k, v in env.vehicles.items() if v['type'] == 1)
     aev = next(k for k, v in env.vehicles.items() if v['type'] == 2)
     req = next(iter(env.active_requests))
-    result = value.acceptance_for_live_edges([ev, ev, aev], [2, 3, 2], [req, -1, req])
+    result = value.rejection_for_live_edges([ev, ev, aev], [2, 3, 2], [req, -1, req])
     assert 0 < result[0] < 1 and list(result[1:]) == [0, 0]
     with pytest.raises(ValueError, match='request_ids'):
-        value.acceptance_for_live_edges([ev], [2])
+        value.rejection_for_live_edges([ev], [2])
     with pytest.raises(ValueError, match='trained'):
         configure_acceptance_feature(env, 'predicted')
     model = env.ev_acceptance_model.to_dict()
@@ -114,7 +114,7 @@ def test_probability_column_has_td_gradient_and_preserves_initialization(env, mo
     torch.manual_seed(81)
     off = make_value(env, mode)
     x = torch.randn(4, off.edge_dim)
-    p = torch.full((4, 1), .7)
+    p = torch.full((4, 2), .7)
     idx = on.acceptance_input_index
     expanded = torch.cat([x[:, :idx], p, x[:, idx:]], 1)
     assert torch.allclose(on.network(expanded), off.network(x), atol=1e-5)
@@ -168,11 +168,11 @@ def test_checkpoint_namespace_and_predictor_identity(env, tmp_path):
     model_path = tmp_path / 'acceptance.json'
     env.ev_acceptance_model.save(model_path)
     suffix = acceptance_checkpoint_suffix('predicted', model_path)
-    assert suffix.startswith('_evaccept-')
+    assert suffix.startswith('_evreject-v3-')
     assert acceptance_checkpoint_suffix('off', None) == ''
     assert acceptance_checkpoint_suffix('predicted', model_path) == suffix
     state = value.extra_checkpoint_state()
-    state['ev_acceptance'] = {**state['ev_acceptance'], 'model': None}
+    state['ev_response'] = {**state['ev_response'], 'model': None}
     with pytest.raises(ValueError, match='predictor differs'):
         value.load_acceptance_checkpoint_state(state)
 
