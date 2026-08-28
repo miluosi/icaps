@@ -310,7 +310,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
                  encoder: bool = True,
                  zone_distribution_mode: str = None,
                  replay_buffer_size: int = 500000,
-                 iftransformer: bool = False):
+                 iftransformer: bool = False,
+                 enable_legacy_rejection_predictor: bool = False):
         super().__init__(log_dir=log_dir, device=device)
         
         self.grid_size = grid_size
@@ -320,6 +321,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         self.num_locations = grid_size * grid_size
         self.env = env  # 存储环境引用
         self._init_acceptance_feature()
+        # The online historical predictor is separate from the opt-in frozen
+        # v3 response feature. Neither should start implicitly in a Q learner.
+        self.enable_legacy_rejection_predictor = bool(enable_legacy_rejection_predictor)
         self.iftransformer = bool(iftransformer)
         self.zone_distribution_mode = zone_distribution_mode or ("bayes" if encoder else "time-only")
         if self.zone_distribution_mode not in {"bayes", "time-only", "none"}:
@@ -471,7 +475,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
             print(f"   - Time zone dist predictor follower parameters: {sum(p.numel() for p in self.time_zone_dist_predictor_follower.parameters())}")
         else:
             print("   - Time zone dist predictor parameters: disabled (no distribution input)")
-        print(f"   - Rejection predictor parameters: {sum(p.numel() for p in self.rejection_predictor.parameters())}")
+        if self.rejection_predictor is not None:
+            print(f"   - Legacy rejection predictor parameters: {sum(p.numel() for p in self.rejection_predictor.parameters())}")
+        else:
+            print("   - Legacy rejection predictor: disabled")
     
 
     
@@ -497,7 +504,17 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         self.joint_replay_buffer.add(transition)
 
     def _init_rejection_predictor(self):
-        """初始化拒绝概率预测神经网络"""
+        """Keep outcome diagnostics, but create the old model only by opt-in."""
+        self.rejection_predictor = None
+        self.rejection_optimizer = None
+        self.rejection_criterion = None
+        self.rejection_buffer = deque(maxlen=5000)
+        self.rejection_training_losses = []
+        self.rejection_min_train_samples = 64
+        self.rejection_predictor_trained = False
+        if not self.enable_legacy_rejection_predictor:
+            return
+
         class RejectionPredictor(nn.Module):
             def __init__(self, input_dim=10, hidden_dim=64):
                 super().__init__()
@@ -519,12 +536,6 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         self.rejection_optimizer = optim.Adam(self.rejection_predictor.parameters(), lr=1e-3)
         self.rejection_criterion = nn.BCELoss()
         
-        # 拒绝数据缓冲区
-        self.rejection_buffer = deque(maxlen=5000)
-        self.rejection_training_losses = []
-        self.rejection_min_train_samples = 64
-        self.rejection_predictor_trained = False
-
     def _build_rejection_sample(
         self,
         vehicle_id: int,
@@ -2637,6 +2648,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         基于神经网络从历史拒绝经验学习的拒绝概率计算惩罚
         使用训练好的神经网络预测拒绝概率，而不是固定的数学公式
         """
+        if self.rejection_predictor is None:
+            return 0.0
         distance = float(distance or 0.0)
 
         def _fallback_penalty() -> float:
@@ -3192,6 +3205,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
             batch_size: 批次大小
             num_epochs: 训练轮数
         """
+        if self.rejection_predictor is None:
+            return None
         if self.debug_mode:
             print("Training rejection predictor...")
             print(f"Rejection buffer size: {len(self.rejection_buffer)}")
@@ -4727,6 +4742,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
 
         if (
             ifEV
+            and self.rejection_predictor is not None
             and self.training_step % 20 == 0
             and len(self.rejection_buffer) >= self.rejection_min_train_samples
         ):

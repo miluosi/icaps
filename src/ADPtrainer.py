@@ -873,7 +873,7 @@ class ADPTrainer:
                 ):
                     if metric_name in checkpoint:
                         setattr(value_function, metric_name, list(checkpoint.get(metric_name, [])))
-                if hasattr(value_function, 'rejection_predictor') and 'rejection_predictor_state_dict' in checkpoint:
+                if getattr(value_function, 'rejection_predictor', None) is not None and 'rejection_predictor_state_dict' in checkpoint:
                     value_function.rejection_predictor.load_state_dict(checkpoint['rejection_predictor_state_dict'])
                     value_function.rejection_predictor_trained = bool(
                         checkpoint.get('rejection_predictor_trained', False)
@@ -882,7 +882,7 @@ class ADPTrainer:
                         checkpoint.get('rejection_training_losses', [])
                     )
                     print(f"✓ 成功加载rejection_predictor权重", flush=True)
-                if hasattr(value_function, 'rejection_optimizer') and 'rejection_optimizer_state_dict' in checkpoint:
+                if getattr(value_function, 'rejection_optimizer', None) is not None and 'rejection_optimizer_state_dict' in checkpoint:
                     try:
                         value_function.rejection_optimizer.load_state_dict(checkpoint['rejection_optimizer_state_dict'])
                     except (ValueError, RuntimeError) as e:

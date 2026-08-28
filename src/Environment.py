@@ -9189,7 +9189,10 @@ class ChargingIntegratedEnvironment(Environment):
                     self._save_rejection_acceptance_data(rejection_buffer)
                     
                     # 训练rejection predictor（仅对EV）
-                    if hasattr(self.value_function_ev, 'train_rejection_predictor'):
+                    if (
+                        getattr(self.value_function_ev, 'rejection_predictor', None) is not None
+                        and hasattr(self.value_function_ev, 'train_rejection_predictor')
+                    ):
                         print(f"\n{'='*60}")
                         print(f"Training EV Rejection Predictor at step {self._rejection_save_counter}")
                         print(f"{'='*60}")
