@@ -10,6 +10,7 @@ import numpy as np
 from .lifecycle import RequestLifecycleTracker
 from .replay import PrioritizedJointReplayBuffer
 from .state_snapshot import StateSnapshotBuilder
+from .reward_ledger import build_reward_ledger
 from .types import (
     FeasibleGraphSnapshot,
     JointActionSnapshot,
@@ -44,6 +45,9 @@ class PendingTransition:
     residual_state: SystemSnapshot | None = None
     aev_stage_graph: FeasibleGraphSnapshot | None = None
     aev_joint_action: JointActionSnapshot | None = None
+    committed_aev_edge_ids: tuple[str, ...] = ()
+    repair_hold_aev_ids: tuple[int, ...] = ()
+    repair_candidate_request_ids: tuple[int, ...] = ()
 
 
 class RecourseCoordinator:
@@ -192,6 +196,7 @@ class RecourseCoordinator:
             if int(vehicle.get("type", 1)) == 2
         )
         next_state = StateSnapshotBuilder.build(env)
+        ledger = build_reward_ledger(env, pending, rewards, self.lifecycle)
         transition = RecourseTransition(
             transition_id=pending.transition_id,
             episode_id=pending.episode_id,
@@ -230,6 +235,10 @@ class RecourseCoordinator:
             reward_scope="selected_epoch_actions",
             rewarded_vehicle_ids=rewarded_vehicle_ids,
             continuing_action_edge_ids=continuing_action_edge_ids,
+            reward_ledger=ledger,
+            committed_aev_edge_ids=pending.committed_aev_edge_ids,
+            repair_hold_aev_ids=pending.repair_hold_aev_ids,
+            repair_candidate_request_ids=pending.repair_candidate_request_ids,
         )
         if self.replay is not None:
             self.replay.add(transition)
@@ -260,11 +269,18 @@ class RecourseCoordinator:
                 JointActionSnapshot.from_graph(graph, selected)
             )
 
-        if pending.mode == "integrated":
+        if pending.mode in {"integrated", "integrated_repair"}:
             if pending.ev_stage_graph is None or pending.ev_joint_action is None:
                 pending.ev_stage_graph, pending.ev_joint_action = build(
                     0, pending.pre_state
                 )
+            if pending.mode == "integrated_repair" and pending.aev_stage_graph is None:
+                graph, _ = build(2, pending.residual_state or pending.pre_state)
+                # Committed/continuing vehicles belong only to stage 0.
+                from dataclasses import replace
+                graph = replace(graph, edges=(), selected_edge_ids=())
+                pending.aev_stage_graph = graph
+                pending.aev_joint_action = JointActionSnapshot.from_graph(graph)
             return
         if pending.mode in {"ev_first", "evfirst"}:
             if pending.ev_stage_graph is None or pending.ev_joint_action is None:

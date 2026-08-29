@@ -525,6 +525,46 @@ class RecourseEvent:
     rejection_event_id: str = ""
     transition_id: str = ""
     ultimately_served: bool = False
+    repair_architecture: str = "ev_first"
+
+
+def is_true_same_epoch_recourse(event: RecourseEvent) -> bool:
+    return bool(event.residual_category == "rejected" and event.eligible
+                and event.same_epoch_recourse_link and event.assigned
+                and event.assigned_vehicle_type == 2
+                and event.first_rejected_epoch is not None
+                and event.assignment_epoch_id == event.first_rejected_epoch)
+
+
+@dataclass(frozen=True)
+class RewardLedger:
+    ev_accepted_service: float = 0.0
+    ev_rejection_penalty: float = 0.0
+    ev_other: float = 0.0
+    aev_rejected_repair_service: float = 0.0
+    aev_unoffered_service: float = 0.0
+    aev_other_service: float = 0.0
+    aev_charging: float = 0.0
+    aev_relocation: float = 0.0
+    aev_waiting: float = 0.0
+    aev_other: float = 0.0
+    request_expiry_penalty: float = 0.0
+    other_system_penalty: float = 0.0
+
+    @property
+    def stage1(self):
+        return self.ev_accepted_service + self.ev_rejection_penalty + self.ev_other
+
+    @property
+    def stage2(self):
+        return sum((self.aev_rejected_repair_service, self.aev_unoffered_service,
+                    self.aev_other_service, self.aev_charging, self.aev_relocation,
+                    self.aev_waiting, self.aev_other, self.request_expiry_penalty,
+                    self.other_system_penalty))
+
+    @property
+    def system(self):
+        return self.stage1 + self.stage2
 
 
 @dataclass(frozen=True)
@@ -591,14 +631,33 @@ class RecourseTransition:
     target_structured_value: float = 0.0
     target_correction_value: float = 0.0
     target_full_value: float = 0.0
+    recourse_target_family: str = "auto"
+    reward_ledger: RewardLedger | None = None
+    committed_aev_edge_ids: tuple[str, ...] = ()
+    repair_hold_aev_ids: tuple[int, ...] = ()
+    repair_candidate_request_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != REPLAY_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported replay schema {self.schema_version}; expected {REPLAY_SCHEMA_VERSION}"
             )
-        if self.mode not in {"integrated", "ev_first", "aev_first"}:
+        if self.mode not in {"integrated", "integrated_repair", "ev_first", "aev_first"}:
             raise ValueError(f"invalid transition mode: {self.mode}")
+        from .config import canonical_variant, target_family
+        object.__setattr__(self, "recourse_variant", canonical_variant(self.recourse_variant))
+        family = target_family(self.recourse_variant, self.mode)
+        if self.recourse_target_family not in {"auto", family}:
+            raise ValueError("recourse target family does not match the physical/credit configuration")
+        object.__setattr__(self, "recourse_target_family", family)
+        if abs(self.reward_system - self.reward_ev - self.reward_aev) > 1e-6 * max(1., abs(self.reward_system)):
+            raise ValueError("joint system reward does not reconcile with fleet rewards")
+        if self.reward_ledger is not None:
+            if abs(self.reward_ledger.system - self.reward_system) > 1e-6 * max(1., abs(self.reward_system)):
+                raise ValueError("reward ledger does not reconcile with realized system reward")
+            if (abs(self.reward_ledger.stage1 - self.reward_ev) > 1e-6 * max(1., abs(self.reward_ev))
+                    or abs(self.reward_ledger.stage2 - self.reward_aev) > 1e-6 * max(1., abs(self.reward_aev))):
+                raise ValueError("reward ledger does not reconcile with realized fleet rewards")
         for graph, action in ((self.ev_stage_graph, self.ev_joint_action), (self.aev_stage_graph, self.aev_joint_action)):
             if graph is None or action is None or not any(edge.response_model_hash for edge in graph.edges):
                 continue
@@ -608,6 +667,22 @@ class RecourseTransition:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def stage1_graph(self):
+        return self.ev_stage_graph
+
+    @property
+    def stage2_graph(self):
+        return self.aev_stage_graph
+
+    @property
+    def stage1_joint_action(self):
+        return self.ev_joint_action
+
+    @property
+    def stage2_joint_action(self):
+        return self.aev_joint_action
 
 
 @dataclass(frozen=True)

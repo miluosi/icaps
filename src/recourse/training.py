@@ -26,6 +26,8 @@ def training_readiness(
 ) -> TrainingReadiness:
     if value_function is None:
         return TrainingReadiness(False, False, False)
+    if not ifEV and getattr(value_function, 'recourse_variant', 'legacy') == 'r2':
+        return TrainingReadiness(False, False, False)
     edge_ready = len(
         getattr(value_function, "experience_buffer", ())
     ) >= max(0, int(edge_warmup))

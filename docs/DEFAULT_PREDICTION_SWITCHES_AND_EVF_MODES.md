@@ -1,5 +1,7 @@
 # 默认预测开关与 EV-first 模式核查
 
+后续更新：本文件保留上一轮预测开关核查记录。新增 macro recourse、R2/R3 命名、保留 R1/Integrated 及 Samitha 的实现与实测，请见 [Recourse 修订报告](RECOURSE_CREDIT_REPAIR_SAMITHA_AUDIT_20260828.md)；下文原 r3/r4 表不是当前全部模式清单。
+
 核查日期：2026-08-28。范围：默认关闭拒单预测、检查 demand/queue 开关、说明现有 EVF 训练路径。本次没有新增多阶段 ADP，没有修改 demand/queue 的学习机制，也没有删除充电、接单或拒单统计。
 
 ## 1. 拒单预测现在默认关闭

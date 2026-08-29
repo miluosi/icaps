@@ -11,7 +11,7 @@ import pickle
 
 import numpy as np
 
-from .types import REPLAY_SCHEMA_VERSION, RecourseTransition
+from .types import REPLAY_SCHEMA_VERSION, RecourseTransition, is_true_same_epoch_recourse
 
 
 @dataclass(frozen=True)
@@ -187,10 +187,8 @@ class PrioritizedJointReplayBuffer:
         has_rejection = bool(
             transition.rejection_outcome.rejected_request_ids
         )
-        has_recourse = bool(
-            transition.outcome_summary.count("assigned")
-            or transition.outcome_summary.count("picked_up")
-        )
+        has_recourse = any(is_true_same_epoch_recourse(event)
+                           for event in transition.outcome_summary.events)
         return float(
             abs(float(td_error))
             + self.epsilon
@@ -223,6 +221,7 @@ class PrioritizedJointReplayBuffer:
         content_hash = self._content_hash(items, priorities)
         return {
             "schema_version": REPLAY_SCHEMA_VERSION,
+            "recourse_credit_schema": 1,
             "capacity": self.capacity,
             "alpha": self.alpha,
             "beta": self.beta,
@@ -255,10 +254,22 @@ class PrioritizedJointReplayBuffer:
         if len(items) > int(state.get("capacity", self.capacity)):
             raise ValueError("serialized replay exceeds its declared capacity")
         expected_hash = state.get("content_hash")
-        if expected_hash is not None and str(expected_hash) != self._content_hash(
-            items, priorities
-        ):
-            raise ValueError("serialized replay content hash mismatch")
+        legacy_credit = 'recourse_credit_schema' not in state
+        if expected_hash is not None:
+            digest = self._content_hash(items, priorities)
+            if str(expected_hash) != digest and not (
+                legacy_credit and str(expected_hash) == self._legacy_content_hash(items, priorities)
+            ):
+                raise ValueError("serialized replay content hash mismatch")
+        if legacy_credit:
+            # Existing R0--R4 retain their meaning. Only optional credit/ledger
+            # metadata is filled; no missing historical reward is fabricated.
+            items = [replace(row, recourse_target_family='auto') for row in items]
+            bonus = float(state.get('recourse_bonus', self.recourse_bonus))
+            priorities = [max(float(state.get('epsilon', self.epsilon)), float(priority)
+                + bonus * (int(any(is_true_same_epoch_recourse(e) for e in row.outcome_summary.events))
+                           - int(bool(row.outcome_summary.count('assigned') or row.outcome_summary.count('picked_up')))))
+                for row, priority in zip(items, priorities)]
         for transition in items:
             self._validate(transition)
         transition_ids = [transition.transition_id for transition in items]
@@ -293,6 +304,22 @@ class PrioritizedJointReplayBuffer:
             for index, transition in enumerate(self._items)
         }
         self._validate_hyperparameters()
+
+    @staticmethod
+    def _legacy_content_hash(items, priorities):
+        fields_added = {'recourse_target_family', 'reward_ledger', 'committed_aev_edge_ids',
+                        'repair_hold_aev_ids', 'repair_candidate_request_ids'}
+        records = []
+        for row in items:
+            record = row.to_dict()
+            for name in fields_added:
+                record.pop(name, None)
+            for event in record.get('outcome_summary', {}).get('events', []):
+                event.pop('repair_architecture', None)
+            records.append(record)
+        canonical = json.dumps(dict(items=records, priorities=[float(p).hex() for p in priorities]),
+                               ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        return sha256(canonical).hexdigest()
 
     @staticmethod
     def _content_hash(

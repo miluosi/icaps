@@ -1489,6 +1489,7 @@ class NYCEnvironment:
         self._same_epoch_blocked_request_ids = set()
         self._ensure_recourse_runtime()
         self.request_lifecycle.reset()
+        self._integrated_repair_metrics = {}
         self.charge_wait_bool = bool(getattr(self, 'charge_wait_bool', True))
         self.charge_index = int(getattr(self, 'charge_index', 5))
         self.recourse_coordinator.pending = None
@@ -2716,8 +2717,9 @@ class NYCEnvironment:
         common_random_numbers: bool = False,
     ) -> None:
         """Configure explicit R0--R4 execution and target semantics."""
-        variant = str(variant or "legacy").strip().lower()
-        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4"}:
+        from src.recourse.config import canonical_variant
+        variant = canonical_variant(variant)
+        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4", "recourse_macro"}:
             raise ValueError(
                 "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
             )
@@ -2748,6 +2750,10 @@ class NYCEnvironment:
 
     def _epoch_id(self) -> int:
         return StateSnapshotBuilder.epoch_id(self)
+
+    def _charge_uniform(self, vehicle_id, stream, *, numpy_fallback=False):
+        from src.recourse.crn import vehicle_uniform
+        return vehicle_uniform(self, vehicle_id, stream, numpy_fallback=numpy_fallback)
 
     def _acceptance_uniform(self, vehicle_id: int, request) -> float:
         """Return an offer-keyed uniform shared by paired experiment runs."""
@@ -3808,7 +3814,7 @@ class NYCEnvironment:
                             self._set_vehicle_charging_session(vehicle_id)
                             vehicle['charging_count'] += 1
                             vehicle['target_location'] = None
-                            reward = -self.charging_penalty - np.random.random() * self.charging_reward_noise
+                            reward = -self.charging_penalty - self._charge_uniform(vehicle_id, 'charge_reward', numpy_fallback=True) * self.charging_reward_noise
                         else:
                             reward = self._charging_wait_step_penalty(vehicle_id, sid)
                     else:
@@ -3937,8 +3943,11 @@ class NYCEnvironment:
         self.step_rejection_reward_count = 0
 
         execute_actions_start = time.time()
+        self._epoch_rejection_reward_components = {}
         for vehicle_id, action in actions.items():
+            reject_before = self.step_rejection_reward_total
             reward, dur_reward = self._execute_action(vehicle_id, action)
+            self._epoch_rejection_reward_components[vehicle_id] = self.step_rejection_reward_total - reject_before
             rewards[vehicle_id] = reward
             dur_rewards[vehicle_id] = dur_reward
             next_states[vehicle_id] = self._get_vehicle_state(vehicle_id)
@@ -5483,8 +5492,8 @@ class NYCEnvironment:
                 if must_charge and not station_probs:
                     v['needs_emergency_charging'] = True
                     continue
-                if station_probs and (must_charge or random.random() < p_charge):
-                    r = random.random()
+                if station_probs and (must_charge or self._charge_uniform(vid, 'charge_decision') < p_charge):
+                    r = self._charge_uniform(vid, 'charge_station')
                     acc = 0.0
                     chosen_station = next(iter(station_probs.keys())) if station_probs else None
                     if chosen_station is None:
@@ -5707,6 +5716,10 @@ class NYCEnvironment:
     # ------------------------------------------------------------------
     # simulate_motion_evfirst  (EV first, then AEV with prior features)
     # ------------------------------------------------------------------
+
+    def simulate_motion_integrated_repair(self, agents=None, current_requests=None, rebalance=True):
+        from src.recourse.integrated_repair import simulate_integrated_repair
+        return simulate_integrated_repair(self, agents, current_requests, rebalance)
 
     def simulate_motion_evfirst(self, agents=None, current_requests=None, rebalance=True):
         if agents is None:
@@ -7619,6 +7632,9 @@ class NYCEnvironment:
             'mean_completion_recovery_delay': float(
                 lifecycle_metrics['mean_completion_recovery_delay']
             ),
+            **getattr(self, '_integrated_repair_metrics', {}),
+            'samitha_repair_pickup_count': lifecycle_metrics['samitha_repair_pickup_count'],
+            'samitha_repair_completion_count': lifecycle_metrics['samitha_repair_completion_count'],
             'residual_request_count': residual_count,
             'residual_request_served_count': int(
                 getattr(self, 'residual_request_served_count', 0)

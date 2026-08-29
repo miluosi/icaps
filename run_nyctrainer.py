@@ -29,6 +29,7 @@ from src.value_function_registry import (
     validate_value_function_registry,
 )
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.recourse.config import VARIANT_CHOICES, add_method_arguments, resolve_method_arguments
 from src.recourse.manifest import write_experiment_manifest
 
 
@@ -40,6 +41,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run NYC zone-based ADP training")
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
+    add_method_arguments(parser)
     parser.add_argument("--paper-parameter-preset", action="store_true",
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
@@ -114,7 +116,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--transportation-mode", type=str, nargs="+", default=["integrated"],
-                        choices=["integrated", "evfirst", "aevfirst"],
+                        choices=["integrated", "integrated_repair", "evfirst", "aevfirst"],
                         help="One or more transportation modes")
     parser.add_argument("--use-intense-requests", action="store_true",
                         help="Compatibility flag only; NYC always uses real parquet demand")
@@ -294,7 +296,7 @@ def parse_args():
     )
     parser.add_argument(
         "--recourse-variant",
-        choices=["legacy", "r0", "r1", "r2", "r3", "r4"],
+        choices=VARIANT_CHOICES,
         default="legacy",
         help=(
             "EV-first rejection/recourse experiment: r0=no rejection; "
@@ -994,7 +996,7 @@ def run_nyc_training(
 
 
 def main():
-    args = apply_paper_parameter_preset(parse_args())
+    args = resolve_method_arguments(apply_paper_parameter_preset(parse_args()))
     validate_value_function_registry()
     if args.recourse_variant != "legacy":
         invalid_modes = [
@@ -1028,7 +1030,7 @@ def main():
     )
     if args.learner_variant == "integrated_directq" and (
         args.all_modes
-        or any(mode != "integrated" for mode in args.transportation_mode)
+        or any(mode not in {"integrated", "integrated_repair"} for mode in args.transportation_mode)
     ):
         raise ValueError(
             "integrated_directq requires --transportation-mode integrated"

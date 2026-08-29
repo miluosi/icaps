@@ -40,6 +40,8 @@ class NYCTrainer:
 
     @staticmethod
     def _select_motion_fn(env: Any, transportation_mode: str) -> Callable[..., tuple[Any, Any, Any]]:
+        if transportation_mode == "integrated_repair":
+            return env.simulate_motion_integrated_repair
         if transportation_mode == "integrated":
             return env.simulate_motion
         if transportation_mode == "evfirst":
@@ -76,7 +78,7 @@ class NYCTrainer:
             ).strip("_")
             if clean_suffix:
                 extra_suffix = f"_{clean_suffix}"
-        if transportation_mode == "integrated":
+        if transportation_mode in {"integrated", "integrated_repair"}:
             return (
                 f"checkpoints/q_networks_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
                 f"checkpoints/q_networks_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
@@ -939,6 +941,7 @@ class NYCTrainer:
             checkpoint_suffix = (checkpoint_suffix or "") + acceptance_checkpoint_suffix(
                 ev_acceptance_feature, ev_acceptance_model,
                 anchor=ev_response_anchor, critic_input=ev_response_critic_input)
+        recourse_variant = env.recourse_variant
         shared_critic = uses_shared_critic(state_variant)
 
         effective_zone_distribution_mode = self._resolve_zone_distribution_mode(zone_distribution_mode)
@@ -954,6 +957,8 @@ class NYCTrainer:
         value_function_class = self._get_value_function_class(effective_zone_distribution_mode)
 
         if use_neural_network or ifloadcheckpoint:
+            from src.recourse.config import validate_joint_learner
+            validate_joint_learner(transportation_mode, recourse_variant, value_function_class)
             device = "cuda" if torch.cuda.is_available() else "cpu"
             value_function_kwargs = dict(
                 grid_size=env.grid_size,

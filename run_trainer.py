@@ -10,6 +10,7 @@ import src.ADPtrainer as adp_trainer_module
 from src.ADPtrainer import ADPTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.recourse.config import VARIANT_CHOICES, add_method_arguments, resolve_method_arguments
 from src.recourse.manifest import write_experiment_manifest
 from src.value_function_registry import (
     get_value_function_class,
@@ -36,6 +37,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run charging integration training with ADPTrainer")
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
+    add_method_arguments(parser)
     parser.add_argument("--adp", type=float, default=1.0, help="ADP value (0 disables NN training)")
     parser.add_argument("--episodes", type=int, default=50, help="Number of episodes")
     parser.add_argument("--num-vehicles", type=int, default=200, help="Total vehicles")
@@ -45,7 +47,7 @@ def parse_args():
         type=str,
         nargs="+",
         default=["integrated", "evfirst", "aevfirst"],
-        choices=["integrated", "evfirst", "aevfirst"],
+        choices=["integrated", "integrated_repair", "evfirst", "aevfirst"],
         help="One or more transportation modes",
     )
     parser.add_argument("--use-intense-requests", action="store_true", help="Use intense request pattern")
@@ -126,7 +128,7 @@ def parse_args():
     parser.add_argument("--random-seed", type=int, default=64, help="Random seed for training")
     parser.add_argument(
         "--recourse-variant",
-        choices=["legacy", "r0", "r1", "r2", "r3", "r4"],
+        choices=VARIANT_CHOICES,
         default="legacy",
         help="EV-first rejection/recourse ablation",
     )
@@ -207,7 +209,7 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
+    args = resolve_method_arguments(parse_args())
     if args.recourse_variant != "legacy" and (
         args.all_modes
         or any(mode != "evfirst" for mode in args.transportation_mode)
@@ -224,7 +226,7 @@ def main():
     )
     if args.learner_variant == "integrated_directq" and (
         args.all_modes
-        or any(mode != "integrated" for mode in args.transportation_mode)
+        or any(mode not in {"integrated", "integrated_repair"} for mode in args.transportation_mode)
     ):
         raise ValueError(
             "integrated_directq requires --transportation-mode integrated"

@@ -1011,6 +1011,8 @@ class ADPTrainer:
         self.logger.info(f"   Mode: {transportation_mode.upper()}")
         self.logger.info(f"   Demand: {'INTENSE' if use_intense_requests else 'RANDOM'}")
         self.logger.info(f"   ADP: {adpvalue}")
+        from src.recourse.config import canonical_variant
+        recourse_variant = canonical_variant(recourse_variant)
         if recourse_variant != "legacy" and transportation_mode != "evfirst":
             raise ValueError("R0--R4 recourse variants require transportation_mode='evfirst'")
         valid_state_variants = {
@@ -1204,6 +1206,8 @@ class ADPTrainer:
         )
 
         if use_neural_network or ifloadgingValueFunction:
+            from src.recourse.config import validate_joint_learner
+            validate_joint_learner(transportation_mode, recourse_variant, PyTorchChargingValueFunction)
             value_function_init_start = time.time()
             log_progress("Initializing AEV value function")
             value_function_extra_kwargs = {}
@@ -1309,7 +1313,7 @@ class ADPTrainer:
                 f"Loading value functions trained with {load_tag.upper()} assignment"
             )
             enc_suffix = get_distribution_suffix()
-            if transportation_mode == "integrated":
+            if transportation_mode in {"integrated", "integrated_repair"}:
                 evfile = f"checkpoints/q_networks_{load_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}_ev{enc_suffix}"
                 aevfile = f"checkpoints/q_networks_{load_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}_aev{enc_suffix}"
             elif transportation_mode == "evfirst":
@@ -1511,6 +1515,8 @@ class ADPTrainer:
                         ('AEV', value_function),
                         ('EV', value_function_ev),
                     ):
+                        if predictor_name == 'AEV' and recourse_variant == 'r2':
+                            continue
                         queue_loss = 0.0
                         demand_loss = 0.0
                         for _ in range(predictor_pretrain_steps):
@@ -1588,7 +1594,9 @@ class ADPTrainer:
                     log_progress(
                         f"Episode {episode + 1} step 0 starting dispatch with {len(current_requests)} active requests"
                     )
-                if transportation_mode == 'integrated':
+                if transportation_mode == 'integrated_repair':
+                    actions, storeactions, storeactions_ev = env.simulate_motion_integrated_repair(agents=[], current_requests=current_requests, rebalance=True)
+                elif transportation_mode == 'integrated':
                     actions, storeactions, storeactions_ev = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
                 elif transportation_mode == 'evfirst':
                     actions, storeactions, storeactions_ev = env.simulate_motion_evfirst(agents=[], current_requests=current_requests, rebalance=True)
@@ -1740,7 +1748,7 @@ class ADPTrainer:
                 global_episode = resume_episode_offset + episode + 1
                 assign_tag = "gurobi" if assignmentgurobi else "heu"
                 enc_suffix = get_distribution_suffix()
-                if transportation_mode == 'integrated':
+                if transportation_mode in {'integrated', 'integrated_repair'}:
                     checkpoint_base = f"checkpoints/q_networks_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}"
                 elif transportation_mode == 'evfirst':
                     checkpoint_base = f"checkpoints/q_networksevfirst_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}"
@@ -2105,7 +2113,7 @@ class ADPTrainer:
             }
             assign_tag = "gurobi" if assignmentgurobi else "heu"
             enc_suffix = get_distribution_suffix()
-            if transportation_mode == 'integrated':
+            if transportation_mode in {'integrated', 'integrated_repair'}:
                 self._save_q_network_checkpoint(
                     value_function, global_episode, checkpoint_dir=f"checkpoints/q_networks_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}_aev{enc_suffix}", checkpoint_metadata=latest_metadata
                 )

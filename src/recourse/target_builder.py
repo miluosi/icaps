@@ -11,9 +11,10 @@ import numpy as np
 from src.exact_mcmf import build_reduced_problem, solve_exact
 
 from .types import FeasibleEdgeSnapshot, FeasibleGraphSnapshot
+from .config import canonical_variant
 
 
-VALID_RECOURSE_VARIANTS = {"legacy", "r0", "r1", "r2", "r3", "r4"}
+VALID_RECOURSE_VARIANTS = {"legacy", "r0", "r1", "r2", "r3", "r4", "recourse_macro"}
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ RECOURSE_VARIANT_POLICIES = {
     "r2": RecourseVariantPolicy(True, True, True, False, False),
     "r3": RecourseVariantPolicy(True, True, False, True, False),
     "r4": RecourseVariantPolicy(True, True, False, True, True),
+    "recourse_macro": RecourseVariantPolicy(True, True, False, True, False),
 }
 
 
@@ -72,7 +74,7 @@ class RecourseTargetBuilder:
 
     @staticmethod
     def variant_policy(variant: str) -> RecourseVariantPolicy:
-        variant = str(variant or "legacy").lower()
+        variant = canonical_variant(variant)
         try:
             return RECOURSE_VARIANT_POLICIES[variant]
         except KeyError as exc:
@@ -80,7 +82,7 @@ class RecourseTargetBuilder:
 
     @staticmethod
     def validate_variant(variant: str, transportation_mode: str) -> str:
-        variant = str(variant or "legacy").lower()
+        variant = canonical_variant(variant)
         if variant not in RECOURSE_VARIANT_POLICIES:
             raise ValueError(
                 "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
@@ -103,10 +105,13 @@ class RecourseTargetBuilder:
         gamma: float = 0.95,
         elapsed_epochs: float = 1.0,
         within_epoch_gamma: float = 1.0,
+        reward_aev: float = 0.0,
     ) -> float:
-        variant = str(variant).lower()
+        variant = canonical_variant(variant)
         policy = RecourseTargetBuilder.variant_policy(variant)
         ordinary_bootstrap = 0.0 if done else (gamma ** elapsed_epochs) * temporal_value
+        if variant == "recourse_macro":
+            return float(reward_ev + reward_aev + ordinary_bootstrap)
         if policy.stage_coupled_leader:
             # Rejection is an observed within-epoch outcome, not a terminal
             # mask.  The follower bootstrap is retained even when the EV offer

@@ -2376,8 +2376,9 @@ class ChargingIntegratedEnvironment(Environment):
         common_random_numbers: bool = False,
     ) -> None:
         """Configure the shared R0--R4 contract for synthetic experiments."""
-        variant = str(variant or "legacy").strip().lower()
-        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4"}:
+        from src.recourse.config import canonical_variant
+        variant = canonical_variant(variant)
+        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4", "recourse_macro"}:
             raise ValueError(
                 "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
             )
@@ -2410,6 +2411,10 @@ class ChargingIntegratedEnvironment(Environment):
 
     def _epoch_id(self) -> int:
         return StateSnapshotBuilder.epoch_id(self)
+
+    def _charge_uniform(self, vehicle_id, stream, *, numpy_fallback=False):
+        from src.recourse.crn import vehicle_uniform
+        return vehicle_uniform(self, vehicle_id, stream, numpy_fallback=numpy_fallback)
 
     def _acceptance_uniform(self, vehicle_id: int, request) -> float:
         if not bool(getattr(self, "common_random_numbers", False)):
@@ -5609,9 +5614,9 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None and self._should_consider_ev_charging(vehicle_id):
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
+                if station_probs and ((self._charge_uniform(vehicle_id, 'charge_decision') < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
-                    r = random.random()
+                    r = self._charge_uniform(vehicle_id, 'charge_station')
                     acc = 0.0
                     chosen_station = next(iter(station_probs.keys()))
                     for sid, prob in station_probs.items():
@@ -6251,6 +6256,10 @@ class ChargingIntegratedEnvironment(Environment):
         self._annotate_recourse_actions(actions)
         return actions, storeactions, storeactions_ev
 
+    def simulate_motion_integrated_repair(self, agents=None, current_requests=None, rebalance=True):
+        from src.recourse.integrated_repair import simulate_integrated_repair
+        return simulate_integrated_repair(self, agents, current_requests, rebalance)
+
     def simulate_motion_evfirst(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True):
         """Override simulate_motion to integrate Gurobi optimization with Q-learning for charging environment"""
         if agents is None:
@@ -6278,9 +6287,9 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None and self._should_consider_ev_charging(vehicle_id):
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
+                if station_probs and ((self._charge_uniform(vehicle_id, 'charge_decision') < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
-                    r = random.random()
+                    r = self._charge_uniform(vehicle_id, 'charge_station')
                     acc = 0.0
                     chosen_station = next(iter(station_probs.keys()))
                     for sid, prob in station_probs.items():
@@ -7203,9 +7212,9 @@ class ChargingIntegratedEnvironment(Environment):
         for vehicle_id, vehicle in self.vehicles.items():
             if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None and self._should_consider_ev_charging(vehicle_id):
                 p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
-                if station_probs and ((random.random() < p_charge) or vehicle['battery'] <= 0.2):
+                if station_probs and ((self._charge_uniform(vehicle_id, 'charge_decision') < p_charge) or vehicle['battery'] <= 0.2):
                     # Choose charging station by probability
-                    r = random.random()
+                    r = self._charge_uniform(vehicle_id, 'charge_station')
                     acc = 0.0
                     chosen_station = next(iter(station_probs.keys()))
                     for sid, prob in station_probs.items():
@@ -8761,7 +8770,7 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle['charging_count'] += 1
                             vehicle['target_location'] = None
                             vehicle.pop('target_charging_station', None)
-                            reward = -charging_penalty - np.random.random()*0.2
+                            reward = -charging_penalty - self._charge_uniform(vehicle_id, 'charge_reward', numpy_fallback=True)*0.2
                         else:
                             reward = self._charging_wait_step_penalty(vehicle_id, station_id)
                     else:
@@ -8770,9 +8779,9 @@ class ChargingIntegratedEnvironment(Environment):
                         #print(f"DEBUG: Vehicle {vehicle_id} moving towards charging station {station_id}")
                         reward = self._execute_movement_towards_charging_station(vehicle_id, station_id)
                 else:
-                    reward = -charging_penalty - np.random.random()*0.2  # Invalid station penalty
+                    reward = -charging_penalty - self._charge_uniform(vehicle_id, 'charge_reward', numpy_fallback=True)*0.2  # Invalid station penalty
             else:
-                reward = -charging_penalty - np.random.random()*0.2  # Invalid station penalty
+                reward = -charging_penalty - self._charge_uniform(vehicle_id, 'charge_reward', numpy_fallback=True)*0.2  # Invalid station penalty
             if vehicle['type'] == 1:
                 reward += -0.1  # Extra penalty for EVs to encourage efficiency
                 if self.storeactions_ev[vehicle_id] is not None:
@@ -9766,7 +9775,7 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle['charging_time_left'] -= 1
                 #print(f"DEBUG: Vehicle {vehicle_id} charging at station {vehicle['charging_station']}, time left: {vehicle['charging_time_left']}")
                 # Charging increases battery (reduced rate for more realistic charging)
-                vehicle['battery'] += self.chargeincrease_per_epoch + np.random.random()*0.001
+                vehicle['battery'] += self.chargeincrease_per_epoch + self._charge_uniform(vehicle_id, 'charge_increment', numpy_fallback=True)*0.001
                 vehicle['battery'] = min(1.0, vehicle['battery'])
                 
                 # Charging complete
@@ -9866,6 +9875,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.current_time = 0
         self._ensure_recourse_runtime()
         self.request_lifecycle.reset()
+        self._integrated_repair_metrics = {}
         self.recourse_coordinator.pending = None
         self._pending_recourse_actions = {}
         self._same_epoch_blocked_request_ids = set()
@@ -10242,6 +10252,7 @@ class ChargingIntegratedEnvironment(Environment):
         self._ensure_recourse_runtime()
         self.request_lifecycle.assert_reconciled()
         stats.update(self.request_lifecycle.metrics())
+        stats.update(getattr(self, '_integrated_repair_metrics', {}))
         return stats
 
     def get_stats(self):

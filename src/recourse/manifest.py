@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping
 
 from .metrics import summarize_metric_with_uncertainty
 from .types import REPLAY_SCHEMA_VERSION
+from .config import method_metadata
 
 
 METRIC_DEFINITIONS = {
@@ -59,6 +60,9 @@ def write_experiment_manifest(
         if any(row.get(metric) is not None for row in rows):
             summaries[metric] = summarize_metric_with_uncertainty(rows, metric)
     manifest = {
+        "recourse_configuration": method_metadata(
+            arguments.get('transportation_mode', 'integrated'),
+            arguments.get('recourse_variant', 'legacy')),
         "manifest_version": 2,
         "git_commit": _git_commit(output_path.parent),
         "replay_schema_version": REPLAY_SCHEMA_VERSION,

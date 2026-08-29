@@ -13,6 +13,49 @@ def recourse_metrics(tracker: RequestLifecycleTracker) -> dict[str, float | int]
     return tracker.metrics()
 
 
+def summarize_joint_targets(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Finite sampled-TD diagnostics, keeping an absent follower as null."""
+    result: dict[str, Any] = {}
+    for name, phases in (("leader", {"ev_leader", "system"}), ("follower", {"aev_follower"})):
+        values = [float(row["joint_target_full"]) for row in diagnostics if row["phase"] in phases]
+        mean = sum(values) / len(values) if values else None
+        result[f"{name}_td_target_mean"] = mean
+        result[f"{name}_td_target_std"] = (
+            math.sqrt(sum((v - mean) ** 2 for v in values) / len(values)) if values else None)
+        result[f"{name}_td_target_count"] = len(values)
+    result["joint_prediction_abs_mean"] = (
+        sum(row["joint_prediction_abs"] for row in diagnostics) / len(diagnostics) if diagnostics else None)
+    result["target_projection_runtime_seconds"] = sum(row["target_projection_runtime"] for row in diagnostics)
+    return result
+
+
+def ordinary_service_displacement(graph) -> int:
+    """Fixed-graph opportunity count, NOT a rollout causal-effect estimate.
+
+    Remove currently rejected request edges, keep all other frozen scores and
+    capacities, and count the additional ordinary AEV services selected. This
+    optional audit calculation never changes the executed action.
+    """
+    from dataclasses import replace
+    from .target_builder import RecourseTargetBuilder
+    from .types import ActionType
+
+    if graph is None:
+        return 0
+    rejected = {rid for rid, category in graph.state.request_labels if category == "rejected"}
+    if not rejected:
+        return 0
+    ordinary = lambda e: (e.vehicle_type == 2 and e.action_type == ActionType.SERVICE
+                           and e.request_id not in rejected and not dict(e.metadata).get("continuing", False))
+    actual = sum(ordinary(e) for e in graph.edges if e.edge_id in graph.selected_edge_ids)
+    counterfactual = replace(graph, edges=tuple(e for e in graph.edges if e.request_id not in rejected),
+                             selected_edge_ids=())
+    selected = set(RecourseTargetBuilder().project(counterfactual,
+                   {e.edge_id: e.collection_score for e in counterfactual.edges}))
+    alternative = sum(ordinary(e) for e in counterfactual.edges if e.edge_id in selected)
+    return max(0, alternative - actual)
+
+
 def reconcile_episode(
     *,
     generated: int,

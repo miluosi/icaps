@@ -2513,6 +2513,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                     bounds = provider._correction_bounds_for_edges(
                         graph, provider_edges, target_context=False
                     )
+                    if provider.planning_objective_mode != "structured_only":
+                        provider.deployment_edges_scored = getattr(provider, "deployment_edges_scored", 0) + len(provider_edges)
+                        provider.deployment_edges_clipped = getattr(provider, "deployment_edges_clipped", 0) + int(
+                            (selected_raw.detach().abs() > bounds).sum().item())
                     corrections = float(provider._beta()) * torch.clamp(
                         selected_raw, min=-bounds, max=bounds
                     )
@@ -2819,7 +2823,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 "direct replay transition link has incompatible identity: "
                 f"expected={expected}, actual={actual}"
             )
-        if candidate.mode == "integrated":
+        if candidate.mode in {"integrated", "integrated_repair"}:
             return candidate.ev_stage_graph
         if candidate.mode == "ev_first":
             # The AEV follower ends at the next epoch's EV leader phase.
@@ -2846,7 +2850,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         *,
         ifEV: bool,
     ):
-        if transition.mode == "integrated":
+        if transition.mode in {"integrated", "integrated_repair"}:
             if ifEV:
                 return None
             return (
@@ -2860,7 +2864,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 return (
                     transition.ev_stage_graph,
                     transition.ev_joint_action,
-                    float(transition.reward_ev),
+                    float(transition.reward_system if transition.recourse_target_family == "macro_realized" else transition.reward_ev),
                     "ev_leader",
                 )
             if transition.recourse_variant == "r2":
@@ -2904,7 +2908,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         if (
             transition.mode == "ev_first"
             and phase == "ev_leader"
-            and transition.recourse_variant == "r4"
+            and transition.recourse_target_family == "nested_follower"
         ):
             return transition.aev_stage_graph is not None
         if transition.mode == "aev_first" and phase == "aev_leader":
@@ -2990,7 +2994,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             if (
                 transition.mode == "ev_first"
                 and phase == "ev_leader"
-                and transition.recourse_variant == "r4"
+                and transition.recourse_target_family == "nested_follower"
             ):
                 # The follower action is inside the current epoch and is
                 # evaluated by the explicitly wired AEV lagged target critic.
@@ -3059,6 +3063,13 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 "joint_q1_loss": float(loss1.detach().item()),
                 "joint_q2_loss": float(loss2.detach().item()),
                 "joint_target_full": float(full_target_value),
+                "leader_recourse_credit": float(transition.reward_aev) if phase == "ev_leader" and transition.recourse_target_family == "macro_realized" else 0.0,
+                "recourse_target_family": transition.recourse_target_family,
+                "phase": phase,
+                "joint_residual_target": float(target_value),
+                "joint_prediction_abs": float(0.5 * (prediction1.detach().abs() + prediction2.detach().abs()).item()),
+                "follower_target": float(full_target_value) if phase == "aev_follower" else 0.0,
+                "follower_residual": float(prediction1.detach().item()) if phase == "aev_follower" else 0.0,
                 "joint_target_structured": float(
                     0.0
                     if target_components is None
@@ -3119,7 +3130,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             provider.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         for provider in providers_to_step.values():
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 [
                     parameter
                     for parameter in provider.graph_encoder.parameters()
@@ -3130,6 +3141,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 + list(provider.critic2.parameters()),
                 max_norm=self.gradient_clip_norm,
             )
+            provider.joint_gradient_clip_count = getattr(provider, "joint_gradient_clip_count", 0) + int(
+                float(grad_norm) > self.gradient_clip_norm)
             provider.optimizer.step()
             provider.joint_training_step = int(
                 getattr(provider, "joint_training_step", 0)
@@ -3159,7 +3172,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         return float(loss.detach().item())
 
     def train_step(self, batch_size: int = 64, tau: float | None = None, ifEV: bool = False) -> float:
-        if str(self.learner_variant) in {
+        if not ifEV and str(getattr(self, 'recourse_variant', 'legacy')) == 'r2':
+            # Repair Only must not update the follower, including auxiliaries.
+            return 0.0
+        if str(getattr(self, 'recourse_variant', 'legacy')) in {'r2', 'r3', 'r4', 'recourse_macro'} or str(self.learner_variant) in {
             "optimization_anchored_residual",
             "integrated_directq",
         }:

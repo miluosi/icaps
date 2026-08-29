@@ -19,6 +19,7 @@ from .types import (
 @dataclass
 class _MutableLifecycle:
     request_id: int
+    repair_architecture: str = "ev_first"
     rejection_event_id: str = ""
     transition_id: str = ""
     rejected_epoch_id: int | None = None
@@ -62,6 +63,9 @@ class RequestLifecycleTracker:
         ] = {}
         self._offers: list[OfferAttempt] = []
         self._offer_counts: dict[tuple[int, int, int], int] = {}
+        # Separate from EV-rejection events: Samitha can also repair unoffered
+        # requests. Initial integrated commitments never enter this ledger.
+        self._integrated_repairs: dict[int, _MutableLifecycle] = {}
 
     def next_attempt_index(self, epoch_id: int, ev_id: int, request_id: int) -> int:
         return int(self._offer_counts.get((int(epoch_id), int(ev_id), int(request_id)), 0))
@@ -150,6 +154,7 @@ class RequestLifecycleTracker:
         epoch_id: int,
         category: str,
         eligible: bool,
+        repair_architecture: str = "ev_first",
     ) -> None:
         if category not in {"rejected", "unoffered", "other"}:
             raise ValueError(f"invalid residual category: {category}")
@@ -167,6 +172,7 @@ class RequestLifecycleTracker:
         if observation not in state.residual_observations:
             state.residual_observations.append(observation)
         state.residual_category = category
+        state.repair_architecture = repair_architecture
         state.residual_epoch_id = int(epoch_id)
         state.eligible = bool(eligible)
         if category != "rejected":
@@ -200,6 +206,7 @@ class RequestLifecycleTracker:
             if observation not in rejection_event.residual_observations:
                 rejection_event.residual_observations.append(observation)
             rejection_event.residual_category = "rejected"
+            rejection_event.repair_architecture = repair_architecture
             rejection_event.residual_epoch_id = int(epoch_id)
             rejection_event.eligible = bool(eligible)
 
@@ -261,6 +268,13 @@ class RequestLifecycleTracker:
             return bool(same_epoch_recourse)
         return False
 
+    def record_integrated_repair_assignment(self, request_id: int, *, vehicle_id: int, epoch_id: int) -> None:
+        self._integrated_repairs[int(request_id)] = _MutableLifecycle(
+            request_id=int(request_id), repair_architecture="integrated_repair",
+            assigned=True, assigned_vehicle_id=int(vehicle_id), assigned_vehicle_type=2,
+            assignment_epoch_id=int(epoch_id),
+        )
+
     def record_pickup(
         self,
         request_id: int,
@@ -272,6 +286,10 @@ class RequestLifecycleTracker:
         state = self._requests.setdefault(
             int(request_id), _MutableLifecycle(request_id=int(request_id))
         )
+        repair = self._integrated_repairs.get(int(request_id))
+        if repair is not None and repair.assigned_vehicle_id == int(vehicle_id) and int(vehicle_type) == 2:
+            repair.picked_up = True
+            repair.pickup_epoch_id = int(epoch_id)
         candidates = [
             event
             for (candidate_request_id, _), event in self._rejection_events.items()
@@ -325,6 +343,11 @@ class RequestLifecycleTracker:
             if vehicle_type is None
             else int(vehicle_type)
         )
+        repair = self._integrated_repairs.get(int(request_id))
+        if (repair is not None and repair.assigned_vehicle_id == state.completion_vehicle_id
+                and state.completion_vehicle_type == 2):
+            repair.completed = True
+            repair.completion_epoch_id = int(epoch_id)
         state.completed = bool(
             state.rejected_epoch_id is not None
             and state.assigned_vehicle_type == 2
@@ -455,6 +478,7 @@ class RequestLifecycleTracker:
                     rejection_event_id=state.rejection_event_id,
                     transition_id=state.transition_id,
                     ultimately_served=state.ultimately_served,
+                    repair_architecture=state.repair_architecture,
                 )
             )
         return OutcomeSummary(tuple(events))
@@ -520,6 +544,8 @@ class RequestLifecycleTracker:
         accepted_offers = sum(offer.accepted for offer in self._offers)
         rejected_offers = sum(offer.rejected for offer in self._offers)
         return {
+            "samitha_repair_pickup_count": sum(e.picked_up for e in self._integrated_repairs.values()),
+            "samitha_repair_completion_count": sum(e.completed for e in self._integrated_repairs.values()),
             "ev_offer_count": len(self._offers),
             "ev_accepted_offer_count": accepted_offers,
             "ev_rejected_offer_count": rejected_offers,
