@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .config import CAUSAL_PREDICTOR_VARIANTS
+
 
 @dataclass(frozen=True)
 class TrainingReadiness:
@@ -33,7 +35,7 @@ def training_readiness(
         not ifEV and variant in {'r1_structured', 'r2'}
     )
     predictors_frozen = bool(
-        variant in {'r1_structured', 'r2', 'r3'}
+        variant in CAUSAL_PREDICTOR_VARIANTS
         and getattr(value_function, 'freeze_causal_predictors', True)
     )
     edge_ready = len(

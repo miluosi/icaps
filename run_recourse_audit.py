@@ -19,6 +19,10 @@ from run_acceptance_ablation import seed_everything, weight_hash, save_pair, jso
 from train_acceptance_model import make_environment, parse_args as environment_args
 from src.acceptance_features import configure_acceptance_feature
 from src.recourse.config import (
+    ARCHITECTURE_CONTRASTS,
+    CAUSAL_CONTRASTS,
+    CAUSAL_PREDICTOR_VARIANTS,
+    DIAGNOSTIC_CONTRASTS,
     METHOD_ALIASES,
     METHODS,
     PAPER_METHODS,
@@ -30,7 +34,7 @@ from src.recourse.contracts import (
     evaluate_method_event_contract,
 )
 from src.recourse.metrics import summarize_paired_crn_difference, summarize_joint_targets, ordinary_service_displacement
-from src.recourse.types import is_true_same_epoch_recourse
+from src.recourse.types import STATE_VARIANTS, is_true_same_epoch_recourse
 from src.value_function_registry import get_value_function_class
 
 ROOT = Path(__file__).resolve().parent
@@ -66,6 +70,9 @@ def parse_args(argv=None):
     parser.add_argument('--max-steps', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--train-every', type=int, default=10)
+    parser.add_argument('--state-variant', choices=STATE_VARIANTS, default='joint_state_separate_critics')
+    parser.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'], default='none')
+    parser.add_argument('--checkpoint-replay-recent', type=int, default=5000)
     parser.add_argument('--date', default='2025-12-18')
     parser.add_argument('--dates', nargs='+', default=None)
     parser.add_argument(
@@ -78,6 +85,8 @@ def parse_args(argv=None):
         parser.error('Require both fleets and positive training counts')
     if args.max_steps is not None and args.max_steps <= 1:
         parser.error('max-steps must allow linked joint transitions (>1)')
+    if args.checkpoint_replay_recent <= 0:
+        parser.error('checkpoint-replay-recent must be positive')
     try:
         args.methods = [canonical_method(method) for method in args.methods]
     except ValueError as exc:
@@ -104,7 +113,7 @@ def build_env(args, seed, method, *, training):
     spec = METHODS[method]
     env.configure_recourse_experiment(spec.variant, common_random_numbers=True)
     configure_acceptance_feature(env, 'off')
-    env.state_variant = 'joint_state_separate_critics'
+    env.state_variant = args.state_variant
     env.learner_variant = 'optimization_anchored_residual'
     env.adp_value, env.evaluatemode = 1., not training
     # Offer-keyed CRN includes run_id: it must be identical across methods.
@@ -125,15 +134,23 @@ def build_env(args, seed, method, *, training):
     return env
 
 
-def build_pair(env, *, replay_buffer_size=5000):
+def build_pair(
+    env,
+    *,
+    replay_buffer_size=5000,
+    checkpoint_replay='none',
+    checkpoint_replay_recent=5000,
+):
     cls = get_value_function_class(env.learner_variant)
     pair = [cls(env=env, num_vehicles=len(env.vehicles), grid_size=env.grid_size,
                 episode_length=env.episode_length, max_requests=10000, neighbour_number=0,
-                replay_buffer_size=replay_buffer_size, checkpoint_replay='none') for _ in range(2)]
+                replay_buffer_size=replay_buffer_size,
+                checkpoint_replay=checkpoint_replay,
+                checkpoint_replay_recent=checkpoint_replay_recent) for _ in range(2)]
     for value in pair:
         value.state_variant = env.state_variant
         value.recourse_variant = env.recourse_variant
-        if env.recourse_variant in {'r1_structured', 'r2', 'r3'}:
+        if env.recourse_variant in CAUSAL_PREDICTOR_VARIANTS:
             value.predictor_variant = 'p0'
             value.freeze_causal_predictors = True
             value.queue_predictor_trained = False
@@ -142,7 +159,16 @@ def build_pair(env, *, replay_buffer_size=5000):
     return attach_pair(env, pair)
 
 
-def rollout(args, env, pair, method, *, training, progress_path=None):
+def rollout(
+    args,
+    env,
+    pair,
+    method,
+    *,
+    training,
+    progress_path=None,
+    capture_random_events=False,
+):
     spec = METHODS[method]
     motion = {'integrated': env.simulate_motion_integrated_control, 'evfirst': env.simulate_motion_evfirst,
               'integrated_repair': env.simulate_motion_integrated_repair}[spec.operating_mode]
@@ -205,9 +231,31 @@ def rollout(args, env, pair, method, *, training, progress_path=None):
         (tuple(key), tuple(sorted(value.items())))
         for key, value in getattr(env, '_last_offer_realizations', {}).items()
     )
+    event_rows = sorted(
+        (tuple(key), float(value))
+        for key, value in getattr(env, '_recourse_random_events', {}).items()
+    )
+    combined_random_rows = {'offers': random_rows, 'events': event_rows}
     stats['random_stream_hash'] = hashlib.sha256(
-        json.dumps(random_rows, default=json_default).encode()
+        json.dumps(combined_random_rows, default=json_default).encode()
     ).hexdigest()
+    stats['random_event_count'] = len(event_rows)
+    def random_stream_name(key):
+        return str(key[7] if key and key[0] == 'normal' else key[-1])
+
+    streams = sorted({random_stream_name(key) for key, _value in event_rows})
+    stats['random_event_stream_hashes'] = {
+        stream: hashlib.sha256(json.dumps([
+            (key, value) for key, value in event_rows
+            if random_stream_name(key) == stream
+        ], default=json_default).encode()).hexdigest()
+        for stream in streams
+    }
+    if capture_random_events:
+        # Kept in memory only by the CRN audit caller and removed before JSON
+        # serialization.  This permits an exact common-event comparison
+        # without bloating production result files with every random draw.
+        stats['_random_event_values'] = dict(event_rows)
     if training:
         stats['optimizer_steps_joint'] = [v.optimizer_steps_joint for v in pair]
         stats['optimizer_steps_edge'] = [v.optimizer_steps_edge for v in pair]
@@ -260,6 +308,8 @@ def main():
     torch.set_num_threads(1)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     summary = dict(arguments=vars(args), runs=[], paired_differences=[],
+                   crn_common_event_checks=[],
+                   evaluation_scope='same_day_new_seed_checkpoint_check',
                    scope='smoke_not_convergence' if args.max_steps else 'full_episode')
     source_paths = [Path(__file__), *sorted((ROOT / 'src').rglob('*.py'))]
     summary['source_sha256'] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
@@ -270,6 +320,8 @@ def main():
             args.date = day
             hashes = set()
             demand_hashes = set()
+            reference_method = None
+            reference_events = None
             for method in args.methods:
                 day_tag = day.replace('-', '')
                 folder = args.output_dir / f'{day_tag}-{method}-{seed}'
@@ -278,7 +330,11 @@ def main():
                 with (folder / 'run.log').open('w') as log, redirect_stdout(log), redirect_stderr(log):
                     env = build_env(args, seed, method, training=True)
                     seed_everything(seed + 100000)
-                    pair = build_pair(env)
+                    pair = build_pair(
+                        env,
+                        checkpoint_replay=args.checkpoint_replay,
+                        checkpoint_replay_recent=args.checkpoint_replay_recent,
+                    )
                     initial_hash = weight_hash(pair)
                     hashes.add(initial_hash)
                     trained = rollout(args, env, pair, method, training=True)
@@ -294,16 +350,26 @@ def main():
                             backend=getattr(env, 'mcmf_backend', 'primal_dual'),
                             graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
                             verify=getattr(env, 'mcmf_verify', True),
+                            strict=getattr(env, 'mcmf_strict', True),
                             cost_scale=getattr(env, 'mcmf_cost_scale', 10_000),
                             target_policy=getattr(env, 'target_solver_policy', 'same_as_rollout_exact'),
                         ),
                     ))
                     evaluation = build_env(args, seed + 90000, method, training=False)
                     pair = attach_pair(evaluation, pair)
-                    expected = rollout(args, evaluation, pair, method, training=False)
+                    expected = rollout(
+                        args, evaluation, pair, method, training=False,
+                        capture_random_events=True,
+                    )
                     restored_env = build_env(args, seed + 90000, method, training=False)
                     restored = build_pair(restored_env)
                     payload = torch.load(folder / 'checkpoint.pt', weights_only=False, map_location='cpu')
+                    if payload.get('checkpoint_schema_version') != 2:
+                        raise ValueError('unsupported paired checkpoint schema')
+                    if len(payload.get('learners', ())) != 2:
+                        raise ValueError('paired checkpoint must contain exactly two learners')
+                    if payload.get('metadata', {}).get('method') != method:
+                        raise ValueError('checkpoint method mismatch before tensor loading')
                     for value, saved in zip(restored, payload['learners']):
                         value.network.load_state_dict(saved['network'])
                         value.target_network.load_state_dict(saved['target'])
@@ -311,7 +377,38 @@ def main():
                             value.optimizer.load_state_dict(saved['optimizer'])
                         value.load_extra_checkpoint_state(saved['extra'])
                     attach_pair(restored_env, restored)
-                    repeated = rollout(args, restored_env, restored, method, training=False)
+                    repeated = rollout(
+                        args, restored_env, restored, method, training=False,
+                        capture_random_events=True,
+                    )
+                    expected_events = expected.pop('_random_event_values')
+                    repeated_events = repeated.pop('_random_event_values')
+                    if expected_events != repeated_events:
+                        raise AssertionError(
+                            'checkpoint inference changed keyed random events'
+                        )
+                    if reference_events is None:
+                        reference_method = method
+                        reference_events = repeated_events
+                    else:
+                        common_keys = set(reference_events) & set(repeated_events)
+                        mismatches = [
+                            key for key in common_keys
+                            if reference_events[key] != repeated_events[key]
+                        ]
+                        if mismatches:
+                            raise AssertionError(
+                                'CRN common-event values differ across methods: '
+                                f'{reference_method} vs {method}, first={mismatches[0]!r}'
+                            )
+                        summary['crn_common_event_checks'].append({
+                            'seed': seed,
+                            'day_id': day,
+                            'baseline': reference_method,
+                            'treatment': method,
+                            'common_event_count': len(common_keys),
+                            'mismatch_count': 0,
+                        })
                     verify_checkpoint_stats(expected, repeated)
                     for key in ('selected_action_trace_hash', 'random_stream_hash'):
                         if expected[key] != repeated[key]:
@@ -342,9 +439,9 @@ def main():
                 raise AssertionError('Paired modes do not share initial neural weights')
             if len(demand_hashes) != 1:
                 raise AssertionError('Paired modes do not share the generated demand stream')
-    for baseline, treatment in [('evfirst_no_repair', 'repair_only'), ('repair_only', 'repair_learning'),
-                                 ('repair_learning', 'recourse_macro'), ('recourse_macro', 'recourse_nested_q2'),
-                                 ('no_repair', 'samitha')]:
+    for baseline, treatment in (
+        *CAUSAL_CONTRASTS, *ARCHITECTURE_CONTRASTS, *DIAGNOSTIC_CONTRASTS
+    ):
         if baseline in args.methods and treatment in args.methods:
             for metric in PAIRED_METRICS:
                 difference = summarize_paired_crn_difference(summary['runs'], metric,

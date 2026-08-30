@@ -25,15 +25,28 @@ def source_run(tmp_path, monkeypatch, methods=('no_repair',)):
         (folder / 'checkpoint.pt').write_bytes(b'checkpoint fixture')
         stats = dict(method=method, steps=4, demand_hash='train')
         runner.engine.save_json(folder / 'training.json', stats)
-        payloads[method] = dict(metadata=dict(method=method, train_date=settings.train_date,
-            test_date=settings.test_date, seed=settings.seed, test_seed=settings.test_seed,
-            initial_weight_hash='initial', trained_weight_hash='trained'),
-            learners=[dict(network={}, target={}, extra={}) for _ in range(2)])
+        spec = runner.METHODS[method]
+        payloads[method] = dict(
+            checkpoint_schema_version=2,
+            metadata=dict(
+                method=method, train_date=settings.train_date,
+                test_date=settings.test_date, seed=settings.seed,
+                test_seed=settings.test_seed, initial_weight_hash='initial',
+                trained_weight_hash='trained',
+                **runner.engine.method_metadata(spec.operating_mode, spec.variant),
+                state_variant=settings.state_variant,
+                learner_variant='optimization_anchored_residual',
+            ),
+            learners=[
+                dict(network={}, target={}, optimizer={}, extra={})
+                for _ in range(2)
+            ],
+        )
     monkeypatch.setattr(runner.engine.torch, 'load', lambda path, **kw: payloads[path.parent.name])
     return source, payloads
 
 
-def test_defaults_cover_existing_seven_not_all_legacy_solver_products():
+def test_defaults_cover_canonical_nine_not_all_legacy_solver_products():
     args = runner.parse_args([])
     assert args.methods == runner.engine.MAIN_METHODS
     assert args.num_vehicles == 200 and args.num_ev == 100

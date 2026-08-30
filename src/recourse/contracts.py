@@ -68,6 +68,9 @@ def evaluate_method_event_contract(
         if method == "evfirst_no_repair_structured":
             zero("aev_optimizer_frozen", "aev_follower_optimizer_steps")
             zero("aev_score_delta_zero", "aev_learned_score_difference_count")
+        else:
+            positive("aev_optimizer_updated", "aev_follower_optimizer_steps")
+            positive("learned_score_changed", "aev_learned_score_difference_count")
     elif method == "repair_only":
         positive("eligible_rejection_present", "eligible_rejected_residual_count")
         positive("same_epoch_repair_present", "same_epoch_aev_assignment_count")
@@ -75,18 +78,24 @@ def evaluate_method_event_contract(
         zero("aev_score_delta_zero", "aev_learned_score_difference_count")
     elif method == "repair_learning":
         positive("eligible_rejection_present", "eligible_rejected_residual_count")
+        positive("same_epoch_repair_present", "same_epoch_aev_assignment_count")
         positive("aev_optimizer_updated", "aev_follower_optimizer_steps")
         positive("learned_score_changed", "aev_learned_score_difference_count")
     elif method == "recourse_macro":
+        positive("eligible_rejection_present", "eligible_rejected_residual_count")
+        positive("same_epoch_repair_present", "same_epoch_aev_assignment_count")
         positive("macro_target_built", "macro_leader_target_count")
         positive("aev_optimizer_updated", "aev_follower_optimizer_steps")
     elif method == "recourse_nested_q2":
+        positive("eligible_rejection_present", "eligible_rejected_residual_count")
+        positive("same_epoch_repair_present", "same_epoch_aev_assignment_count")
         positive("nested_target_built", "nested_leader_target_count")
         positive("follower_provider_queried", "follower_target_query_count")
     elif method == "samitha":
         positive("hold_candidate_present", "hold_candidate_count")
         positive("hold_selected", "hold_selected_count")
         positive("repair_candidate_present", "repair_candidate_rejected_count")
+        positive("repair_assignment_present", "samitha_repair_assignment_count")
         zero("committed_aev_not_reassigned", "committed_aev_reassignment_count")
     return EventContractResult(
         method=method,

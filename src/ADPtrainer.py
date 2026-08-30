@@ -38,6 +38,7 @@ from .recourse.critics import (
     uses_shared_critic,
     wire_recourse_critics,
 )
+from .recourse.config import CAUSAL_PREDICTOR_VARIANTS
 from .recourse.training import training_readiness
 
 
@@ -1525,7 +1526,7 @@ class ADPTrainer:
                     ):
                         if (
                             predictor_name == 'AEV'
-                            and recourse_variant in {'r1_structured', 'r2', 'r3'}
+                            and recourse_variant in CAUSAL_PREDICTOR_VARIANTS
                         ):
                             continue
                         queue_loss = 0.0

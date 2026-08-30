@@ -113,23 +113,54 @@ def attach_pair(env, pair):
 
 
 def weight_hash(pair, *, remove_acceptance=False):
+    """Hash every tensor used by rollout, target, actor, or auxiliary inference."""
     digest = hashlib.sha256()
-    for vf in pair:
-        for module_name in ('network', 'critic2', 'graph_encoder', 'mixer', 'queue_predictor', 'post_demand_predictor'):
+    module_names = (
+        'network', 'critic2', 'target_network', 'target_critic2',
+        'graph_encoder', 'target_graph_encoder', 'mixer', 'target_mixer',
+        'actor', 'queue_predictor', 'target_queue_predictor',
+        'post_demand_predictor', 'target_post_demand_predictor',
+    )
+    acceptance_modules = {'network', 'critic2', 'target_network', 'target_critic2'}
+    for learner_index, vf in enumerate(pair):
+        digest.update(f'learner:{learner_index}'.encode())
+        for module_name in module_names:
             module = getattr(vf, module_name, None)
             if module is None:
                 continue
-            for name, value in module.state_dict().items():
-                tensor = value.detach().cpu()
-                if remove_acceptance and vf.acceptance_input_enabled and module_name in {'network', 'critic2'} and name.endswith('net.0.weight'):
+            for name, value in sorted(module.state_dict().items()):
+                if not hasattr(value, 'detach'):
+                    continue
+                tensor = value.detach().cpu().contiguous()
+                if (remove_acceptance and vf.acceptance_input_enabled
+                        and module_name in acceptance_modules
+                        and name.endswith('net.0.weight')):
                     i = vf.acceptance_input_index
                     tensor = torch.cat([tensor[:, :i], tensor[:, i+2:]], 1)
-                digest.update(module_name.encode() + name.encode() + tensor.numpy().tobytes())
+                digest.update(module_name.encode())
+                digest.update(name.encode())
+                digest.update(str(tuple(tensor.shape)).encode())
+                digest.update(tensor.numpy().tobytes())
+        log_alpha = getattr(vf, 'log_alpha', None)
+        if hasattr(log_alpha, 'detach'):
+            tensor = log_alpha.detach().cpu().contiguous()
+            digest.update(b'log_alpha')
+            digest.update(str(tuple(tensor.shape)).encode())
+            digest.update(tensor.numpy().tobytes())
     return digest.hexdigest()
 
 
 def save_pair(pair, path, metadata):
-    payload = {'metadata': metadata, 'learners': []}
+    payload = {
+        'checkpoint_schema_version': 2,
+        'metadata': metadata,
+        'learners': [],
+        'rng_state': {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+        },
+    }
     for vf in pair:
         payload['learners'].append(dict(network=vf.network.state_dict(), target=vf.target_network.state_dict(),
                                        optimizer=vf.optimizer.state_dict(), extra=vf.extra_checkpoint_state()))
@@ -139,6 +170,10 @@ def save_pair(pair, path, metadata):
 def load_pair(env, learner, path):
     payload = torch.load(path, map_location='cpu', weights_only=False)
     pair = build_pair(env, learner)
+    if payload.get('checkpoint_schema_version') != 2:
+        raise ValueError('unsupported paired checkpoint schema')
+    if len(payload.get('learners', ())) != len(pair):
+        raise ValueError('paired checkpoint learner count mismatch')
     for vf, saved in zip(pair, payload['learners']):
         vf.load_acceptance_checkpoint_state(saved['extra'])
         vf.network.load_state_dict(saved['network'])
@@ -146,6 +181,11 @@ def load_pair(env, learner, path):
         if saved.get('optimizer'):
             vf.optimizer.load_state_dict(saved['optimizer'])
         vf.load_extra_checkpoint_state(saved['extra'])
+    rng_state = payload.get('rng_state', {})
+    if rng_state:
+        random.setstate(rng_state['python'])
+        np.random.set_state(rng_state['numpy'])
+        torch.set_rng_state(rng_state['torch'])
     return attach_pair(env, pair)
 
 

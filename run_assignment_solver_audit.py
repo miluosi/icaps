@@ -10,7 +10,7 @@ import torch
 
 from run_acceptance_ablation import attach_pair, weight_hash
 from run_recourse_audit import build_env, build_pair, rollout
-from run_recourse_day import parse_args as day_args
+from run_recourse_day import parse_args as day_args, validate_checkpoint_payload
 from src.recourse.config import PAPER_METHODS
 
 
@@ -25,6 +25,7 @@ def parse_args(argv=None):
     parser.add_argument('--parquet-path', type=Path, required=True)
     parser.add_argument('--solvers', nargs='+', choices=['exact', 'auction'], default=['exact'])
     parser.add_argument('--backends', nargs='+', choices=['primal_dual', 'ortools', 'gurobi_network'], default=['primal_dual'])
+    parser.add_argument('--target-oracle-backend', choices=['primal_dual', 'ortools', 'gurobi_network'], default='primal_dual')
     parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--verify', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--seeds', nargs='+', type=int, required=True)
@@ -35,6 +36,13 @@ def parse_args(argv=None):
     parser.add_argument('--max-steps', type=int)
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args(argv)
+    if ('auction' in args.solvers
+            and args.recourse_method in {'no_repair', 'samitha'}):
+        parser.error(
+            'Integrated/Samitha use the shared exact stage-0 oracle; '
+            'do not label that rollout as auction until an approximate stage '
+            'adapter exists'
+        )
     if len(set(args.seeds)) != len(args.seeds) or len(set(args.dates)) != len(args.dates):
         parser.error('seeds and dates must be unique')
     return args
@@ -68,12 +76,18 @@ def main(argv=None):
     for seed in args.seeds:
         for day in args.dates:
             for solver in args.solvers:
-                for backend in args.backends:
+                backend_values = args.backends if solver in EXACT_SOLVERS else ['auction']
+                for backend in backend_values:
                     settings = _settings(args, seed, day)
                     env = build_env(settings, seed, args.recourse_method, training=False)
+                    validate_checkpoint_payload(payload, args.recourse_method, env)
                     env.mcmf_solver = solver
                     env.useauction = solver == 'auction'
-                    env.mcmf_backend = backend
+                    env.mcmf_backend = (
+                        backend if solver in EXACT_SOLVERS
+                        else args.target_oracle_backend
+                    )
+                    env.target_oracle_backend = args.target_oracle_backend
                     env.mcmf_graph_reduction = bool(args.graph_reduction)
                     env.mcmf_verify = bool(args.verify)
                     env.target_solver_policy = (
@@ -95,6 +109,10 @@ def main(argv=None):
                     rows.append(dict(
                         method=args.recourse_method, seed=seed, day_id=day,
                         solver=solver, backend=backend,
+                        target_oracle_backend=(
+                            env.mcmf_backend if solver in EXACT_SOLVERS
+                            else args.target_oracle_backend
+                        ),
                         exact=solver in EXACT_SOLVERS,
                         training_during_test=False,
                         graph_reduction=args.graph_reduction, verify=args.verify,

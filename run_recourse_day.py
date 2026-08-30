@@ -21,6 +21,7 @@ from run_acceptance_ablation import attach_pair, json_default, save_pair, seed_e
 from run_recourse_audit import MAIN_METHODS, ROOT, build_env, build_pair, rollout
 from src.recourse.contracts import assert_method_event_contract, evaluate_method_event_contract
 from src.recourse.config import METHODS, method_metadata
+from src.recourse.types import STATE_VARIANTS
 
 
 def parse_args(argv=None):
@@ -37,6 +38,9 @@ def parse_args(argv=None):
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--train-every', type=int, default=10)
     parser.add_argument('--joint-replay-capacity', type=int, default=256)
+    parser.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'], default='recent')
+    parser.add_argument('--checkpoint-replay-recent', type=int, default=5000)
+    parser.add_argument('--state-variant', choices=STATE_VARIANTS, default='joint_state_separate_critics')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--resume', action='store_true', help='Resume completed train/test phase boundaries, not partial epochs')
@@ -54,6 +58,8 @@ def parse_args(argv=None):
         parser.error('Counts and epoch length must be positive')
     if args.joint_replay_capacity < max(2, args.batch_size + 1):
         parser.error('Replay must retain at least one successor in addition to the batch')
+    if args.checkpoint_replay_recent <= 0:
+        parser.error('checkpoint-replay-recent must be positive')
     if args.smoke_steps is not None and args.smoke_steps < args.train_every:
         parser.error('Preflight must reach at least one training update')
     if len(set(args.methods)) != len(args.methods):
@@ -94,6 +100,43 @@ def save_json(path, value):
     temporary.replace(path)
 
 
+def validate_checkpoint_payload(payload, method, env):
+    """Fail before loading tensors when checkpoint semantics do not match."""
+    if payload.get('checkpoint_schema_version') != 2:
+        raise ValueError('unsupported paired checkpoint schema')
+    learners = payload.get('learners', ())
+    if len(learners) != 2:
+        raise ValueError('paired checkpoint must contain exactly two learners')
+    if any(not {'network', 'target', 'optimizer', 'extra'} <= set(row)
+           for row in learners):
+        raise ValueError('paired checkpoint learner payload is incomplete')
+    spec = METHODS[method]
+    expected = {
+        'method': method,
+        **method_metadata(spec.operating_mode, spec.variant),
+        'state_variant': env.state_variant,
+        'learner_variant': env.learner_variant,
+    }
+    metadata = dict(payload.get('metadata', {}))
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise ValueError(
+                f'checkpoint {key} mismatch: {metadata.get(key)!r} != {value!r}'
+            )
+    expected_solver = {
+        'rollout_solver': getattr(env, 'mcmf_solver', 'exact'),
+        'backend': getattr(env, 'mcmf_backend', 'primal_dual'),
+        'graph_reduction': getattr(env, 'mcmf_graph_reduction', True),
+        'verify': getattr(env, 'mcmf_verify', True),
+        'strict': getattr(env, 'mcmf_strict', True),
+        'cost_scale': getattr(env, 'mcmf_cost_scale', 10_000),
+        'target_policy': getattr(env, 'target_solver_policy', 'same_as_rollout_exact'),
+    }
+    if metadata.get('solver_config') != expected_solver:
+        raise ValueError('checkpoint solver configuration mismatch')
+    return metadata
+
+
 def run_worker(args):
     method = args.worker_method
     folder = args.output_dir / method
@@ -104,7 +147,11 @@ def run_worker(args):
         if not (args.resume and trained_path.exists() and checkpoint.exists()):
             env = build_env(args, args.seed, method, training=True)
             seed_everything(args.seed + 100000)
-            pair = build_pair(env, replay_buffer_size=5 * args.joint_replay_capacity)
+            pair = build_pair(
+                env, replay_buffer_size=5 * args.joint_replay_capacity,
+                checkpoint_replay=args.checkpoint_replay,
+                checkpoint_replay_recent=args.checkpoint_replay_recent,
+            )
             initial_hash = weight_hash(pair)
             trained = rollout(args, env, pair, method, training=True, progress_path=folder / 'progress.json')
             trained_hash = weight_hash(pair)
@@ -121,6 +168,7 @@ def run_worker(args):
                     backend=getattr(env, 'mcmf_backend', 'primal_dual'),
                     graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
                     verify=getattr(env, 'mcmf_verify', True),
+                    strict=getattr(env, 'mcmf_strict', True),
                     cost_scale=getattr(env, 'mcmf_cost_scale', 10_000),
                     target_policy=getattr(env, 'target_solver_policy', 'same_as_rollout_exact'),
                 )))
@@ -128,9 +176,14 @@ def run_worker(args):
             del pair, env
             gc.collect()
         trained = json.loads(trained_path.read_text())
-        payload = torch.load(checkpoint, weights_only=False, map_location='cpu')
         env = build_env(args, args.test_seed, method, training=False)
-        pair = build_pair(env, replay_buffer_size=5 * args.joint_replay_capacity)
+        payload = torch.load(checkpoint, weights_only=False, map_location='cpu')
+        validate_checkpoint_payload(payload, method, env)
+        pair = build_pair(
+            env, replay_buffer_size=5 * args.joint_replay_capacity,
+            checkpoint_replay=args.checkpoint_replay,
+            checkpoint_replay_recent=args.checkpoint_replay_recent,
+        )
         for value, saved in zip(pair, payload['learners']):
             value.network.load_state_dict(saved['network'])
             value.target_network.load_state_dict(saved['target'])

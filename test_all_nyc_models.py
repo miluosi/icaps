@@ -28,24 +28,18 @@ import sys
 import time
 from types import SimpleNamespace
 import run_recourse_day as engine
-from src.recourse.config import METHODS
+from src.recourse.config import (
+    METHOD_ALIASES as CANONICAL_METHOD_ALIASES,
+    METHODS,
+    canonical_method,
+)
+from src.recourse.types import STATE_VARIANTS
 from summarize_recourse_day import LABELS, build_report
 
 ROOT = Path(__file__).resolve().parent
 TRAIN_MODELS = tuple(engine.MAIN_METHODS)
 TEST_MODELS = tuple(engine.MAIN_METHODS)
-METHOD_ALIASES = {
-    'integrated': 'no_repair',
-    'r0': 'evfirst_no_rejection',
-    'r1': 'evfirst_no_repair',
-    'structured_r1': 'evfirst_no_repair_structured',
-    'r1_structured': 'evfirst_no_repair_structured',
-    'r2': 'repair_only',
-    'r3': 'repair_learning',
-    'macro': 'recourse_macro',
-    'recourse_aware': 'recourse_macro',
-    'r4': 'recourse_nested_q2',
-}
+METHOD_ALIASES = dict(CANONICAL_METHOD_ALIASES)
 METHOD_SHORT_NAMES = {
     'no_repair': 'Integrated', 'evfirst_no_rejection': 'R0',
     'evfirst_no_repair': 'R1',
@@ -72,7 +66,8 @@ ACTION_COMMANDS = {
 ENGINE_OPTIONS = (
     'train_date', 'test_date', 'parquet_path', 'num_vehicles', 'num_ev', 'seed',
     'test_seed', 'epoch_length', 'batch_size', 'train_every',
-    'joint_replay_capacity', 'workers', 'output_dir', 'smoke_steps',
+    'joint_replay_capacity', 'checkpoint_replay', 'checkpoint_replay_recent',
+    'state_variant', 'workers', 'output_dir', 'smoke_steps',
     'event_contract_mode',
 )
 METRICS = {
@@ -102,7 +97,12 @@ def save_json(path, value):
 
 def normalize_method_name(value):
     name = str(value).strip().lower().replace('-', '_')
-    return METHOD_ALIASES.get(name, name)
+    if name == 'all':
+        return name
+    try:
+        return canonical_method(name)
+    except ValueError:
+        return name
 
 
 def method_selection(values, available=None):
@@ -226,6 +226,12 @@ def parse_args(argv=None, *, input_fn=None):
         ):
             train.add_argument('--' + name.replace('_', '-'), type=value_type,
                                default=getattr(defaults, name))
+        train.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'],
+                           default=defaults.checkpoint_replay)
+        train.add_argument('--checkpoint-replay-recent', type=int,
+                           default=defaults.checkpoint_replay_recent)
+        train.add_argument('--state-variant', choices=STATE_VARIANTS,
+                           default=defaults.state_variant)
         train.add_argument('--output-dir', type=Path)
         train.add_argument('--resume', action='store_true', help='Only resume completed phase boundaries')
         train.add_argument(
@@ -322,13 +328,25 @@ def prepare_test_only(args, *, copy_files=True):
             raise ValueError(f'{method}: incomplete or mismatched training statistics')
         payload = engine.torch.load(checkpoint, weights_only=False, map_location='cpu')
         metadata = payload['metadata']
+        if payload.get('checkpoint_schema_version') != 2:
+            raise ValueError(f'{method}: unsupported checkpoint schema')
         expected = dict(method=method, train_date=settings.train_date, test_date=settings.test_date,
                         seed=settings.seed, test_seed=settings.test_seed)
         if any(metadata.get(k) != v for k, v in expected.items()):
             raise ValueError(f'{method}: checkpoint metadata differs from manifest')
         if len(payload['learners']) != 2 or any(
-                not {'network', 'target', 'extra'} <= saved.keys() for saved in payload['learners']):
+                not {'network', 'target', 'optimizer', 'extra'} <= saved.keys()
+                for saved in payload['learners']):
             raise ValueError(f'{method}: incompatible checkpoint schema; require paired joint critics')
+        from src.recourse.config import method_metadata
+        spec = METHODS[method]
+        expected_axes = {
+            **method_metadata(spec.operating_mode, spec.variant),
+            'state_variant': settings.state_variant,
+            'learner_variant': 'optimization_anchored_residual',
+        }
+        if any(metadata.get(key) != value for key, value in expected_axes.items()):
+            raise ValueError(f'{method}: checkpoint assignment axes differ from manifest')
         if not metadata.get('trained_weight_hash') or not metadata.get('initial_weight_hash'):
             raise ValueError(f'{method}: checkpoint lacks weight verification metadata')
         del payload
@@ -363,7 +381,11 @@ def run_training_worker(settings):
     with (folder / 'run.log').open('a', buffering=1) as log, redirect_stdout(log), redirect_stderr(log):
         env = engine.build_env(settings, settings.seed, method, training=True)
         engine.seed_everything(settings.seed + 100000)
-        pair = engine.build_pair(env, replay_buffer_size=5 * settings.joint_replay_capacity)
+        pair = engine.build_pair(
+            env, replay_buffer_size=5 * settings.joint_replay_capacity,
+            checkpoint_replay=settings.checkpoint_replay,
+            checkpoint_replay_recent=settings.checkpoint_replay_recent,
+        )
         initial_hash = engine.weight_hash(pair)
         trained = engine.rollout(settings, env, pair, method, training=True,
                                  progress_path=folder / 'progress.json')
@@ -385,6 +407,7 @@ def run_training_worker(settings):
                             backend=getattr(env, 'mcmf_backend', 'primal_dual'),
                             graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
                             verify=getattr(env, 'mcmf_verify', True),
+                            strict=getattr(env, 'mcmf_strict', True),
                             cost_scale=getattr(env, 'mcmf_cost_scale', 10_000),
                             target_policy=getattr(env, 'target_solver_policy', 'same_as_rollout_exact'),
                         ))

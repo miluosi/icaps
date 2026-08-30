@@ -19,6 +19,7 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 
+from src.recourse.config import CAUSAL_PREDICTOR_VARIANTS
 from src.ValueFunction_st_masac_gat import (
     PyTorchChargingValueFunction as _BaseMASAC,
     _MLP,
@@ -461,7 +462,13 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         if not ifEV and str(getattr(self, 'recourse_variant', 'legacy')) in {'r1_structured', 'r2'}:
             return 0.0
         loss = super().train_step(batch_size=batch_size, tau=tau, ifEV=ifEV)
-        self.train_post_demand_predictor(batch_size=batch_size)
+        predictors_frozen = bool(
+            str(getattr(self, 'recourse_variant', 'legacy'))
+            in CAUSAL_PREDICTOR_VARIANTS
+            and getattr(self, 'freeze_causal_predictors', True)
+        )
+        if not predictors_frozen:
+            self.train_post_demand_predictor(batch_size=batch_size)
         return loss
 
     def extra_checkpoint_state(self) -> dict[str, Any]:

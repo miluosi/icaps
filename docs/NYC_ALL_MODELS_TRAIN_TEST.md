@@ -1,17 +1,19 @@
-# NYC 七方法：本地训练、测试与结果保存
+# NYC 九方法：本地训练、测试与结果保存
 
-统一入口：`test_all_nyc_models.py`。不带参数时，默认运行下列七种方法，各训练一天、在另一日期测试一天，200 车（100 EV + 100 AEV）。R1 保留，No repair 就是原 Integrated。
+统一入口：`test_all_nyc_models.py`。不带参数时，默认运行下列九种方法，各训练一天、在另一日期测试一天，200 车（100 EV + 100 AEV）。R1 保留，No repair 就是原 Integrated。
 
 现在也支持 `--action train` 仅训练、`--action test` 仅测试、`--action train-test` 连续训练测试，以及 `--interactive` 键盘输入选择。`--mode` 是 `--action` 的等价参数，这里的 mode 指执行阶段，不是 integrated/evfirst 分配架构。
 
 ## “所有模型”的范围
 
-这里按本轮约定指七种 recourse 方法，不是旧脚本中所有 solver × 所有历史神经网络的笛卡尔积：
+这里按本轮约定指九种 canonical assignment/recourse 方法，不是旧脚本中所有 solver × 所有历史神经网络的笛卡尔积：
 
 | CLI 名称 | 方法 | 运行模式 | Recourse variant |
 | --- | --- | --- | --- |
 | `no_repair` | Integrated / No repair | `integrated` | `legacy` |
+| `evfirst_no_rejection` | R0，EV-first、禁止拒单 | `evfirst` | `r0` |
 | `evfirst_no_repair` | R1，EV-first 无补救 | `evfirst` | `r1` |
+| `evfirst_no_repair_structured` | C0，structured no-repair 因果基线 | `evfirst` | `r1_structured` |
 | `repair_only` | R2，仅物理补救，AEV follower 不学习 | `evfirst` | `r2` |
 | `repair_learning` | R3，补救学习，leader 无补救 credit | `evfirst` | `r3` |
 | `recourse_macro` | Macro recourse-aware | `evfirst` | `recourse_macro` |
@@ -22,23 +24,25 @@
 
 | 别名 | 规范方法 | 训练函数 | Motion 函数 |
 | --- | --- | --- | --- |
-| Integrated | `no_repair` | `train_integrated` | `NYCEnvironment.simulate_motion` |
+| Integrated | `no_repair` | `train_integrated` | `NYCEnvironment.simulate_motion_integrated_control` |
+| R0 | `evfirst_no_rejection` | `train_r0` | `NYCEnvironment.simulate_motion_evfirst` |
 | R1 | `evfirst_no_repair` | `train_r1` | `NYCEnvironment.simulate_motion_evfirst` |
+| C0 | `evfirst_no_repair_structured` | `train_structured_r1` | `NYCEnvironment.simulate_motion_evfirst` |
 | R2 | `repair_only` | `train_r2` | `NYCEnvironment.simulate_motion_evfirst` |
 | R3 | `repair_learning` | `train_r3` | `NYCEnvironment.simulate_motion_evfirst` |
 | Macro | `recourse_macro` | `train_macro` | `NYCEnvironment.simulate_motion_evfirst` |
 | R4 | `recourse_nested_q2` | `train_r4` | `NYCEnvironment.simulate_motion_evfirst` |
 | Samitha | `samitha` | `train_samitha` | `NYCEnvironment.simulate_motion_integrated_repair` |
 
-这些训练函数是显式、可测试的命名入口，最终都调用同一个经过验证的 `run_training_worker`，再由所选配置决定物理补救、credit/target 和 motion；不是复制七份训练算法。
+这些训练函数是显式、可测试的命名入口，最终都调用同一个经过验证的 `run_training_worker`，再由所选配置决定物理补救、credit/target 和 motion；不是复制九份训练算法。
 
-七种方法统一使用 `optimization_anchored_residual` 和 `joint_state_separate_critics`，便于比较 repair/credit。**本脚本不声称覆盖 Full-Q、所有历史 MASAC 网络或所有非学习基线。** 项目原有这些模式未删除，也未修改。
+九种方法默认使用 `optimization_anchored_residual` 和 `joint_state_separate_critics`，便于比较 repair/credit；状态实验可通过 `--state-variant` 显式改变信息集。**本脚本不声称覆盖 Full-Q、所有历史 MASAC 网络或所有非学习基线。** 项目原有这些模式未删除，也未修改。
 
 ## 与 ADP/NYC train/test 的关系
 
 参考 `src/ADPtrainer.py`、`src/NYCtrainer.py`、`run_nyctrainer.py`、`test_nyc_model.py` 的“环境 → 分配 → env.step → 按频率训练 → 保存/加载 → 独立评估”流程。
 
-实际复用 `run_recourse_day.py` 和 `run_recourse_audit.py` 的实验引擎：同一个 `NYCEnvironment`、生产 value-function 类、joint replay/target/train_step 和同一套七方法配置。不是重写 reward、target 或 recourse 算法，也不是直接调用旧脚本的完整训练主循环。生产 NYCTrainer 的 motion 选择映射另有回归测试核对。
+实际复用 `run_recourse_day.py` 和 `run_recourse_audit.py` 的实验引擎：同一个 `NYCEnvironment`、生产 value-function 类、joint replay/target/train_step 和同一套九方法配置。不是重写 reward、target 或 recourse 算法，也不是直接调用旧脚本的完整训练主循环。生产 NYCTrainer 的 motion 选择映射另有回归测试核对。
 
 不同于旧 `test_nyc_model.py` 的 `ADP-MCMF-FT`，此入口没有 test-time fine-tuning：测试设置 `evaluatemode=True`，不调用 `train_step`，加载后的模型权重 hash 必须等于训练保存值，且测试结束不得改变。
 
@@ -68,7 +72,7 @@ python test_all_nyc_models.py --list-models
 
 # 仅训练指定方法，保存 checkpoint 后结束
 python test_all_nyc_models.py --action train \
-  --train-models no_repair evfirst_no_repair repair_only repair_learning recourse_macro recourse_nested_q2 samitha \
+  --train-models no_repair evfirst_no_rejection evfirst_no_repair evfirst_no_repair_structured repair_only repair_learning recourse_macro recourse_nested_q2 samitha \
   --output-dir results/nyc_all_models/train-selected
 
 # 只测试已有训练结果中的指定子集，不重新训练
@@ -91,10 +95,10 @@ python test_all_nyc_models.py --action train --train-models no_repair samitha --
 
 等价子命令：`train` / `train-only`、`test` / `test-only`、`train-test`。原来的命令仍可使用。
 
-代码中的 `TRAIN_MODELS` 和 `TEST_MODELS` 从当前七方法注册列表取得，并分别用于 `train.add_argument(... choices=...)` 和 `test.add_argument(... choices=...)`：
+代码中的 `TRAIN_MODELS` 和 `TEST_MODELS` 从当前九方法注册列表取得，并分别用于 `train.add_argument(... choices=...)` 和 `test.add_argument(... choices=...)`：
 
 - 训练或训练后测试：`--train-models`，等价于 `--models` / `--methods`；默认 `all`。
-- 仅测试：`--test-models`，等价于 `--models` / `--methods`；默认来源目录中全部方法，不要求目录必须包含七个模型。
+- 仅测试：`--test-models`，等价于 `--models` / `--methods`；默认来源目录中全部方法，不要求目录必须包含九个模型。
 - `--r` 是相同列表的短参数；支持 `R1`、`R2`、`R3`、`R4`（不区分大小写），分别映射到 `evfirst_no_repair`、`repair_only`、`repair_learning`、`recourse_nested_q2`。另支持 `integrated`、`macro`、`recourse-aware`、`samitha`。
 - `all` 只能单独使用；方法名、编号冲突、重复方法和与执行阶段不匹配的参数会报错，不默默回退到默认训练。
 - `train-test` 使用同一训练/测试列表。需要训练全部、测试其中一部分时，分两次使用上面的 `train` 和 `test` 命令。
@@ -114,7 +118,7 @@ python test_all_nyc_models.py --interactive --dry-run
 
 真正执行前需要输入 `yes` 确认；直接回车取消，不创建或复制实验文件。只有显式 `--interactive` 才会询问，批处理和后台 worker 不会等待键盘输入。输入 `q` 可在操作选择时退出。
 
-### 1. 七方法完整训练一天、测试一天
+### 1. 九方法完整训练一天、测试一天
 
 ```bash
 python test_all_nyc_models.py train-test \
@@ -126,7 +130,7 @@ python test_all_nyc_models.py train-test \
 
 输出目录必须是新目录，防止覆盖既有实验。不指定目录时自动生成带微秒时间戳的目录。
 
-`--models all` 是默认；也可以选择子集，例如 `--models no_repair repair_only recourse_macro samitha`。`--methods` 是等价参数。用 `python test_all_nyc_models.py list` 查看全部七个预设。
+`--models all` 是默认；也可以选择子集，例如 `--models no_repair repair_only recourse_macro samitha`。`--methods` 是等价参数。用 `python test_all_nyc_models.py list` 查看全部九个预设。
 
 ### 2. 先检查参数，或执行短程运行检查
 
@@ -183,7 +187,7 @@ output-dir/
   metrics.csv              同一核心指标的 CSV 表，可直接用表格软件读取
   REPORT.md                可读表格、充电次数、验证结果与限制
   execution.json           train-only/test-only 执行阶段、训练来源/入口版本
-  no_repair/               其余六种方法各有同样目录
+  no_repair/               其余八种方法各有同样目录
     checkpoint.pt          两个 critic 及关联网络状态
     training.json          已完成训练阶段的统计和诊断
     training_result.json   仅 train-only：训练完成记录，明确不含 testing
@@ -203,7 +207,7 @@ output-dir/
 - `aev_completions_after_rejection`：拒单后由 AEV 完成，可能包括后续 epoch 的 rescue，不能与同轮补救数混淆。
 - `ev_charging_sessions` / `aev_charging_sessions`：保留 EV/AEV 充电次数。
 
-一日训练、一日测试、单 seed 只能检查运行和本次表现，不能证明收敛或统计显著优势。R1→R2→R3→Macro 与 Integrated→Samitha 是两条不同的比较路径。
+一日训练、一日测试、单 seed 只能检查运行和本次表现，不能证明收敛或统计显著优势。主要因果路径是 C0（structured no-repair）→R2→R3→Macro→R4；learned R1 是诊断对照，Integrated→Samitha 是另一条架构比较路径。
 
 ## 本地验证
 
@@ -212,6 +216,6 @@ python -m pytest -q tests/test_all_nyc_models_runner.py tests/test_recourse_day.
 python -m pytest -q
 ```
 
-新增测试覆盖：七方法映射、日期/seed 泄漏、参数校验、dry-run 无执行、缺失 checkpoint 不训练、错误 checkpoint/数据拒绝、仅测试阶段复制、来源不覆盖、进度不冒充最终结果、失败状态保留、负 reward / completed / recourse / 充电统计语义。
+新增测试覆盖：九方法映射、日期/seed 泄漏、参数校验、dry-run 无执行、缺失 checkpoint 不训练、错误 checkpoint/数据拒绝、仅测试阶段复制、来源不覆盖、进度不冒充最终结果、失败状态保留、负 reward / completed / recourse / 充电统计语义。
 
 命令接口补充覆盖：train/test/action/mode 等价写法、训练/测试列表别名、交互编号/名称/取消、仅训练 worker 不创建测试环境、仅训练报告不声称测试通过、中断时清理本次子进程。命令接口修改只做参数和执行分支的本地测试，没有重新启动全天实验。

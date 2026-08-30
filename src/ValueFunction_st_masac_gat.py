@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from src.recourse.config import CAUSAL_PREDICTOR_VARIANTS
 from src.recourse.replay import PrioritizedJointReplayBuffer
 from src.recourse.target_builder import RecourseTargetBuilder
 from src.recourse.types import (
@@ -2449,7 +2450,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         edge_tensor, type_weight, _ = self._edge_tensor_from_experience(
             exp,
             target_context=target_context,
-            state_snapshot=graph.state,
+            state_snapshot=exp["state_snapshot"],
         )
         critic1 = self.target_network if target_context else self.network
         critic2 = self.target_critic2 if target_context else self.critic2
@@ -2508,7 +2509,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 edge_tensor, type_weight, _ = provider._edge_tensor_from_experience(
                     exp,
                     target_context=target_context,
-                    state_snapshot=graph.state,
+                    state_snapshot=exp["state_snapshot"],
                 )
                 edge_rows.append(edge_tensor.squeeze(0))
                 type_rows.append(type_weight.reshape(()))
@@ -3095,6 +3096,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             )
             used_indices.append(int(replay_index))
             diagnostics.append({
+                "transition_id": transition.transition_id,
+                "replay_index": int(replay_index),
+                "rollout_selected_edge_ids": tuple(action.selected_edge_ids),
                 "joint_q1_loss": float(loss1.detach().item()),
                 "joint_q2_loss": float(loss2.detach().item()),
                 "joint_target_full": float(full_target_value),
@@ -3235,7 +3239,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             # auxiliary predictors and diagnostics, but never impose an
             # arbitrary joint-value/edge-count TD target on the same critic.
             predictors_frozen = bool(
-                recourse_variant in {'r1_structured', 'r2', 'r3'}
+                recourse_variant in CAUSAL_PREDICTOR_VARIANTS
                 and getattr(self, 'freeze_causal_predictors', True)
             )
             queue_loss = (

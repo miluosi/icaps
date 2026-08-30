@@ -2420,7 +2420,10 @@ class NYCEnvironment:
             return 0.0, {}
         soc = float(vehicle.get('battery', 1.0))
         d_deadhead = 1.0 if vehicle.get('total_distance', 0) > 100 else 0.0
-        eta = np.random.normal(0, 1.760)
+        from src.recourse.crn import vehicle_normal
+        eta = vehicle_normal(
+            self, vehicle_id, 'charge_decision_utility', 1.760
+        )
         V_swap = 3.5 - 9.5 * soc + 0.69 * d_deadhead + eta
         p_charge = 1.0 / (1.0 + np.exp(-V_swap))
         if not self.charging_manager.stations:
@@ -2447,7 +2450,9 @@ class NYCEnvironment:
                 pop = 3.0
             else:
                 pop = 2.0
-            xi = np.random.normal(0, 1.900)
+            xi = vehicle_normal(
+                self, vehicle_id, f'charge_station_utility:{int(sid)}', 1.900
+            )
             V_i = -0.325 * d_detour + 0.0529 * n_battery - queue_penalty - 1.020 * cost + 0.0927 * pop + xi
             station_utilities[int(sid)] = V_i
         if station_utilities:
@@ -2535,7 +2540,14 @@ class NYCEnvironment:
         prob_dict = self.compute_ev_relocation_distribution(vehicle_id)
         locs = list(prob_dict)
         probs = np.asarray([prob_dict[loc] for loc in locs], dtype=np.float64)
-        chosen = int(np.random.choice(locs, p=probs))
+        draw = self._charge_uniform(vehicle_id, 'relocation_destination')
+        cumulative = 0.0
+        chosen = int(locs[-1])
+        for location, probability in zip(locs, probs):
+            cumulative += float(probability)
+            if draw <= cumulative:
+                chosen = int(location)
+                break
         return chosen, prob_dict
 
     def _sample_ev_default_relocation_target(self, vehicle_id: int) -> int:

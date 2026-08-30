@@ -1045,8 +1045,12 @@ class ChargingIntegratedEnvironment(Environment):
         soc = float(vehicle.get('battery', 1.0))
         # d_deadhead: 1 if cumulative distance exceeds threshold (100 grid units ≈ heavy usage day)
         d_deadhead = 1.0 if vehicle.get('total_distance', 0) > 100 else 0.0
-        # η ~ N(0, 1.760²): state-dependence noise drawn once per decision window
-        eta = np.random.normal(0, 1.760)
+        # Event-keyed under CRN so different policies receive the same charge
+        # utility shock whenever the physical decision event is common.
+        from src.recourse.crn import vehicle_normal
+        eta = vehicle_normal(
+            self, vehicle_id, 'charge_decision_utility', 1.760
+        )
 
         V_swap = 3.5 - 9.5 * soc + 0.69 * d_deadhead + eta
         p_charge = 1.0 / (1.0 + np.exp(-V_swap))
@@ -1080,8 +1084,11 @@ class ChargingIntegratedEnvironment(Environment):
                 pop = 3.0
             else:
                 pop = 2.0
-            # ξ_i ~ N(0, 1.900²): station-specific noise
-            xi = np.random.normal(0, 1.900)
+            # Station id is part of the stream name: enumeration/order changes
+            # cannot move a shock from one station to another.
+            xi = vehicle_normal(
+                self, vehicle_id, f'charge_station_utility:{int(sid)}', 1.900
+            )
 
             V_i = (-0.325 * d_detour + 0.0529 * n_battery
                    - 0.111 * l_queue - 1.020 * cost
@@ -1187,7 +1194,14 @@ class ChargingIntegratedEnvironment(Environment):
         prob_dict = self.compute_ev_relocation_distribution(vehicle_id)
         locs = list(prob_dict)
         probs = np.asarray([prob_dict[loc] for loc in locs], dtype=np.float64)
-        chosen = int(np.random.choice(locs, p=probs))
+        draw = self._charge_uniform(vehicle_id, 'relocation_destination')
+        cumulative = 0.0
+        chosen = int(locs[-1])
+        for location, probability in zip(locs, probs):
+            cumulative += float(probability)
+            if draw <= cumulative:
+                chosen = int(location)
+                break
         return chosen, prob_dict
 
     def _sample_ev_default_relocation_target(self, vehicle_id: int) -> int:

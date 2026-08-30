@@ -13,6 +13,22 @@ TARGET_SOLVER_POLICIES = (
 )
 OBJECTIVE_POLICY = "execution_reward_with_separate_service_loss_metrics"
 
+# Main causal arms share identical auxiliary inputs. Only physical repair,
+# repair residual learning, or leader-credit construction may change.
+CAUSAL_PREDICTOR_VARIANTS = frozenset({
+    "r1_structured", "r2", "r3", "recourse_macro", "r4",
+})
+CAUSAL_CONTRASTS = (
+    ("evfirst_no_repair_structured", "repair_only"),
+    ("repair_only", "repair_learning"),
+    ("repair_learning", "recourse_macro"),
+    ("recourse_macro", "recourse_nested_q2"),
+)
+ARCHITECTURE_CONTRASTS = (("no_repair", "samitha"),)
+DIAGNOSTIC_CONTRASTS = (
+    ("evfirst_no_repair_structured", "evfirst_no_repair"),
+)
+
 
 @dataclass(frozen=True)
 class RecourseMethod:
@@ -81,10 +97,10 @@ VARIANT_ALIASES.update(
     {alias: METHODS[name].variant for alias, name in METHOD_ALIASES.items()
      if name in METHODS and METHODS[name].operating_mode == "evfirst"}
 )
-VARIANT_CHOICES = (
+VARIANT_CHOICES = tuple(dict.fromkeys((
     "legacy", "r0", "r1", "r1_structured", "r2", "r3", "r4",
-    "recourse_macro", *PAPER_METHODS,
-)
+    "recourse_macro", *VARIANT_ALIASES.keys(),
+)))
 
 
 @dataclass(frozen=True)

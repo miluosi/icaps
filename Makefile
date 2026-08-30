@@ -23,7 +23,7 @@ smoke-recourse-nyc:
 	bash scripts/smoke_recourse_nyc.sh
 
 assignment-audit:
-	python -m pytest -q tests/test_assignment_audit_repairs.py tests/test_all_nyc_models_runner.py tests/test_recourse_day.py
+	python -m pytest -q tests/test_remaining_assignment_fixes.py tests/test_assignment_audit_repairs.py tests/test_all_nyc_models_runner.py tests/test_recourse_day.py
 
 assignment-production-smoke:
 	python -m pytest -q tests/test_assignment_method_production_matrix.py
