@@ -8,6 +8,7 @@ from typing import Any
 SHARED_CRITIC_STATE_VARIANTS = {
     "joint_state_shared_critic",
     "fleet_local_shared_critic",
+    "strict_fleet_local_shared_critic",
 }
 
 

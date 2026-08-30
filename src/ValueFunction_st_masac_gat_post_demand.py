@@ -458,7 +458,7 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         return values.astype(np.float32).tolist()
 
     def train_step(self, batch_size: int = 64, tau: float | None = None, ifEV: bool = False) -> float:
-        if not ifEV and str(getattr(self, 'recourse_variant', 'legacy')) == 'r2':
+        if not ifEV and str(getattr(self, 'recourse_variant', 'legacy')) in {'r1_structured', 'r2'}:
             return 0.0
         loss = super().train_step(batch_size=batch_size, tau=tau, ifEV=ifEV)
         self.train_post_demand_predictor(batch_size=batch_size)

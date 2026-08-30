@@ -349,6 +349,8 @@ def main():
                 recourse_variant=args.recourse_variant,
                 rejection_logit_shift=args.rejection_logit_shift,
                 common_random_numbers=args.common_random_numbers,
+                integrated_repair_hold_enabled=args.integrated_repair_hold_enabled,
+                target_solver_policy=args.target_solver_policy,
                 state_variant=args.state_variant,
                 learner_variant=args.learner_variant,
                 ev_acceptance_feature=args.ev_acceptance_feature,

@@ -1,5 +1,14 @@
-"""Classify the returned execution reward, never substitute option scores."""
+"""Classify returned execution reward under the paper's explicit Option A.
+
+The optimized objective is cumulative vehicle execution reward. Lost,
+unresolved, and recovered orders remain separately reported service metrics;
+they are not silently converted into a non-vehicle cash-flow penalty.
+"""
+from .config import OBJECTIVE_POLICY
 from .types import ActionType, RewardLedger
+
+
+REWARD_OBJECTIVE_POLICY = OBJECTIVE_POLICY
 
 
 def build_reward_ledger(env, pending, rewards, lifecycle):

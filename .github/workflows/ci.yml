@@ -27,3 +27,5 @@ jobs:
         run: make smoke-nyc
       - name: End-to-end recourse learner smokes
         run: make smoke-recourse
+      - name: Canonical assignment matrix and production runner dry-run
+        run: make assignment-matrix-smoke

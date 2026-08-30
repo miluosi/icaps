@@ -5,7 +5,10 @@ from pathlib import Path
 
 
 LABELS = {
-    'no_repair': 'Integrated (No repair)', 'evfirst_no_repair': 'R1',
+    'no_repair': 'Integrated (No repair)',
+    'evfirst_no_rejection': 'R0 (No rejection)',
+    'evfirst_no_repair': 'R1 (Learned no repair)',
+    'evfirst_no_repair_structured': 'C0 (Structured no repair)',
     'repair_only': 'Repair Only (R2)', 'repair_learning': 'Repair Learning (R3)',
     'recourse_macro': 'Macro Recourse-aware', 'recourse_nested_q2': 'Nested R4',
     'samitha': 'Samitha',
@@ -32,7 +35,7 @@ def build_report(summary, manifest):
         '## 运行与数据口径', '',
         '- 数据来源：[NYC TLC 原始 Yellow Taxi 数据](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)。使用完整日期，不再使用旧的 08:00–10:00 sample。',
         f"- 沿用项目默认 Manhattan-only 清洗与需求范围、2 km 接驾限制、{manifest['arguments']['epoch_length']:g} 秒 epoch、真实随机拒单；拒单 predictor 特征仍关闭。",
-        '- 学习器：`optimization_anchored_residual`；状态：`joint_state_separate_critics`；分配：exact MCMF。这里的七方法不是七种不同神经网络。',
+        '- 学习器：`optimization_anchored_residual`；状态：`joint_state_separate_critics`；分配：exact MCMF。这里的方法是 recourse 配置与因果控制，不是不同神经网络。',
         ('- 各方法使用相同初始神经网络权重、训练需求和配对 CRN。仅保存训练 checkpoint，没有测试数据或测试权重检查。' if train_only else
          '- 各方法使用相同初始神经网络权重、训练需求、测试需求和配对 CRN。测试从磁盘 checkpoint 加载，且验证测试不改变网络权重。'),
         f"- 每 {manifest['arguments']['train_every']} 步训练，joint batch={manifest['arguments']['batch_size']}，joint replay 容量={manifest['arguments']['joint_replay_capacity']}；测试无梯度更新。", '',

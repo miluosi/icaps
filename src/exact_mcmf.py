@@ -278,11 +278,10 @@ def build_reduced_problem(
             foldable = np.asarray(sorted(next_foldable), dtype=np.int64)
 
     else:
-        if fallback_int is None or fallback_values is None:
-            raise ValueError("unreduced exact graph requires explicit fallback values")
         shared = active_actions.copy()
         baseline_action.fill(-1)
-        baseline_value_raw[:] = np.asarray(fallback_values, dtype=np.float64)
+        if fallback_values is not None:
+            baseline_value_raw[:] = np.asarray(fallback_values, dtype=np.float64)
         row_actions = [
             np.flatnonzero(feasible[vehicle] & shared).astype(
                 np.int64,

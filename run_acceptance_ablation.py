@@ -143,6 +143,8 @@ def load_pair(env, learner, path):
         vf.load_acceptance_checkpoint_state(saved['extra'])
         vf.network.load_state_dict(saved['network'])
         vf.target_network.load_state_dict(saved['target'])
+        if saved.get('optimizer'):
+            vf.optimizer.load_state_dict(saved['optimizer'])
         vf.load_extra_checkpoint_state(saved['extra'])
     return attach_pair(env, pair)
 

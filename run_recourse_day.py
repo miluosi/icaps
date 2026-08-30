@@ -1,4 +1,4 @@
-"""All seven recourse methods: one complete NYC training day, one held-out day.
+"""Canonical recourse methods: one NYC training day and one held-out day.
 
 Run workers in separate processes so complete replay graphs are freed between
 methods. Checkpoints are loaded before testing; evaluation never trains.
@@ -19,6 +19,8 @@ import torch
 
 from run_acceptance_ablation import attach_pair, json_default, save_pair, seed_everything, weight_hash
 from run_recourse_audit import MAIN_METHODS, ROOT, build_env, build_pair, rollout
+from src.recourse.contracts import assert_method_event_contract, evaluate_method_event_contract
+from src.recourse.config import METHODS, method_metadata
 
 
 def parse_args(argv=None):
@@ -39,6 +41,7 @@ def parse_args(argv=None):
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--resume', action='store_true', help='Resume completed train/test phase boundaries, not partial epochs')
     parser.add_argument('--smoke-steps', type=int, default=None, help='Explicit preflight only; omit for full 24h days')
+    parser.add_argument('--event-contract-mode', choices=['required', 'record', 'off'], default='required')
     parser.add_argument('--worker-method', choices=MAIN_METHODS, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if date.fromisoformat(args.train_date) == date.fromisoformat(args.test_date):
@@ -107,9 +110,20 @@ def run_worker(args):
             trained_hash = weight_hash(pair)
             if initial_hash == trained_hash:
                 raise AssertionError('Training did not change any model weights')
+            spec = METHODS[method]
             save_pair(pair, checkpoint, dict(method=method, initial_weight_hash=initial_hash,
                 trained_weight_hash=trained_hash, train_date=args.train_date, test_date=args.test_date,
-                seed=args.seed, test_seed=args.test_seed))
+                seed=args.seed, test_seed=args.test_seed,
+                **method_metadata(spec.operating_mode, spec.variant),
+                state_variant=env.state_variant, learner_variant=env.learner_variant,
+                solver_config=dict(
+                    rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
+                    backend=getattr(env, 'mcmf_backend', 'primal_dual'),
+                    graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
+                    verify=getattr(env, 'mcmf_verify', True),
+                    cost_scale=getattr(env, 'mcmf_cost_scale', 10_000),
+                    target_policy=getattr(env, 'target_solver_policy', 'same_as_rollout_exact'),
+                )))
             save_json(trained_path, trained)
             del pair, env
             gc.collect()
@@ -120,6 +134,8 @@ def run_worker(args):
         for value, saved in zip(pair, payload['learners']):
             value.network.load_state_dict(saved['network'])
             value.target_network.load_state_dict(saved['target'])
+            if saved.get('optimizer'):
+                value.optimizer.load_state_dict(saved['optimizer'])
             value.load_extra_checkpoint_state(saved['extra'])
         pair = attach_pair(env, pair)
         before = weight_hash(pair)
@@ -131,7 +147,18 @@ def run_worker(args):
         expected_steps = args.max_steps or round(86400 / args.epoch_length)
         if trained['steps'] != expected_steps or tested['steps'] != expected_steps:
             raise AssertionError('A requested full training/test day ended early')
+        contract_stats = dict(tested)
+        for key in (
+            'aev_follower_optimizer_steps', 'aev_stage_graph_count',
+            'aev_learned_score_difference_count', 'macro_leader_target_count',
+            'nested_leader_target_count', 'follower_target_query_count',
+        ):
+            contract_stats[key] = trained.get(key, 0)
+        contract = evaluate_method_event_contract(method, contract_stats)
+        if args.event_contract_mode == 'required':
+            assert_method_event_contract(method, contract_stats)
         result = dict(training=trained, testing=tested,
+            event_contract=contract.as_dict(),
             checkpoint_loaded=True, test_weights_unchanged=True, **payload['metadata'])
         save_json(folder / 'results.json', result)
 

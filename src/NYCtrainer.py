@@ -43,7 +43,9 @@ class NYCTrainer:
         if transportation_mode == "integrated_repair":
             return env.simulate_motion_integrated_repair
         if transportation_mode == "integrated":
-            return env.simulate_motion
+            return getattr(
+                env, "simulate_motion_integrated_control", env.simulate_motion
+            )
         if transportation_mode == "evfirst":
             return env.simulate_motion_evfirst
         if transportation_mode == "aevfirst":
@@ -843,6 +845,8 @@ class NYCTrainer:
         recourse_variant: str = "legacy",
         rejection_logit_shift: float = 0.0,
         common_random_numbers: bool = False,
+        integrated_repair_hold_enabled: bool = True,
+        target_solver_policy: str = "same_as_rollout_exact",
         state_variant: str = "joint_state_separate_critics",
         learner_variant: str = "legacy",
         ev_acceptance_feature: str = "off",
@@ -909,6 +913,8 @@ class NYCTrainer:
             recourse_variant=recourse_variant,
             rejection_logit_shift=rejection_logit_shift,
             common_random_numbers=common_random_numbers,
+            integrated_repair_hold_enabled=integrated_repair_hold_enabled,
+            target_solver_policy=target_solver_policy,
             only_manhattan_zones=only_manhattan_zones,
             battery_consumption_ratio=battery_consumption_ratio,
             initial_battery_mean=initial_battery_mean,
@@ -926,6 +932,8 @@ class NYCTrainer:
         env.mcmf_cost_scale = int(mcmf_cost_scale)
         env.mcmf_graph_reduction = bool(mcmf_graph_reduction)
         env.mcmf_verify = bool(mcmf_verify)
+        env.integrated_repair_hold_enabled = bool(integrated_repair_hold_enabled)
+        env.target_solver_policy = str(target_solver_policy)
         env.auction_use_gpu = bool(auction_use_gpu)
         env.auction_epsilon = float(auction_epsilon)
         env.auction_max_rounds = auction_max_rounds

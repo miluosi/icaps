@@ -1,4 +1,4 @@
-"""NYC 七方法统一入口：仅训练、仅测试、跨日 train/test、交互选择及结果汇总。
+"""Legacy filename shim for the NYC recourse-architecture experiment runner.
 
 Examples (run from the repository root):
   python test_all_nyc_models.py --action train --train-models no_repair samitha
@@ -10,7 +10,7 @@ Examples (run from the repository root):
 
 This is an executable experiment runner, not a pytest test module. It reuses
 run_recourse_day's NYC/ADP simulation, joint-critic learning and checkpoint path.
-The seven methods are recourse presets, not a Cartesian product of every legacy
+The methods are recourse presets, not a Cartesian product of every legacy
 solver and value-function architecture in test_nyc_model.py.
 """
 import argparse
@@ -36,7 +36,10 @@ TRAIN_MODELS = tuple(engine.MAIN_METHODS)
 TEST_MODELS = tuple(engine.MAIN_METHODS)
 METHOD_ALIASES = {
     'integrated': 'no_repair',
+    'r0': 'evfirst_no_rejection',
     'r1': 'evfirst_no_repair',
+    'structured_r1': 'evfirst_no_repair_structured',
+    'r1_structured': 'evfirst_no_repair_structured',
     'r2': 'repair_only',
     'r3': 'repair_learning',
     'macro': 'recourse_macro',
@@ -44,13 +47,17 @@ METHOD_ALIASES = {
     'r4': 'recourse_nested_q2',
 }
 METHOD_SHORT_NAMES = {
-    'no_repair': 'Integrated', 'evfirst_no_repair': 'R1',
+    'no_repair': 'Integrated', 'evfirst_no_rejection': 'R0',
+    'evfirst_no_repair': 'R1',
+    'evfirst_no_repair_structured': 'C0',
     'repair_only': 'R2', 'repair_learning': 'R3',
     'recourse_macro': 'Macro', 'recourse_nested_q2': 'R4', 'samitha': 'Samitha',
 }
 MOTION_FUNCTIONS = {
-    'no_repair': 'NYCEnvironment.simulate_motion',
+    'no_repair': 'NYCEnvironment.simulate_motion_integrated_control',
+    'evfirst_no_rejection': 'NYCEnvironment.simulate_motion_evfirst',
     'evfirst_no_repair': 'NYCEnvironment.simulate_motion_evfirst',
+    'evfirst_no_repair_structured': 'NYCEnvironment.simulate_motion_evfirst',
     'repair_only': 'NYCEnvironment.simulate_motion_evfirst',
     'repair_learning': 'NYCEnvironment.simulate_motion_evfirst',
     'recourse_macro': 'NYCEnvironment.simulate_motion_evfirst',
@@ -66,6 +73,7 @@ ENGINE_OPTIONS = (
     'train_date', 'test_date', 'parquet_path', 'num_vehicles', 'num_ev', 'seed',
     'test_seed', 'epoch_length', 'batch_size', 'train_every',
     'joint_replay_capacity', 'workers', 'output_dir', 'smoke_steps',
+    'event_contract_mode',
 )
 METRICS = {
     'recourse_number': 'same_epoch_aev_assignment_count',
@@ -220,6 +228,11 @@ def parse_args(argv=None, *, input_fn=None):
                                default=getattr(defaults, name))
         train.add_argument('--output-dir', type=Path)
         train.add_argument('--resume', action='store_true', help='Only resume completed phase boundaries')
+        train.add_argument(
+            '--event-contract-mode', choices=['required', 'record', 'off'],
+            default=defaults.event_contract_mode,
+            help='required for formal runs; record is suitable for short interface smoke tests',
+        )
         train.add_argument('--dry-run', action='store_true', help='Print configuration; do not train or write results')
         if action == 'train-only':
             train.add_argument('--worker-method', type=normalize_method_name,
@@ -359,9 +372,22 @@ def run_training_worker(settings):
             raise AssertionError('Training did not change any model weights')
         if trained['steps'] != (settings.max_steps or round(86400 / settings.epoch_length)):
             raise AssertionError('Training ended before the requested step count')
+        from src.recourse.config import method_metadata
+        spec = METHODS[method]
         metadata = dict(method=method, initial_weight_hash=initial_hash, trained_weight_hash=trained_hash,
                         train_date=settings.train_date, test_date=settings.test_date,
-                        seed=settings.seed, test_seed=settings.test_seed)
+                        seed=settings.seed, test_seed=settings.test_seed,
+                        **method_metadata(spec.operating_mode, spec.variant),
+                        state_variant=getattr(env, 'state_variant', 'joint_state_separate_critics'),
+                        learner_variant=getattr(env, 'learner_variant', 'optimization_anchored_residual'),
+                        solver_config=dict(
+                            rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
+                            backend=getattr(env, 'mcmf_backend', 'primal_dual'),
+                            graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
+                            verify=getattr(env, 'mcmf_verify', True),
+                            cost_scale=getattr(env, 'mcmf_cost_scale', 10_000),
+                            target_policy=getattr(env, 'target_solver_policy', 'same_as_rollout_exact'),
+                        ))
         checkpoint = folder / 'checkpoint.pt'
         temporary = folder / 'checkpoint.tmp.pt'
         engine.save_pair(pair, temporary, metadata)
@@ -381,8 +407,16 @@ def train_integrated(settings):
     return _train_named_method(settings, 'no_repair')
 
 
+def train_r0(settings):
+    return _train_named_method(settings, 'evfirst_no_rejection')
+
+
 def train_r1(settings):
     return _train_named_method(settings, 'evfirst_no_repair')
+
+
+def train_structured_r1(settings):
+    return _train_named_method(settings, 'evfirst_no_repair_structured')
 
 
 def train_r2(settings):
@@ -407,7 +441,9 @@ def train_samitha(settings):
 
 TRAINING_FUNCTIONS = {
     'no_repair': train_integrated,
+    'evfirst_no_rejection': train_r0,
     'evfirst_no_repair': train_r1,
+    'evfirst_no_repair_structured': train_structured_r1,
     'repair_only': train_r2,
     'repair_learning': train_r3,
     'recourse_macro': train_macro,

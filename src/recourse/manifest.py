@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping
 
 from .metrics import summarize_metric_with_uncertainty
 from .types import REPLAY_SCHEMA_VERSION
-from .config import method_metadata
+from .config import OBJECTIVE_POLICY, method_metadata
 
 
 METRIC_DEFINITIONS = {
@@ -63,7 +63,7 @@ def write_experiment_manifest(
         "recourse_configuration": method_metadata(
             arguments.get('transportation_mode', 'integrated'),
             arguments.get('recourse_variant', 'legacy')),
-        "manifest_version": 2,
+        "manifest_version": 3,
         "git_commit": _git_commit(output_path.parent),
         "replay_schema_version": REPLAY_SCHEMA_VERSION,
         "resolved_config": _json_safe(dict(arguments)),
@@ -85,8 +85,19 @@ def write_experiment_manifest(
         "effective_replay_hyperparameters": _effective_replay_hyperparameters(
             value_functions
         ),
-        "target_builder_version": "solver_consistent_v2",
-        "target_solver_backend": "exact_mcmf_quantized",
+        "target_builder_version": "solver_consistent_v3",
+        "objective_policy": OBJECTIVE_POLICY,
+        "solver_config": _json_safe({
+            "rollout_solver": arguments.get("mcmf_solver", "exact"),
+            "backend": arguments.get("mcmf_backend", "primal_dual"),
+            "graph_reduction": arguments.get("mcmf_graph_reduction", True),
+            "verify": arguments.get("mcmf_verify", True),
+            "cost_scale": arguments.get("mcmf_cost_scale", 10_000),
+            "strict": arguments.get("mcmf_strict", True),
+            "target_policy": arguments.get(
+                "target_solver_policy", "same_as_rollout_exact"
+            ),
+        }),
         "optimizer_budget": _json_safe(
             dict(results.get("optimizer_budget", {}) or {})
         ),

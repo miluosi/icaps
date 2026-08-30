@@ -274,7 +274,7 @@ def test_train_dispatch_only_uses_training_controller(tmp_path, monkeypatch):
 
 
 def test_interactive_numbers_and_names_are_supported():
-    answers = iter(['1', '1, recourse_macro,7', ''])
+    answers = iter(['1', '1, recourse_macro,9', ''])
     args = runner.parse_args(['--interactive', '--dry-run'], input_fn=lambda prompt: next(answers))
     assert args.command == 'train-only'
     assert args.methods == ['no_repair', 'recourse_macro', 'samitha']
@@ -368,7 +368,7 @@ def test_all_current_models_have_explicit_training_and_motion_functions():
     assert runner.TRAINING_FUNCTIONS['recourse_nested_q2'] is runner.train_r4
     assert runner.TRAINING_FUNCTIONS['samitha'] is runner.train_samitha
     assert runner.MOTION_FUNCTIONS['samitha'].endswith('simulate_motion_integrated_repair')
-    assert runner.MOTION_FUNCTIONS['no_repair'].endswith('simulate_motion')
+    assert runner.MOTION_FUNCTIONS['no_repair'].endswith('simulate_motion_integrated_control')
 
 
 @pytest.mark.parametrize('method', runner.TRAIN_MODELS)

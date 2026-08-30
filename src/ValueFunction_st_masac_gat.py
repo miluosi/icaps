@@ -331,7 +331,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         self._owns_joint_replay_payload = True
         self.checkpoint_replay = str(checkpoint_replay)
         self.checkpoint_replay_recent = max(1, int(checkpoint_replay_recent))
-        self.target_builder = RecourseTargetBuilder()
+        self.target_builder = (
+            RecourseTargetBuilder.from_environment(env)
+            if env is not None else RecourseTargetBuilder()
+        )
         self.planning_objective_mode = "learned"
         self.state_variant = "joint_state_shared_critic"
         self.learner_variant = getattr(
@@ -348,6 +351,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         self.queue_loss_weight = 1.0
         self.queue_edge_loss_weight = 1.0
         self.queue_predictor_trained = False
+        # R2/R3 causal arms consume the same frozen P0 auxiliary inputs by
+        # default.  Predictor pretraining can be enabled explicitly only when
+        # an identical frozen checkpoint is loaded into both arms.
+        self.freeze_causal_predictors = True
         self.q_values_history: list[dict[str, float]] = []
         self.training_step = 0
         self.joint_training_step = 0
@@ -2275,8 +2282,22 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         *,
         state_variant: str,
     ) -> dict:
+        observation_state = graph.state.masked(
+            state_variant, vehicle_type=int(edge.vehicle_type)
+        )
         vehicle = next(
-            item for item in graph.state.vehicles if item.vehicle_id == edge.vehicle_id
+            item for item in observation_state.vehicles
+            if item.vehicle_id == edge.vehicle_id
+        )
+        # Compute this scalar from precisely the state view delivered to the
+        # critic.  The old code used the unmasked graph and leaked the online
+        # population of the other fleet into fleet-local ablations.
+        other_vehicles = max(
+            0,
+            sum(
+                item.online for item in observation_state.vehicles
+                if item.vehicle_id != edge.vehicle_id
+            ),
         )
         return {
             "vehicle_id": edge.vehicle_id,
@@ -2289,7 +2310,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             "current_time": graph.state.current_time,
             "battery_level": vehicle.battery,
             "vehicle_idle_time": vehicle.idle_time,
-            "other_vehicles": sum(item.online for item in graph.state.vehicles) - 1,
+            "other_vehicles": other_vehicles,
             "num_requests": len(graph.state.requests),
             "request_value": edge.request_value,
             "target_distance": edge.target_distance,
@@ -2301,7 +2322,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             "rejection_probability": edge.rejection_probability,
             "human_response_mask": edge.human_response_mask,
             "response_model_hash": edge.response_model_hash,
-            "state_snapshot": graph.state,
+            "state_snapshot": observation_state,
             "state_variant": state_variant,
         }
 
@@ -2566,6 +2587,11 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             bool(structured_only),
             model_signature,
             int(graph.objective_cost_scale),
+            str(graph.solver_backend),
+            bool(getattr(graph, 'graph_reduction', True)),
+            bool(getattr(graph, 'solver_verify', True)),
+            str(getattr(graph, 'target_solver_policy', 'fixed_primal_dual_exact')),
+            str(getattr(graph, 'solver_family', 'exact')),
         )
         component_cache = getattr(self, "_target_component_cache", None)
         if component_cache is None:
@@ -2867,7 +2893,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                     float(transition.reward_system if transition.recourse_target_family == "macro_realized" else transition.reward_ev),
                     "ev_leader",
                 )
-            if transition.recourse_variant == "r2":
+            if transition.recourse_variant in {"r1_structured", "r2"}:
                 return None
             return (
                 transition.aev_stage_graph,
@@ -2959,6 +2985,15 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         for transition, replay_index, importance_weight in zip(
             sample.transitions, sample.indices, sample.weights
         ):
+            from src.recourse.config import target_family
+            expected_family = target_family(
+                transition.recourse_variant, transition.mode
+            )
+            if transition.recourse_target_family != expected_family:
+                raise ValueError(
+                    "joint update target family mismatch: "
+                    f"expected={expected_family}, row={transition.recourse_target_family}"
+                )
             fleet = "ev" if ifEV else "aev"
             payload = self._joint_stage_payload(transition, ifEV=ifEV)
             if payload is None:
@@ -3025,7 +3060,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 target_components = self.target_components_for_graph(
                     next_graph,
                     structured_only=(
-                        transition.recourse_variant == "r2"
+                        transition.recourse_variant in {"r1_structured", "r2"}
                         and fleet == "aev"
                     ),
                 )
@@ -3089,6 +3124,21 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                     0.0
                     if target_components is None
                     else target_components.solver_runtime_seconds
+                ),
+                "target_solver_backend": self.target_builder.last_solver_diagnostics.get(
+                    "backend", "not_built"
+                ),
+                "target_solver_policy": self.target_builder.last_solver_diagnostics.get(
+                    "target_policy", "not_built"
+                ),
+                "target_solver_graph_reduction": self.target_builder.last_solver_diagnostics.get(
+                    "graph_reduction", None
+                ),
+                "target_solver_verify": self.target_builder.last_solver_diagnostics.get(
+                    "verify", None
+                ),
+                "selected_edge_trace_hash": self.target_builder.last_solver_diagnostics.get(
+                    "selected_edge_trace_hash", ""
                 ),
                 "joint_target_projection_time": float(
                     0.0
@@ -3172,10 +3222,11 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         return float(loss.detach().item())
 
     def train_step(self, batch_size: int = 64, tau: float | None = None, ifEV: bool = False) -> float:
-        if not ifEV and str(getattr(self, 'recourse_variant', 'legacy')) == 'r2':
+        recourse_variant = str(getattr(self, 'recourse_variant', 'legacy'))
+        if not ifEV and recourse_variant in {'r1_structured', 'r2'}:
             # Repair Only must not update the follower, including auxiliaries.
             return 0.0
-        if str(getattr(self, 'recourse_variant', 'legacy')) in {'r2', 'r3', 'r4', 'recourse_macro'} or str(self.learner_variant) in {
+        if recourse_variant in {'r1_structured', 'r2', 'r3', 'r4', 'recourse_macro'} or str(self.learner_variant) in {
             "optimization_anchored_residual",
             "integrated_directq",
         }:
@@ -3183,9 +3234,15 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             # joint transition.  Legacy edge rows remain available to
             # auxiliary predictors and diagnostics, but never impose an
             # arbitrary joint-value/edge-count TD target on the same critic.
+            predictors_frozen = bool(
+                recourse_variant in {'r1_structured', 'r2', 'r3'}
+                and getattr(self, 'freeze_causal_predictors', True)
+            )
             queue_loss = (
                 self.train_queue_predictor(batch_size=batch_size)
                 if (
+                    not predictors_frozen
+                    and
                     not ifEV
                     or not bool(
                         getattr(self, "_owns_joint_replay_payload", True)
@@ -3221,7 +3278,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 for exp in batch
                 if not (
                     int(exp.get("stage_id", 0) or 0) == 2
-                    and str(exp.get("recourse_variant", "legacy")) == "r2"
+                    and str(exp.get("recourse_variant", "legacy")) in {"r1_structured", "r2"}
                 )
             ]
         if not batch:

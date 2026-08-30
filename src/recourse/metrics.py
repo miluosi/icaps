@@ -79,13 +79,14 @@ def summarize_metric_with_uncertainty(
     *,
     confidence: float = 0.95,
 ) -> dict[str, float | int | str]:
-    """Compute a seed-clustered interval after averaging days within seed."""
+    """Compute uncertainty over independent ``(seed, held-out day)`` clusters."""
 
     observations = [row for row in rows if row.get(metric) is not None]
-    seed_groups: dict[Any, list[float]] = {}
+    cluster_groups: dict[tuple[Any, Any], list[float]] = {}
     for row in observations:
-        seed_groups.setdefault(row.get("seed", 0), []).append(float(row[metric]))
-    values = [sum(group) / len(group) for group in seed_groups.values()]
+        key = (row.get("seed", 0), row.get("day_id", ""))
+        cluster_groups.setdefault(key, []).append(float(row[metric]))
+    values = [sum(group) / len(group) for group in cluster_groups.values()]
     if not values:
         raise ValueError(f"no observations for metric {metric!r}")
     count = len(values)
@@ -119,7 +120,7 @@ def summarize_metric_with_uncertainty(
         "confidence": float(confidence),
         "ci_lower": mean - half_width,
         "ci_upper": mean + half_width,
-        "interval_unit": "seed_mean",
+        "interval_unit": "seed_day_cluster",
     }
 
 
@@ -142,16 +143,14 @@ def summarize_paired_crn_difference(
             continue
         key = (row.get("seed", 0), row.get("day_id", ""))
         by_key.setdefault(key, {})[variant] = float(row[metric])
-    seed_differences: dict[Any, list[float]] = {}
-    for (seed, _day), values in by_key.items():
+    paired_rows = []
+    for (seed, day), values in by_key.items():
         if baseline_variant in values and treatment_variant in values:
-            seed_differences.setdefault(seed, []).append(
-                values[treatment_variant] - values[baseline_variant]
-            )
-    paired_rows = [
-        {"seed": seed, "day_id": "paired", "difference": sum(values) / len(values)}
-        for seed, values in seed_differences.items()
-    ]
+            paired_rows.append({
+                "seed": seed,
+                "day_id": day,
+                "difference": values[treatment_variant] - values[baseline_variant],
+            })
     if not paired_rows:
         raise ValueError("no complete paired CRN rows")
     result = summarize_metric_with_uncertainty(

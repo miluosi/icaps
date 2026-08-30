@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Mapping
+from hashlib import sha256
 import time
 
 import numpy as np
@@ -11,10 +12,18 @@ import numpy as np
 from src.exact_mcmf import build_reduced_problem, solve_exact
 
 from .types import FeasibleEdgeSnapshot, FeasibleGraphSnapshot
-from .config import canonical_variant
+from .config import (
+    AssignmentOracleConfig,
+    LEADER_CREDITS,
+    TARGET_SOLVER_POLICIES,
+    canonical_variant,
+)
 
 
-VALID_RECOURSE_VARIANTS = {"legacy", "r0", "r1", "r2", "r3", "r4", "recourse_macro"}
+VALID_RECOURSE_VARIANTS = {
+    "legacy", "r0", "r1", "r1_structured", "r2", "r3", "r4",
+    "recourse_macro",
+}
 
 
 @dataclass(frozen=True)
@@ -50,27 +59,73 @@ class RecourseVariantPolicy:
     same_epoch_repair: bool
     structured_only_follower: bool
     learned_follower: bool
-    stage_coupled_leader: bool
+    leader_credit: str
+
+    def __post_init__(self) -> None:
+        if self.leader_credit not in LEADER_CREDITS:
+            raise ValueError(f"invalid leader credit: {self.leader_credit}")
+
+    @property
+    def stage_coupled_leader(self) -> bool:
+        """Deprecated compatibility view; use ``leader_credit`` in new code."""
+        return self.leader_credit == "nested_follower"
 
 
 RECOURSE_VARIANT_POLICIES = {
-    "legacy": RecourseVariantPolicy(True, True, False, True, False),
-    "r0": RecourseVariantPolicy(False, False, False, True, False),
-    "r1": RecourseVariantPolicy(True, False, False, True, False),
-    "r2": RecourseVariantPolicy(True, True, True, False, False),
-    "r3": RecourseVariantPolicy(True, True, False, True, False),
-    "r4": RecourseVariantPolicy(True, True, False, True, True),
-    "recourse_macro": RecourseVariantPolicy(True, True, False, True, False),
+    "legacy": RecourseVariantPolicy(True, True, False, True, "uncoupled"),
+    "r0": RecourseVariantPolicy(False, False, False, True, "uncoupled"),
+    "r1": RecourseVariantPolicy(True, False, False, True, "uncoupled"),
+    "r1_structured": RecourseVariantPolicy(True, False, True, False, "uncoupled"),
+    "r2": RecourseVariantPolicy(True, True, True, False, "uncoupled"),
+    "r3": RecourseVariantPolicy(True, True, False, True, "uncoupled"),
+    "r4": RecourseVariantPolicy(True, True, False, True, "nested_follower"),
+    "recourse_macro": RecourseVariantPolicy(True, True, False, True, "macro_realized"),
 }
 
 
 class RecourseTargetBuilder:
-    VERSION = "solver_consistent_v2"
+    VERSION = "solver_consistent_v3"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        backend: str | None = None,
+        solver_family: str | None = None,
+        graph_reduction: bool | None = None,
+        verify: bool | None = None,
+        cost_scale: int | None = None,
+        target_policy: str | None = None,
+        gp=None,
+        grb=None,
+        environment=None,
+        strict: bool | None = None,
+    ) -> None:
+        if target_policy is not None and target_policy not in TARGET_SOLVER_POLICIES:
+            raise ValueError(f"invalid target solver policy: {target_policy}")
+        self.backend = backend
+        self.solver_family = solver_family
+        self.graph_reduction = graph_reduction
+        self.verify = verify
+        self.cost_scale = cost_scale
+        self.target_policy = target_policy
+        self.gp, self.grb = gp, grb
+        self.environment = environment
+        self.strict = strict
         self.last_solver_status = "not_run"
         self.last_fallback_used = False
         self.last_solver_runtime_seconds = 0.0
+        self.last_solver_diagnostics: dict[str, object] = {}
+
+    @classmethod
+    def from_environment(cls, env) -> "RecourseTargetBuilder":
+        config = AssignmentOracleConfig.from_environment(env)
+        optimizer = getattr(env, "gurobi_optimizer", None)
+        return cls(
+            **config.as_dict(),
+            gp=getattr(optimizer, "gp", getattr(env, "gp", None)),
+            grb=getattr(optimizer, "GRB", getattr(env, "GRB", None)),
+            environment=env,
+        )
 
     @staticmethod
     def variant_policy(variant: str) -> RecourseVariantPolicy:
@@ -85,7 +140,8 @@ class RecourseTargetBuilder:
         variant = canonical_variant(variant)
         if variant not in RECOURSE_VARIANT_POLICIES:
             raise ValueError(
-                "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
+                "recourse variant must be legacy, r0, r1, r1_structured, "
+                "r2, r3, recourse_macro, or r4"
             )
         normalized_mode = str(transportation_mode).replace("-", "_").lower()
         if variant != "legacy" and normalized_mode not in {"evfirst", "ev_first"}:
@@ -110,9 +166,9 @@ class RecourseTargetBuilder:
         variant = canonical_variant(variant)
         policy = RecourseTargetBuilder.variant_policy(variant)
         ordinary_bootstrap = 0.0 if done else (gamma ** elapsed_epochs) * temporal_value
-        if variant == "recourse_macro":
+        if policy.leader_credit == "macro_realized":
             return float(reward_ev + reward_aev + ordinary_bootstrap)
-        if policy.stage_coupled_leader:
+        if policy.leader_credit == "nested_follower":
             # Rejection is an observed within-epoch outcome, not a terminal
             # mask.  The follower bootstrap is retained even when the EV offer
             # was rejected.
@@ -181,6 +237,7 @@ class RecourseTargetBuilder:
             self.last_solver_status = "empty"
             self.last_fallback_used = False
             self.last_solver_runtime_seconds = 0.0
+            self.last_solver_diagnostics = self.solver_config_for_graph(graph)
             return ()
         self._validate_resource_capacities(edges)
         self.last_solver_runtime_seconds = 0.0
@@ -225,23 +282,102 @@ class RecourseTargetBuilder:
                 capacities[column] = int(edge.resource_capacity)
 
         build_start = time.perf_counter()
+        config = self.solver_config_for_graph(graph)
+        if str(config["backend"]) == "gurobi_network" and self.gp is None:
+            optimizer = getattr(self.environment, "gurobi_optimizer", None)
+            self.gp = getattr(optimizer, "gp", getattr(self.environment, "gp", None))
+            self.grb = getattr(optimizer, "GRB", getattr(self.environment, "GRB", None))
         problem = build_reduced_problem(
             feasibility,
             q_values,
             capacities,
-            cost_scale=int(graph.objective_cost_scale),
-            graph_reduction=True,
+            cost_scale=int(config["cost_scale"]),
+            graph_reduction=bool(config["graph_reduction"]),
         )
-        result = solve_exact(problem, backend="primal_dual", verify=True)
+        result = solve_exact(
+            problem,
+            backend=str(config["backend"]),
+            verify=bool(config["verify"]),
+            gp=self.gp,
+            grb=self.grb,
+        )
+        if bool(config["strict"]) and result.fallback_used:
+            raise RuntimeError(
+                "strict target assignment forbids backend fallback"
+            )
         self.last_solver_runtime_seconds = time.perf_counter() - build_start
         self.last_solver_status = result.status.lower()
         self.last_fallback_used = bool(result.fallback_used)
+        self.last_solver_diagnostics = {
+            **config,
+            "status": self.last_solver_status,
+            "fallback_used": self.last_fallback_used,
+            "runtime_seconds": self.last_solver_runtime_seconds,
+            "objective_q": float(result.objective_q),
+        }
         selected = tuple(
             edge_by_vehicle_action[(row, int(column))].edge_id
             for row, column in sorted(result.action_by_vehicle.items())
         )
+        self.last_solver_diagnostics["selected_edge_trace_hash"] = sha256(
+            "\n".join(selected).encode()
+        ).hexdigest()
         self.verify_feasible(graph, selected)
         return selected
+
+    def solver_config_for_graph(self, graph: FeasibleGraphSnapshot) -> dict[str, object]:
+        policy = str(
+            self.target_policy
+            or getattr(graph, "target_solver_policy", "fixed_primal_dual_exact")
+        )
+        solver_family = str(
+            self.solver_family or getattr(graph, "solver_family", "exact")
+        )
+        if policy == "same_as_rollout_exact" and solver_family != "exact":
+            raise ValueError(
+                "same_as_rollout_exact requires an exact rollout; use "
+                "exact_oracle_for_approximate_rollout for approximate solvers"
+            )
+        backend = str(self.backend or graph.solver_backend)
+        metadata_migrated = False
+        if backend.startswith("mcmf:"):
+            backend = backend.split(":", 1)[1] or "primal_dual"
+            metadata_migrated = True
+        elif backend in {"", "unknown", "test", "mcmf"}:
+            # Replay schema <=3 used descriptive placeholders here while the
+            # target operator was always exact primal-dual. Preserve those
+            # checkpoints explicitly; arbitrary new backend names still fail.
+            backend = "primal_dual"
+            metadata_migrated = True
+        if policy == "fixed_primal_dual_exact":
+            backend = "primal_dual"
+        elif policy == "exact_oracle_for_approximate_rollout" and self.backend is None:
+            # This policy is the one explicit exception allowed to decouple
+            # targets from an approximate rollout backend.
+            backend = "primal_dual"
+        return {
+            "backend": backend,
+            "graph_reduction": bool(
+                getattr(graph, "graph_reduction", True)
+                if self.graph_reduction is None else self.graph_reduction
+            ),
+            "verify": bool(
+                getattr(graph, "solver_verify", True)
+                if self.verify is None else self.verify
+            ),
+            "cost_scale": max(1, int(
+                graph.objective_cost_scale if self.cost_scale is None else self.cost_scale
+            )),
+            "target_policy": policy,
+            "rollout_backend": str(graph.solver_backend),
+            "rollout_solver_family": solver_family,
+            "target_solver_family": "exact",
+            "strict": bool(
+                getattr(graph, "solver_strict", True)
+                if self.strict is None else self.strict
+            ),
+            "legacy_solver_metadata_migrated": metadata_migrated,
+        }
 
     def double_q_target(
         self,

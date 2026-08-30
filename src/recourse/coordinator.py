@@ -223,7 +223,12 @@ class RecourseCoordinator:
             next_state=next_state,
             elapsed_epochs=max(0.0, next_state.current_time - pending.pre_state.current_time),
             done=bool(done),
-            planner_metadata=PlannerMetadata(backend=pending.solver_backend),
+            planner_metadata=PlannerMetadata(
+                backend=pending.solver_backend,
+                target_backend=str(
+                    getattr(env, 'target_solver_policy', 'same_as_rollout_exact')
+                ),
+            ),
             outcome_summary=self.lifecycle.outcome_summary(epoch_id=pending.epoch_id),
             run_id=pending.run_id,
             cumulative_episode_id=pending.cumulative_episode_id,

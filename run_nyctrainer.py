@@ -380,6 +380,12 @@ def apply_paper_parameter_preset(args):
     args.start_hour = 0.0
     args.stop_hour = 24.0
     args.epoch_length = 30.0
+    args.mcmf_solver = "exact"
+    args.mcmf_backend = "primal_dual"
+    args.mcmf_strict = True
+    args.mcmf_graph_reduction = True
+    args.mcmf_verify = True
+    args.target_solver_policy = "same_as_rollout_exact"
     if args.start_date is None:
         args.start_date = f"{args.start_year_month}-15"
     if args.end_date is None:
@@ -663,6 +669,8 @@ def _create_nyc_environment(
     recourse_variant: str = "legacy",
     rejection_logit_shift: float = 0.0,
     common_random_numbers: bool = False,
+    integrated_repair_hold_enabled: bool = True,
+    target_solver_policy: str = "same_as_rollout_exact",
     only_manhattan_zones: bool = False,
     battery_consumption_ratio: float = 1.0,
     initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
@@ -721,6 +729,8 @@ def _create_nyc_environment(
         recourse_variant,
         rejection_logit_shift=rejection_logit_shift,
         common_random_numbers=common_random_numbers,
+        integrated_repair_hold_enabled=integrated_repair_hold_enabled,
+        target_solver_policy=target_solver_policy,
     )
     return env
 
@@ -890,6 +900,8 @@ def run_nyc_training(
     recourse_variant: str = "legacy",
     rejection_logit_shift: float = 0.0,
     common_random_numbers: bool = False,
+    integrated_repair_hold_enabled: bool = True,
+    target_solver_policy: str = "same_as_rollout_exact",
     state_variant: str = "joint_state_separate_critics",
     learner_variant: str = "legacy",
     ev_acceptance_feature: str = "off",
@@ -982,6 +994,8 @@ def run_nyc_training(
         recourse_variant=recourse_variant,
         rejection_logit_shift=rejection_logit_shift,
         common_random_numbers=common_random_numbers,
+        integrated_repair_hold_enabled=integrated_repair_hold_enabled,
+        target_solver_policy=target_solver_policy,
         state_variant=state_variant,
         learner_variant=learner_variant,
         ev_acceptance_feature=ev_acceptance_feature,
@@ -1305,6 +1319,8 @@ def main():
             recourse_variant=args.recourse_variant,
             rejection_logit_shift=args.rejection_logit_shift,
             common_random_numbers=args.common_random_numbers,
+            integrated_repair_hold_enabled=args.integrated_repair_hold_enabled,
+            target_solver_policy=args.target_solver_policy,
             state_variant=args.state_variant,
             learner_variant=args.learner_variant,
             ev_acceptance_feature=args.ev_acceptance_feature,

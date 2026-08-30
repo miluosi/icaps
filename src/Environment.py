@@ -2374,13 +2374,15 @@ class ChargingIntegratedEnvironment(Environment):
         *,
         rejection_logit_shift: float = 0.0,
         common_random_numbers: bool = False,
+        integrated_repair_hold_enabled: bool | None = None,
+        target_solver_policy: str | None = None,
     ) -> None:
         """Configure the shared R0--R4 contract for synthetic experiments."""
         from src.recourse.config import canonical_variant
         variant = canonical_variant(variant)
-        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4", "recourse_macro"}:
+        if variant not in {"legacy", "r0", "r1", "r1_structured", "r2", "r3", "r4", "recourse_macro"}:
             raise ValueError(
-                "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
+                "recourse variant must be legacy, r0, r1, r1_structured, r2, r3, recourse_macro, or r4"
             )
         shift = float(rejection_logit_shift)
         if not math.isfinite(shift):
@@ -2388,6 +2390,13 @@ class ChargingIntegratedEnvironment(Environment):
         self.recourse_variant = variant
         self.rejection_logit_shift = shift
         self.common_random_numbers = bool(common_random_numbers)
+        if integrated_repair_hold_enabled is not None:
+            self.integrated_repair_hold_enabled = bool(integrated_repair_hold_enabled)
+        if target_solver_policy is not None:
+            from src.recourse.config import TARGET_SOLVER_POLICIES
+            if target_solver_policy not in TARGET_SOLVER_POLICIES:
+                raise ValueError(f"invalid target solver policy: {target_solver_policy}")
+            self.target_solver_policy = str(target_solver_policy)
         if not hasattr(self, "recourse_run_id"):
             self.recourse_run_id = (
                 f"synthetic-seed-{int(getattr(self, 'initial_random_seed', 0) or 0)}"
@@ -2447,13 +2456,10 @@ class ChargingIntegratedEnvironment(Environment):
         if self.recourse_coordinator.pending is not None:
             return self.recourse_coordinator.pending
         solver_backend = (
-            "auction"
-            if getattr(self, "useauction", False)
-            else (
-                f"mcmf:{getattr(self, 'mcmf_backend', 'unknown')}"
-                if getattr(self, "usemcmf", False)
-                else ("gurobi" if self.assignmentgurobi else "heuristic")
-            )
+            "auction" if getattr(self, "useauction", False)
+            else str(getattr(self, "mcmf_backend", "primal_dual"))
+            if getattr(self, "usemcmf", False)
+            else ("gurobi_network" if self.assignmentgurobi else "heuristic")
         )
         return self.recourse_coordinator.begin(
             self,
@@ -6260,6 +6266,10 @@ class ChargingIntegratedEnvironment(Environment):
         from src.recourse.integrated_repair import simulate_integrated_repair
         return simulate_integrated_repair(self, agents, current_requests, rebalance)
 
+    def simulate_motion_integrated_control(self, agents=None, current_requests=None, rebalance=True):
+        from src.recourse.integrated_repair import simulate_integrated_control
+        return simulate_integrated_control(self, agents, current_requests, rebalance)
+
     def simulate_motion_evfirst(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True):
         """Override simulate_motion to integrate Gurobi optimization with Q-learning for charging environment"""
         if agents is None:
@@ -8828,8 +8838,14 @@ class ChargingIntegratedEnvironment(Environment):
                 return -1.0, dur_reward
             elif vehicle['assigned_request'] is not None:
                 vehicle['idle_target'] = None  # Clear idle target when servicing
+                reward_request_id = vehicle.get('assigned_request')
                 if self._pickup_passenger(vehicle_id):
-                    reward = 0.5 + np.random.normal(0, 0.2)
+                    from src.recourse.crn import vehicle_normal
+                    reward = 0.5 + vehicle_normal(
+                        self, vehicle_id, 'pickup_reward',
+                        getattr(self, 'service_event_reward_noise_std', 0.2),
+                        request_id=reward_request_id,
+                    )
                 else:
                     # 检查电池是否耗尽
                     if vehicle['battery'] <= 0.0:
@@ -8840,7 +8856,12 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['charging_target'] = None
                         #print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法继续前往pickup位置")
                     else:
-                        reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
+                        from src.recourse.crn import vehicle_normal
+                        reward = self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                            self, vehicle_id, 'pickup_movement_reward',
+                            getattr(self, 'movement_reward_noise_std', 0.1),
+                            request_id=reward_request_id,
+                        )
                 if vehicle['type'] == 1:
                     if self.storeactions_ev[vehicle_id] is not None:
                         self.storeactions_ev[vehicle_id].dur_reward += reward  # Store for reference
@@ -8849,9 +8870,15 @@ class ChargingIntegratedEnvironment(Environment):
                         self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
             elif vehicle['passenger_onboard'] is not None:
                 vehicle['idle_target'] = None  # Clear idle target when servicing
+                reward_request_id = vehicle.get('passenger_onboard')
                 earnings = self._dropoff_passenger(vehicle_id)
                 if earnings > 0:
-                    reward = earnings + np.random.normal(0, 0.2)
+                    from src.recourse.crn import vehicle_normal
+                    reward = earnings + vehicle_normal(
+                        self, vehicle_id, 'dropoff_reward',
+                        getattr(self, 'service_event_reward_noise_std', 0.2),
+                        request_id=reward_request_id,
+                    )
                 else:
                     # 检查电池是否耗尽
                     if vehicle['battery'] <= 0.0:
@@ -8862,7 +8889,12 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['passenger_onboard'] = None
                         vehicle['charging_target'] = None
                     else:
-                        reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
+                        from src.recourse.crn import vehicle_normal
+                        reward = self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                            self, vehicle_id, 'dropoff_movement_reward',
+                            getattr(self, 'movement_reward_noise_std', 0.1),
+                            request_id=reward_request_id,
+                        )
                 if vehicle['type'] == 1:
                     if self.storeactions_ev[vehicle_id] is not None:
                         dropout_penalty = getattr(self.storeactions_ev[vehicle_id], 'dropout_penalty', 0.0)
@@ -10524,19 +10556,37 @@ class ChargingIntegratedEnvironment(Environment):
 
             if a_type == 'assign':
                 # Continue towards pickup/dropoff
+                reward_request_id = v.get('assigned_request') or v.get('passenger_onboard')
+                from src.recourse.crn import vehicle_normal
                 if self._pickup_passenger(vehicle_id):
-                    step_reward += 0.5 + np.random.normal(0, 0.2)
+                    step_reward += 0.5 + vehicle_normal(
+                        self, vehicle_id, 'dqn_pickup_reward',
+                        getattr(self, 'service_event_reward_noise_std', 0.2),
+                        request_id=reward_request_id,
+                    )
                 else:
-                    step_reward += self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.05)
+                    step_reward += self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                        self, vehicle_id, 'dqn_pickup_movement_reward',
+                        getattr(self, 'movement_reward_noise_std', 0.05),
+                        request_id=reward_request_id,
+                    )
                 # Try dropoff if onboard
                 if v.get('passenger_onboard') is not None:
                     drop_r = self._dropoff_passenger(vehicle_id)
                     if drop_r > 0:
-                        step_reward += drop_r + np.random.normal(0, 0.2)
+                        step_reward += drop_r + vehicle_normal(
+                            self, vehicle_id, 'dqn_dropoff_reward',
+                            getattr(self, 'service_event_reward_noise_std', 0.2),
+                            request_id=reward_request_id,
+                        )
                         # Mark successful completion for this buffered assign
                         buf['dropoff_done'] = True
                     else:
-                        step_reward += self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.05)
+                        step_reward += self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                            self, vehicle_id, 'dqn_dropoff_movement_reward',
+                            getattr(self, 'movement_reward_noise_std', 0.05),
+                            request_id=reward_request_id,
+                        )
                 # Done when vehicle becomes free (no assigned and no onboard)
                 if v.get('assigned_request') is None and v.get('passenger_onboard') is None:
                     # If we became free without a recorded dropoff, treat as assignment failure
@@ -10795,19 +10845,37 @@ class ChargingIntegratedEnvironment(Environment):
 
             # Move/pickup/dropoff using existing helpers
             reward = 0.0
+            reward_request_id = vehicle.get('assigned_request') or vehicle.get('passenger_onboard')
+            from src.recourse.crn import vehicle_normal
             if self._pickup_passenger(vehicle_id):
-                reward += 0.5 + np.random.normal(0, 0.2)
+                reward += 0.5 + vehicle_normal(
+                    self, vehicle_id, 'single_pickup_reward',
+                    getattr(self, 'service_event_reward_noise_std', 0.2),
+                    request_id=reward_request_id,
+                )
             else:
                 # Move one step toward target (pickup or dropoff)
-                reward += self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.05)
+                reward += self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                    self, vehicle_id, 'single_pickup_movement_reward',
+                    getattr(self, 'movement_reward_noise_std', 0.05),
+                    request_id=reward_request_id,
+                )
 
             # If passenger onboard after movement, attempt dropoff
             if vehicle.get('passenger_onboard') is not None:
                 drop_reward = self._dropoff_passenger(vehicle_id)
                 if drop_reward > 0:
-                    reward += drop_reward + np.random.normal(0, 0.2)
+                    reward += drop_reward + vehicle_normal(
+                        self, vehicle_id, 'single_dropoff_reward',
+                        getattr(self, 'service_event_reward_noise_std', 0.2),
+                        request_id=reward_request_id,
+                    )
                 else:
-                    reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
+                    reward = self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                        self, vehicle_id, 'single_dropoff_movement_reward',
+                        getattr(self, 'movement_reward_noise_std', 0.1),
+                        request_id=reward_request_id,
+                    )
             return float(reward)
 
         # Charge: send to a station and let charging start when reached

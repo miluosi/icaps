@@ -448,6 +448,13 @@ class StateSnapshotBuilder:
                 1, int(getattr(env, "mcmf_cost_scale", 10_000) or 10_000)
             ),
             objective_precision_mode="integer_q_grid",
+            graph_reduction=bool(getattr(env, "mcmf_graph_reduction", True)),
+            solver_verify=bool(getattr(env, "mcmf_verify", True)),
+            target_solver_policy=str(
+                getattr(env, "target_solver_policy", "same_as_rollout_exact")
+            ),
+            solver_family=str(getattr(env, "mcmf_solver", "exact") or "exact"),
+            solver_strict=bool(getattr(env, "mcmf_strict", True)),
         )
 
     @staticmethod

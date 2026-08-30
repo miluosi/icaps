@@ -991,6 +991,8 @@ class ADPTrainer:
         recourse_variant: str = "legacy",
         rejection_logit_shift: float = 0.0,
         common_random_numbers: bool = False,
+        integrated_repair_hold_enabled: bool = True,
+        target_solver_policy: str = "same_as_rollout_exact",
         state_variant: str = "joint_state_separate_critics",
         learner_variant: str = "legacy",
         ev_acceptance_feature: str = "off",
@@ -1020,6 +1022,8 @@ class ADPTrainer:
             "joint_state_separate_critics",
             "fleet_local_separate_critics",
             "fleet_local_shared_critic",
+            "strict_fleet_local_separate_critics",
+            "strict_fleet_local_shared_critic",
         }
         if state_variant not in valid_state_variants:
             raise ValueError(f"unknown state variant: {state_variant}")
@@ -1165,6 +1169,8 @@ class ADPTrainer:
             recourse_variant,
             rejection_logit_shift=rejection_logit_shift,
             common_random_numbers=common_random_numbers,
+            integrated_repair_hold_enabled=integrated_repair_hold_enabled,
+            target_solver_policy=target_solver_policy,
         )
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
@@ -1184,6 +1190,8 @@ class ADPTrainer:
         env.mcmf_cost_scale = int(mcmf_cost_scale)
         env.mcmf_graph_reduction = bool(mcmf_graph_reduction)
         env.mcmf_verify = bool(mcmf_verify)
+        env.integrated_repair_hold_enabled = bool(integrated_repair_hold_enabled)
+        env.target_solver_policy = str(target_solver_policy)
         env.auction_use_gpu = bool(auction_use_gpu)
         env.auction_epsilon = float(auction_epsilon)
         env.auction_max_rounds = auction_max_rounds
@@ -1515,7 +1523,10 @@ class ADPTrainer:
                         ('AEV', value_function),
                         ('EV', value_function_ev),
                     ):
-                        if predictor_name == 'AEV' and recourse_variant == 'r2':
+                        if (
+                            predictor_name == 'AEV'
+                            and recourse_variant in {'r1_structured', 'r2', 'r3'}
+                        ):
                             continue
                         queue_loss = 0.0
                         demand_loss = 0.0
@@ -1597,7 +1608,7 @@ class ADPTrainer:
                 if transportation_mode == 'integrated_repair':
                     actions, storeactions, storeactions_ev = env.simulate_motion_integrated_repair(agents=[], current_requests=current_requests, rebalance=True)
                 elif transportation_mode == 'integrated':
-                    actions, storeactions, storeactions_ev = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+                    actions, storeactions, storeactions_ev = env.simulate_motion_integrated_control(agents=[], current_requests=current_requests, rebalance=True)
                 elif transportation_mode == 'evfirst':
                     actions, storeactions, storeactions_ev = env.simulate_motion_evfirst(agents=[], current_requests=current_requests, rebalance=True)
                 elif transportation_mode == 'aevfirst':

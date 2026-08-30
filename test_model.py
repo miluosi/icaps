@@ -1,4 +1,4 @@
-"""Evaluate trained value functions with ILP, MCMF, auction, and heuristic backends."""
+"""Legacy solver evaluator; not the fixed-policy ICAPS recourse paper runner."""
 import argparse
 import json
 import numpy as np
@@ -62,7 +62,6 @@ STRATEGY_NAMES = tuple(strategy["name"] for strategy in STRATEGIES)
 
 DEFAULT_STRATEGIES = (
     "ADP-MCMF",
-    "ADP-MCMF-FT",
     "ADP-HEU",
 )
 
@@ -276,7 +275,12 @@ def parse_args():
         default="best",
         help="Load the final trained checkpoint or the best post-warmup checkpoint",
     )
-    return parser.parse_args()
+    parser.add_argument('--allow-online-adaptation', action='store_true',
+                        help='Allow ADP-MCMF-FT as a separately labeled online-adaptation run')
+    args = parser.parse_args()
+    if 'ADP-MCMF-FT' in args.strategies and not args.allow_online_adaptation:
+        parser.error('ADP-MCMF-FT trains during test; use --allow-online-adaptation and exclude it from fixed-policy tables')
+    return args
 
 
 def normalize_distribution_mode(distribution_mode: str | None) -> str:

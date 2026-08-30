@@ -6,9 +6,10 @@ import run_recourse_audit as audit
 from run_recourse_day import parse_args
 
 
-def test_day_runner_defaults_cover_seven_methods_and_disjoint_full_days():
+def test_day_runner_defaults_cover_canonical_methods_and_disjoint_full_days():
     args = parse_args([])
-    assert len(args.methods) == 7
+    from src.recourse.config import PAPER_METHODS
+    assert tuple(args.methods) == PAPER_METHODS
     assert args.train_date != args.test_date and args.seed != args.test_seed
     assert args.num_vehicles == 200 and args.num_ev == 100
     assert (args.start_hour, args.stop_hour, args.max_steps) == (0., 24., None)

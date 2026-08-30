@@ -11,6 +11,8 @@ class TrainingReadiness:
     edge_ready: bool
     queue_ready: bool
     joint_ready: bool
+    predictor_ready: bool = False
+    follower_critic_ready: bool = False
 
     @property
     def any_ready(self) -> bool:
@@ -25,19 +27,35 @@ def training_readiness(
     queue_warmup: int = 4,
 ) -> TrainingReadiness:
     if value_function is None:
-        return TrainingReadiness(False, False, False)
-    if not ifEV and getattr(value_function, 'recourse_variant', 'legacy') == 'r2':
-        return TrainingReadiness(False, False, False)
+        return TrainingReadiness(False, False, False, False, False)
+    variant = str(getattr(value_function, 'recourse_variant', 'legacy'))
+    follower_frozen = bool(
+        not ifEV and variant in {'r1_structured', 'r2'}
+    )
+    predictors_frozen = bool(
+        variant in {'r1_structured', 'r2', 'r3'}
+        and getattr(value_function, 'freeze_causal_predictors', True)
+    )
     edge_ready = len(
         getattr(value_function, "experience_buffer", ())
     ) >= max(0, int(edge_warmup))
-    queue_ready = bool(
+    predictor_ready = bool(
+        not predictors_frozen
+        and
         hasattr(value_function, "train_queue_predictor")
         and len(getattr(value_function, "queue_experience_buffer", ()))
         >= max(0, int(queue_warmup))
     )
-    joint_ready = bool(
+    follower_critic_ready = bool(
+        not follower_frozen
+        and
         hasattr(value_function, "has_trainable_joint_rows")
         and value_function.has_trainable_joint_rows(ifEV=ifEV)
     )
-    return TrainingReadiness(edge_ready, queue_ready, joint_ready)
+    return TrainingReadiness(
+        edge_ready and not follower_frozen,
+        predictor_ready,
+        follower_critic_ready,
+        predictor_ready,
+        follower_critic_ready,
+    )

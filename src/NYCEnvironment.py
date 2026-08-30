@@ -2715,13 +2715,15 @@ class NYCEnvironment:
         *,
         rejection_logit_shift: float = 0.0,
         common_random_numbers: bool = False,
+        integrated_repair_hold_enabled: bool | None = None,
+        target_solver_policy: str | None = None,
     ) -> None:
         """Configure explicit R0--R4 execution and target semantics."""
         from src.recourse.config import canonical_variant
         variant = canonical_variant(variant)
-        if variant not in {"legacy", "r0", "r1", "r2", "r3", "r4", "recourse_macro"}:
+        if variant not in {"legacy", "r0", "r1", "r1_structured", "r2", "r3", "r4", "recourse_macro"}:
             raise ValueError(
-                "recourse variant must be legacy or one of r0, r1, r2, r3, r4"
+                "recourse variant must be legacy, r0, r1, r1_structured, r2, r3, recourse_macro, or r4"
             )
         shift = float(rejection_logit_shift)
         if not math.isfinite(shift):
@@ -2729,6 +2731,13 @@ class NYCEnvironment:
         self.recourse_variant = variant
         self.rejection_logit_shift = shift
         self.common_random_numbers = bool(common_random_numbers)
+        if integrated_repair_hold_enabled is not None:
+            self.integrated_repair_hold_enabled = bool(integrated_repair_hold_enabled)
+        if target_solver_policy is not None:
+            from src.recourse.config import TARGET_SOLVER_POLICIES
+            if target_solver_policy not in TARGET_SOLVER_POLICIES:
+                raise ValueError(f"invalid target solver policy: {target_solver_policy}")
+            self.target_solver_policy = str(target_solver_policy)
         if not hasattr(self, "recourse_run_id"):
             self.recourse_run_id = (
                 f"nyc-seed-{int(getattr(self, '_recourse_experiment_seed', 0) or 0)}"
@@ -3861,29 +3870,43 @@ class NYCEnvironment:
                 return 0.0, 0.0
             elif vehicle['assigned_request'] is not None:
                 vehicle['idle_target'] = None
+                reward_request_id = vehicle.get('assigned_request')
                 if self._pickup_passenger(vehicle_id):
-                    reward = 0.5 + np.random.normal(
-                        0, self.service_event_reward_noise_std
+                    from src.recourse.crn import vehicle_normal
+                    reward = 0.5 + vehicle_normal(
+                        self, vehicle_id, 'pickup_reward',
+                        self.service_event_reward_noise_std,
+                        request_id=reward_request_id,
                     )
                 elif vehicle['battery'] <= 0.0:
                     self._clear_vehicle_assignments(vehicle_id)
                 else:
-                    reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(
-                        0, self.movement_reward_noise_std
+                    from src.recourse.crn import vehicle_normal
+                    reward = self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                        self, vehicle_id, 'pickup_movement_reward',
+                        self.movement_reward_noise_std,
+                        request_id=reward_request_id,
                     )
                 self._update_dur_reward(vehicle_id, reward)
             elif vehicle['passenger_onboard'] is not None:
                 vehicle['idle_target'] = None
+                reward_request_id = vehicle.get('passenger_onboard')
                 earnings = self._dropoff_passenger(vehicle_id)
                 if earnings > 0:
-                    reward = earnings + np.random.normal(
-                        0, self.service_event_reward_noise_std
+                    from src.recourse.crn import vehicle_normal
+                    reward = earnings + vehicle_normal(
+                        self, vehicle_id, 'dropoff_reward',
+                        self.service_event_reward_noise_std,
+                        request_id=reward_request_id,
                     )
                 elif vehicle['battery'] <= 0.0:
                     self._clear_vehicle_assignments(vehicle_id)
                 else:
-                    reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(
-                        0, self.movement_reward_noise_std
+                    from src.recourse.crn import vehicle_normal
+                    reward = self._execute_movement_towards_target(vehicle_id) + vehicle_normal(
+                        self, vehicle_id, 'dropoff_movement_reward',
+                        self.movement_reward_noise_std,
+                        request_id=reward_request_id,
                     )
                 self._update_dur_reward(vehicle_id, reward)
 
@@ -5032,7 +5055,10 @@ class NYCEnvironment:
                 num_stations=int(ns),
                 num_zones=int(nz),
                 stage_id=int(getattr(self, "_active_recourse_stage", 0) or 0),
-                solver_backend=solver_name,
+                solver_backend=(
+                    str(getattr(self, 'mcmf_backend', 'primal_dual'))
+                    if solver_name == 'mcmf' else solver_name
+                ),
                 state=stage_state,
             )
             selected_edge_ids = StateSnapshotBuilder.selected_edge_ids(graph, result)
@@ -5516,13 +5542,10 @@ class NYCEnvironment:
         if getattr(self, "evaluatemode", False):
             return None
         solver_backend = (
-            "auction"
-            if getattr(self, "useauction", False)
-            else (
-                f"mcmf:{getattr(self, 'mcmf_backend', 'unknown')}"
-                if getattr(self, "usemcmf", False)
-                else ("gurobi" if self.assignmentgurobi else "heuristic")
-            )
+            "auction" if getattr(self, "useauction", False)
+            else str(getattr(self, "mcmf_backend", "primal_dual"))
+            if getattr(self, "usemcmf", False)
+            else ("gurobi_network" if self.assignmentgurobi else "heuristic")
         )
         return self.recourse_coordinator.begin(
             self,
@@ -5721,6 +5744,10 @@ class NYCEnvironment:
         from src.recourse.integrated_repair import simulate_integrated_repair
         return simulate_integrated_repair(self, agents, current_requests, rebalance)
 
+    def simulate_motion_integrated_control(self, agents=None, current_requests=None, rebalance=True):
+        from src.recourse.integrated_repair import simulate_integrated_control
+        return simulate_integrated_control(self, agents, current_requests, rebalance)
+
     def simulate_motion_evfirst(self, agents=None, current_requests=None, rebalance=True):
         if agents is None:
             agents = []
@@ -5855,7 +5882,7 @@ class NYCEnvironment:
                 try:
                     self._same_epoch_blocked_request_ids = (
                         set(rejected_residual_ids)
-                        if recourse_variant == 'r1'
+                        if recourse_variant in {'r1', 'r1_structured'}
                         else set()
                     )
                     self._active_recourse_stage = 2
@@ -6490,6 +6517,7 @@ class NYCEnvironment:
         self._last_matrix_num_requests = req_mat.shape[1]
         self._last_matrix_num_stations = charge_mat.shape[1]
         self._last_matrix_num_zones = zone_mat.shape[1]
+        self._last_matrix_layout_ready = True
         wait_mat = self.generate_vehicle_wait(vehicle_ids, rebalance_num)
         total = np.hstack([req_mat, charge_mat, zone_mat, wait_mat])
         self._cache_vehicle_action_graph_neighbours(
@@ -6638,14 +6666,16 @@ class NYCEnvironment:
                 assigned.add(v['passenger_onboard'])
         active_avail = [r for r in self.active_requests.values() if r.request_id not in assigned]
         request_ids = list(getattr(self, '_last_matrix_request_ids', []))
-        if request_ids or int(getattr(self, '_last_matrix_num_requests', 0) or 0) > 0:
+        layout_ready = bool(getattr(self, '_last_matrix_layout_ready', False))
+        if layout_ready:
             request_by_id = {r.request_id: r for r in active_avail}
             avail = [request_by_id[rid] for rid in request_ids if rid in request_by_id]
         else:
             avail = active_avail
-        nr = int(getattr(self, '_last_matrix_num_requests', len(avail)) or 0)
-        if nr == 0 and avail:
-            nr = len(avail)
+        nr = (
+            int(getattr(self, '_last_matrix_num_requests', 0) or 0)
+            if layout_ready else len(avail)
+        )
 
         # These lists may legitimately be empty after generate_whole_matrix filters
         # infeasible charge/zone columns.  Do not fall back to the full station/zone

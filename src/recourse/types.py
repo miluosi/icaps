@@ -19,6 +19,8 @@ STATE_VARIANTS = (
     "joint_state_separate_critics",
     "fleet_local_separate_critics",
     "fleet_local_shared_critic",
+    "strict_fleet_local_separate_critics",
+    "strict_fleet_local_shared_critic",
 )
 LEARNER_VARIANTS = (
     "legacy",
@@ -286,15 +288,30 @@ class SystemSnapshot:
             "s1",
         }:
             return self
-        if variant not in {
+        local_dynamics_variants = {
             "fleet_local_separate_critics",
             "fleet_local_shared_critic",
             "s2",
             "s3",
-        }:
+        }
+        strict_local_variants = {
+            "strict_fleet_local_separate_critics",
+            "strict_fleet_local_shared_critic",
+            "s2_strict",
+            "s3_strict",
+        }
+        if variant not in local_dynamics_variants | strict_local_variants:
             raise ValueError(f"unknown state variant: {variant}")
         if vehicle_type not in {1, 2}:
             raise ValueError("fleet-local state masks require vehicle_type 1 or 2")
+        if variant in strict_local_variants:
+            return replace(
+                self,
+                vehicles=tuple(
+                    vehicle for vehicle in self.vehicles
+                    if vehicle.vehicle_type == int(vehicle_type)
+                ),
+            )
         masked_vehicles = tuple(
             vehicle
             if vehicle.vehicle_type == int(vehicle_type)
@@ -405,6 +422,11 @@ class FeasibleGraphSnapshot:
     solver_runtime_seconds: float = 0.0
     objective_cost_scale: int = 10_000
     objective_precision_mode: str = "integer_q_grid"
+    graph_reduction: bool = True
+    solver_verify: bool = True
+    target_solver_policy: str = "same_as_rollout_exact"
+    solver_family: str = "exact"
+    solver_strict: bool = True
 
     def with_selected(
         self,
@@ -612,7 +634,7 @@ class RecourseTransition:
     planner_metadata: PlannerMetadata = field(default_factory=PlannerMetadata)
     outcome_summary: OutcomeSummary = field(default_factory=OutcomeSummary)
     schema_version: int = REPLAY_SCHEMA_VERSION
-    target_builder_version: str = "solver_consistent_v2"
+    target_builder_version: str = "solver_consistent_v3"
     run_id: str = ""
     cumulative_episode_id: int = 0
     transition_sequence_index: int = 0

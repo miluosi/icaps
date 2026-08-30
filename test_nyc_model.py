@@ -1,4 +1,5 @@
-"""
+"""Legacy solver/inference evaluator (not the ICAPS recourse paper runner).
+
 Test trained models on unseen seeds.
 Compare assignment backends explicitly so MCMF results are not mislabeled as
 heuristic.  ADP-HEU-HEU additionally uses a checkpoint collected and trained
@@ -132,7 +133,7 @@ def parse_args():
                         help="End date encoded in the checkpoint directory; defaults to evaluation end date")
     
     parser.add_argument("--strategies", type=str, nargs="+",
-                        default=["ADP-MCMF","ADP-MCMF-K", "ADP-MCMF-FT", "MCMF","MCMF-K", "ADP-HEU", "ADP-HEU-K", "HEU",],
+                        default=["ADP-MCMF","ADP-MCMF-K", "MCMF","MCMF-K", "ADP-HEU", "ADP-HEU-K", "HEU",],
                         choices=["ADP-ILP", "ILP", "MCMF-K", "ILP-K", "ADP-MCMF", "ADP-MCMF-K", "ADP-MCMF-FT", "MCMF", "ADP-AUCTION", "ADP-AUCTION-K", "AUCTION", "ADP-HEU", "ADP-HEU-K", "ADP-HEU-HEU", "ADP-HEU-HEU-K", "HEU", "HEU-K"],
                         help="Strategies to compare")
     parser.add_argument("--auction-use-gpu", action="store_true", help="Use GPU auction solver for AUCTION strategies")
@@ -221,7 +222,12 @@ def parse_args():
         help="Target entropy as a fraction of log(candidate count) for masac_baseline/standard_masac_gat fine-tuning",
     )
     parser.set_defaults(iftransformer=False)
-    return parser.parse_args()
+    parser.add_argument('--allow-online-adaptation', action='store_true',
+                        help='Allow ADP-MCMF-FT as a separately labeled online-adaptation run')
+    args = parser.parse_args()
+    if 'ADP-MCMF-FT' in args.strategies and not args.allow_online_adaptation:
+        parser.error('ADP-MCMF-FT trains during test; use --allow-online-adaptation and exclude it from fixed-policy tables')
+    return args
 
 
 def get_distribution_suffix(distribution_mode: str) -> str:
