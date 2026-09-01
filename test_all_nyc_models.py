@@ -33,7 +33,7 @@ from src.recourse.config import (
     METHODS,
     canonical_method,
 )
-from src.recourse.types import STATE_VARIANTS
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 from summarize_recourse_day import LABELS, build_report
 
 ROOT = Path(__file__).resolve().parent
@@ -67,7 +67,7 @@ ENGINE_OPTIONS = (
     'train_date', 'test_date', 'parquet_path', 'num_vehicles', 'num_ev', 'seed',
     'test_seed', 'epoch_length', 'batch_size', 'train_every',
     'joint_replay_capacity', 'checkpoint_replay', 'checkpoint_replay_recent',
-    'state_variant', 'workers', 'output_dir', 'smoke_steps',
+    'state_variant', 'learner_variant', 'workers', 'output_dir', 'smoke_steps',
     'event_contract_mode',
 )
 METRICS = {
@@ -232,6 +232,11 @@ def parse_args(argv=None, *, input_fn=None):
                            default=defaults.checkpoint_replay_recent)
         train.add_argument('--state-variant', choices=STATE_VARIANTS,
                            default=defaults.state_variant)
+        train.add_argument(
+            '--learner-variant', choices=LEARNER_VARIANTS,
+            default=defaults.learner_variant,
+            help='Apply MASAC residual or full-Q learning to every selected method',
+        )
         train.add_argument('--output-dir', type=Path)
         train.add_argument('--resume', action='store_true', help='Only resume completed phase boundaries')
         train.add_argument(
@@ -298,6 +303,12 @@ def read_manifest(directory):
     args.output_dir = directory.resolve()
     args.parquet_path = Path(args.parquet_path)
     args.methods = method_selection(args.methods)
+    learner_variant = getattr(args, 'learner_variant', None)
+    if learner_variant not in LEARNER_VARIANTS:
+        raise ValueError(
+            f'Checkpoint learner {learner_variant!r} is no longer supported; '
+            f'choose a source trained with {list(LEARNER_VARIANTS)}'
+        )
     return manifest, args
 
 
@@ -343,7 +354,7 @@ def prepare_test_only(args, *, copy_files=True):
         expected_axes = {
             **method_metadata(spec.operating_mode, spec.variant),
             'state_variant': settings.state_variant,
-            'learner_variant': 'optimization_anchored_residual',
+            'learner_variant': settings.learner_variant,
         }
         if any(metadata.get(key) != value for key, value in expected_axes.items()):
             raise ValueError(f'{method}: checkpoint assignment axes differ from manifest')
@@ -685,6 +696,7 @@ def main(argv=None):
     args = parse_args(argv)
     if args.command == 'list':
         print('Actions: train / test / train-test  (also --action or --mode)')
+        print(f'Learners (--learner-variant): {", ".join(LEARNER_VARIANTS)}')
         print('Training choices (--train-models/--r) / testing choices (--test-models/--r): all or')
         for name in engine.MAIN_METHODS:
             spec = METHODS[name]
@@ -712,7 +724,7 @@ def main(argv=None):
                 else engine.parse_args(engine_arguments(args)))
     if args.dry_run:
         print(json.dumps(dict(phase=args.command, arguments=vars(settings),
-            learner='optimization_anchored_residual', state='joint_state_separate_critics',
+            learner=settings.learner_variant, state=settings.state_variant,
             rejection_predictor='off', test_updates=False,
             training_enabled=args.command != 'test-only', testing_enabled=args.command != 'train-only'),
             default=engine.json_default, indent=2))

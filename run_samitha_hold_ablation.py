@@ -10,6 +10,7 @@ import sys
 
 from run_recourse_multiday_panel import FORMAL_METRICS
 from src.recourse.cluster_stats import summarize_cluster_metric, summarize_paired_cluster_difference
+from src.recourse.types import LEARNER_VARIANTS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -25,6 +26,8 @@ HOLD_METRICS = tuple(dict.fromkeys((*FORMAL_METRICS,
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixed-hold-fractions', nargs='+', type=float, default=[0.1, 0.25, 0.5])
+    parser.add_argument('--learner-variant', choices=LEARNER_VARIANTS,
+                        default='optimization_anchored_residual')
     parser.add_argument('--train-days', nargs='+', required=True)
     parser.add_argument('--test-days', nargs='+', required=True)
     parser.add_argument('--seeds', nargs='+', type=int, required=True)
@@ -69,7 +72,7 @@ def jobs(args):
         output = args.output_dir / arm['arm']
         command = [
             sys.executable, str(ROOT / 'run_recourse_multiday_panel.py'),
-            '--methods', arm['method'], '--learner-variant', 'optimization_anchored_residual',
+            '--methods', arm['method'], '--learner-variant', args.learner_variant,
             '--state-variant', 'joint_state_separate_critics',
             '--samitha-hold-rule', arm['rule'],
             '--samitha-fixed-hold-fraction', str(arm['fraction']),

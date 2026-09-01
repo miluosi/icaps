@@ -99,7 +99,8 @@ class NYCTrainer:
 
     @staticmethod
     def _resolve_zone_distribution_mode(zone_distribution_mode: str | None, encoder: bool = False) -> str:
-        return zone_distribution_mode or ("bayes" if encoder else "none")
+        del encoder
+        return zone_distribution_mode or "optimization_anchored_residual"
 
     @classmethod
     def _distribution_suffix(cls, zone_distribution_mode: str | None, encoder: bool = False) -> str:
@@ -817,7 +818,7 @@ class NYCTrainer:
         start_hour: float = 7.0,
         stop_hour: float = 22.0,
         epoch_length: float = 30.0,
-        zone_distribution_mode: str = "none",
+        zone_distribution_mode: str = "optimization_anchored_residual",
         daily_drop_off: bool = False,
         ifreject: bool = True,
         ifdropoff: bool = False,
@@ -848,7 +849,7 @@ class NYCTrainer:
         integrated_repair_hold_enabled: bool = True,
         target_solver_policy: str = "same_as_rollout_exact",
         state_variant: str = "joint_state_separate_critics",
-        learner_variant: str = "legacy",
+        learner_variant: str = "optimization_anchored_residual",
         ev_acceptance_feature: str = "off",
         ev_acceptance_model: str | None = None,
         ev_response_anchor: str = 'auto',
@@ -953,9 +954,6 @@ class NYCTrainer:
         shared_critic = uses_shared_critic(state_variant)
 
         effective_zone_distribution_mode = self._resolve_zone_distribution_mode(zone_distribution_mode)
-        if learner_variant == "legacy" and effective_zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
-            learner_variant = effective_zone_distribution_mode
-            env.learner_variant = learner_variant
         print(f"Path transformer self-attention: {'enabled' if iftransformer else 'disabled'}")
         use_neural_network = self._trainer_helper._should_train_value_function(
             adpvalue,

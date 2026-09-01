@@ -28,6 +28,7 @@ from datetime import date, datetime
 from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
+from src.recourse.types import LEARNER_VARIANTS
 from run_nyctrainer import run_nyc_training
 
 
@@ -175,25 +176,9 @@ def parse_args():
     parser.add_argument(
         "--distribution-mode",
         type=str,
-        default=None,
-        choices=[
-            "bayes",
-            "time-only",
-            "none",
-            "st_masac_gat",
-            "st_masac_gat_post_demand",
-            "st_masac_gat_post_demand_direct",
-            "integrated_directq",
-            "optimization_anchored_residual",
-            "st_masac_gat_frozen",
-            "st_masac_gat_neighbour_frozen",
-            "st-masac-gat",
-            "st-masac-gat-post-demand",
-            "st-masac-gat-post-demand-direct",
-            "st-masac-gat-frozen",
-            "st-masac-gat-neighbour-frozen",
-        ],
-        help="ICAPS core NYC value-function mode",
+        default="optimization_anchored_residual",
+        choices=LEARNER_VARIANTS,
+        help="Checkpoint learner: MASAC residual or full-Q",
     )
     parser.add_argument("--iftransformer", action="store_true",
                         help="Enable path self-attention before the LSTM path encoder. Default off for old checkpoint compatibility")
@@ -235,29 +220,10 @@ def get_distribution_suffix(distribution_mode: str) -> str:
 
 
 def normalize_distribution_mode(distribution_mode: str | None) -> str:
-    mode = distribution_mode or "none"
-    aliases = {
-        "adpcritic": "adp_critic",
-        "st-masac-gat": "st_masac_gat",
-        "st-masac-gat-post-demand": "st_masac_gat_post_demand",
-        "st-masac-gat-post-demand-direct": "st_masac_gat_post_demand_direct",
-        "masac_demand_direct": "st_masac_gat_post_demand_direct",
-        "standard-masac-gat-greedy-alpha": "standard_masac_gat_greedy_alpha",
-        "standard-masac-gat-fixed-alpha": "standard_masac_gat_fixed_alpha",
-        "standard-masac-gat-total-q": "standard_masac_gat_total_q",
-        "st-masac-gat-former2": "st_masac_gat_former2",
-        "st-masac-gat-former2-queue-feature": "st_masac_gat_former2_queue_feature",
-        "st-masac-gat-former2-queue-feature-greedy-alpha": "st_masac_gat_former2_queue_feature_greedy_alpha",
-        "st-masac-gat-former2-queue-feature-fixed-alpha": "st_masac_gat_former2_queue_feature_fixed_alpha",
-        "masac-former2": "st_masac_gat_former2",
-        "masac-former2-queue": "st_masac_gat_former2_queue_feature",
-        "masacgat": "st_masac_gat",
-        "masac": "st_masac_gat",
-        "masac-baseline": "masac_baseline",
-        "st-masac-gat-frozen": "st_masac_gat_frozen",
-        "st-masac-gat-neighbour-frozen": "st_masac_gat_neighbour_frozen",
-    }
-    return aliases.get(mode, mode)
+    mode = distribution_mode or "optimization_anchored_residual"
+    if mode not in LEARNER_VARIANTS:
+        raise ValueError(f"unsupported learner {mode!r}; choose one of {LEARNER_VARIANTS}")
+    return mode
 
 
 def _first_present_value(stats: dict, *keys: str):
@@ -672,33 +638,11 @@ def main():
     print(f"   Zone scope: {'Manhattan only' if args.only_manhattan_zones else 'full NYC CSV zones'}")
     print(f"   Demand: {'Yellow + non-pooled HVFHV' if args.full_demand else 'Yellow only'}")
     print(f"   Distribution mode: {zone_distribution_mode}")
-    if zone_distribution_mode in {
-        "st_masac_gat",
-        "st_masac_gat_post_demand",
-        "st_masac_gat_post_demand_direct",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-        "st_masac_gat_frozen",
-        "st_masac_gat_neighbour_frozen",
-    }:
+    if zone_distribution_mode in LEARNER_VARIANTS:
         print(f"   GAT neighbour number: {args.gat_neighbour_number}")
-    if zone_distribution_mode in {
-        "st_masac_gat_post_demand_direct",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
+    if zone_distribution_mode == "optimization_anchored_residual":
         print(f"   Post-demand Q weight: {args.post_demand_q_weight:g}")
-    if zone_distribution_mode in {
-        "masac_baseline",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
+    if zone_distribution_mode == "optimization_anchored_residual":
         print(f"   MASAC target entropy ratio: {args.masac_target_entropy_ratio:g}")
     print(f"   iftransformer: {args.iftransformer}")
     print("=" * 80)
@@ -816,6 +760,7 @@ def main():
                     stop_hour=args.stop_hour,
                     epoch_length=args.epoch_length,
                     zone_distribution_mode=zone_distribution_mode,
+                    learner_variant=zone_distribution_mode,
                     ev_acceptance_feature=args.ev_acceptance_feature,
                     ev_acceptance_model=args.ev_acceptance_model,
                 ev_response_anchor=args.ev_response_anchor,

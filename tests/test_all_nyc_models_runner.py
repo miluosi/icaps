@@ -55,6 +55,21 @@ def test_defaults_cover_canonical_nine_not_all_legacy_solver_products():
     assert args.smoke_steps is None
     assert runner.METHODS['no_repair'].operating_mode == 'integrated'
     assert runner.METHODS['evfirst_no_repair'].variant == 'r1'
+    assert args.learner_variant == 'optimization_anchored_residual'
+
+
+def test_method_list_accepts_full_q_and_rejects_removed_learners():
+    args = runner.parse_args([
+        'train-test', '--models', 'recourse-aware', 'R4', 'samitha',
+        '--learner-variant', 'integrated_directq', '--dry-run',
+    ])
+    assert args.methods == ['recourse_macro', 'recourse_nested_q2', 'samitha']
+    assert args.learner_variant == 'integrated_directq'
+    with pytest.raises(SystemExit):
+        runner.parse_args([
+            'train-test', '--models', 'recourse_macro',
+            '--learner-variant', 'structured_myopic', '--dry-run',
+        ])
 
 
 @pytest.mark.parametrize('arguments', [

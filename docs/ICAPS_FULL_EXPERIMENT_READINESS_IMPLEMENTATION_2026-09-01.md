@@ -9,7 +9,7 @@
 | 审计项 | 状态 | 实现位置 |
 |---|---|---|
 | train-once/evaluate-many | 已实现 | `run_recourse_multiday_panel.py`；每个 `(seed, train_window, method)` 只生成一个 checkpoint，每个 test day 独立重载 |
-| Macro 下 Myopic/DirectQ/Residual | 已实现 | `run_assignment_learner_experiment.py`、`src/ValueFunction_structured_myopic.py` |
+| Macro 下 DirectQ/Residual | 已实现 | `run_assignment_learner_experiment.py`、两个保留 learner 的注册表入口 |
 | 规模化实验 | 已实现 runner | `run_assignment_scalability_experiment.py`；100–3000 车、backend、reduction、边数、延迟、内存、fallback、gap |
 | rejection/AEV/demand sensitivity | 已实现 | `run_recourse_sensitivity.py`；adaptation 与 nominal-checkpoint robustness 分开 |
 | energy sensitivity | 已实现 general-charging 轴 | station capacity、battery consumption、initial SOC、charge-duration scale、unreachable charging vehicles |
@@ -39,13 +39,11 @@ $$
 y_t^{R4}=R_t^{\mathrm{EV}}+V_{2,t}^{-}(\bar S_t^2),\qquad y_t^{(2)}=R_t^{\mathrm{AEV}}+\gamma^{\Delta t_t}V_{1,t+1}^{-}(S_{t+1}).
 $$
 
-同一 Macro 物理架构的 learner family：
+同一 Macro 物理架构当前只保留两个 learner family：
 
 $$
-\Psi^{\mathrm{myopic}}(e,S)=G(e,S),\qquad \Psi^{\mathrm{DirectQ}}_\theta(e,S)=Q_\theta(e,S),\qquad \Psi^{\mathrm{residual}}_\theta(e,S)=G(e,S)+\Delta_\theta(e,S).
+\Psi^{\mathrm{DirectQ}}_\theta(e,S)=Q_\theta(e,S),\qquad \Psi^{\mathrm{residual}}_\theta(e,S)=G(e,S)+\Delta_\theta(e,S).
 $$
-
-`structured_myopic` 永久使用 structured-only projection，不调用神经网络生成部署分数，且 `train_step` 不执行 optimizer update。
 
 ## 实验统计单位
 
@@ -68,10 +66,10 @@ $$
 - 新增 readiness 单元测试：9/9 通过；
 - 受影响的 recourse/day/assignment/hold/charging/acceptance 测试（含上述 readiness 测试）：90/90 通过；
 - learner、state、scale、sensitivity、hold 五类正式入口 dry-run 通过；
-- NYC 真实接口 smoke：8 车、4 EV、8 train steps、8 held-out steps、一个 seed；Myopic 更新 0 次，DirectQ 更新 8 次，Residual 更新 8 次；checkpoint 全部独立重载且测试不改权重；
+- NYC 真实接口 smoke：8 车、4 EV、8 train steps、8 held-out steps、一个 seed；DirectQ 与 Residual 都发生更新；checkpoint 全部独立重载且测试不改权重；
 - smoke artifacts：`results/full_experiment_readiness_smoke_2026-09-01/`（该目录受 `.gitignore` 管理）。
 
-- 完整测试套件：476/476 通过；
+- 当前清理后的完整测试套件：453/453 通过；
 - `make smoke-toy`、`make smoke-nyc`、`make smoke-recourse` 和 assignment runner dry-run 均通过。
 
 ## 正式运行前仍需冻结

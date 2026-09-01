@@ -9,6 +9,7 @@ from datetime import datetime
 import src.ADPtrainer as adp_trainer_module
 from src.ADPtrainer import ADPTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
+from src.recourse.types import LEARNER_VARIANTS
 from src.synthetic_scenario import (
     DEFAULT_AEV_INITIAL_BATTERY_SCALE,
     DEFAULT_CHARGE_DURATION,
@@ -227,13 +228,8 @@ def parse_args():
     parser.add_argument(
         "--distribution-mode",
         type=str,
-        default="st_masac_gat_queue_demand_gurobi",
-        choices=[
-            "bayes", "time-only", "none",
-            "integrated_directq", "optimization_anchored_residual",
-            "st_masac_gat_post_demand_direct",
-            "st_masac_gat_queue_demand_gurobi",
-        ],
+        default="optimization_anchored_residual",
+        choices=LEARNER_VARIANTS,
         help="ICAPS core value-function mode for checkpoint lookup and evaluation",
     )
     parser.add_argument("--simulation-period", type=int, default=DEFAULT_SIMULATION_PERIOD, help="Simulation steps per virtual day")
@@ -284,48 +280,15 @@ def parse_args():
 
 
 def normalize_distribution_mode(distribution_mode: str | None) -> str:
-    mode = distribution_mode or "none"
-    aliases = {
-        "masac_demand_direct": "st_masac_gat_post_demand_direct",
-    }
-    return aliases.get(mode, mode)
+    mode = distribution_mode or "optimization_anchored_residual"
+    if mode not in LEARNER_VARIANTS:
+        raise ValueError(f"unsupported learner {mode!r}; choose one of {LEARNER_VARIANTS}")
+    return mode
 
 
 def get_distribution_suffix(distribution_mode: str) -> str:
     distribution_mode = normalize_distribution_mode(distribution_mode)
-    if distribution_mode == "elbo":
-        return "_noenc"
-    if distribution_mode == "bayes":
-        return ""
-    if distribution_mode == "bayes_simple":
-        return "_bayes_simple"
-    if distribution_mode == "none":
-        return "_none"
-    if distribution_mode == "masac_queue_length":
-        return "_masac_queue_length"
-    if distribution_mode == "st_masac_gat_former2_queue_feature":
-        return "_st_masac_gat_former2_queue_feature"
-    if distribution_mode == "st_masac_gat_former2_queue_feature_greedy_alpha":
-        return "_st_masac_gat_former2_queue_feature_greedy_alpha"
-    if distribution_mode == "st_masac_gat_former2_queue_feature_fixed_alpha":
-        return "_st_masac_gat_former2_queue_feature_fixed_alpha"
-    if distribution_mode == "masac_baseline":
-        return "_masac_baseline"
-    if distribution_mode == "st_masac_gat_post_demand_direct":
-        return "_st_masac_gat_post_demand_direct"
-    if distribution_mode == "st_masac_gat_queue_demand_gurobi":
-        return "_st_masac_gat_queue_demand_gurobi"
-    if distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
-        return "_" + distribution_mode
-    if distribution_mode == "standard_masac_gat":
-        return "_standard_masac_gat"
-    if distribution_mode == "standard_masac_gat_total_q":
-        return "_standard_masac_gat_total_q"
-    if distribution_mode == "standard_masac_gat_greedy_alpha":
-        return "_standard_masac_gat_greedy_alpha"
-    if distribution_mode == "standard_masac_gat_fixed_alpha":
-        return "_standard_masac_gat_fixed_alpha"
-    return "_noenc"
+    return "_" + distribution_mode
 
 
 def build_checkpoint_dir(
@@ -386,42 +349,10 @@ def main():
     from src.acceptance_features import acceptance_checkpoint_suffix
     checkpoint_lookup_suffix = checkpoint_scenario_suffix + acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model,
         anchor=args.ev_response_anchor, critic_input=args.ev_response_critic_input)
-    if zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
-        from src.value_function_registry import get_value_function_class
-        adp_trainer_module.PyTorchChargingValueFunction = get_value_function_class(zone_distribution_mode)
-    elif zone_distribution_mode == "elbo":
-        from src.ValueFunction_pytorch_elbo import PyTorchChargingValueFunction as ELBOPyTorchChargingValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = ELBOPyTorchChargingValueFunction
-    elif zone_distribution_mode == "bayes_simple":
-        from src.ValueFunction_pytorch_bayessimple import PyTorchChargingValueFunction as BayesSimplePyTorchChargingValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = BayesSimplePyTorchChargingValueFunction
-    elif zone_distribution_mode in {
-        "masac_queue_length",
-        "st_masac_gat_former2_queue_feature",
-        "st_masac_gat_former2_queue_feature_greedy_alpha",
-        "st_masac_gat_former2_queue_feature_fixed_alpha",
-    }:
-        from src.ValueFunction_st_masac_gat_former2_queue_feature import PyTorchChargingValueFunction as MASACQueueLengthValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = MASACQueueLengthValueFunction
-    elif zone_distribution_mode == "masac_baseline":
-        from src.ValueFunction_masac_baseline import PyTorchChargingValueFunction as MASACBaselineValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = MASACBaselineValueFunction
-    elif zone_distribution_mode in {
-        "st_masac_gat_post_demand_direct",
-        "st_masac_gat_queue_demand_gurobi",
-    }:
-        from src.ValueFunction_st_masac_gat_post_demand_direct import PyTorchChargingValueFunction as MASACPostDemandDirectValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = MASACPostDemandDirectValueFunction
-    elif zone_distribution_mode == "standard_masac_gat_total_q":
-        from src.ValueFunction_standard_masac_gat_total_q import PyTorchChargingValueFunction as StandardMASACTotalQValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = StandardMASACTotalQValueFunction
-    elif zone_distribution_mode in {
-        "standard_masac_gat",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
-        from src.ValueFunction_standard_masac_gat import PyTorchChargingValueFunction as StandardMASACGATValueFunction
-        adp_trainer_module.PyTorchChargingValueFunction = StandardMASACGATValueFunction
+    from src.value_function_registry import get_value_function_class
+    adp_trainer_module.PyTorchChargingValueFunction = get_value_function_class(
+        zone_distribution_mode
+    )
     demand_map = {"intense": True, "random": False}
     strategy_map = {s["name"]: s for s in STRATEGIES}
     selected_strategies = [strategy_map[n] for n in args.strategies]
@@ -559,6 +490,7 @@ def main():
                         aev_initial_battery_scale=args.aev_initial_battery_scale,
                         critical_charging_battery=args.critical_charging_battery,
                         zone_distribution_mode=zone_distribution_mode,
+                        learner_variant=zone_distribution_mode,
                         ev_acceptance_feature=args.ev_acceptance_feature,
                         ev_acceptance_model=args.ev_acceptance_model,
                 ev_response_anchor=args.ev_response_anchor,

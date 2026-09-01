@@ -1,4 +1,4 @@
-"""Compare Myopic, DirectQ, and residual learning under Macro recourse.
+"""Compare full-Q and MASAC residual learning under Macro recourse.
 
 Only the learner changes.  Physical architecture, state, exact solver,
 predictor controls, date windows, CRN, and update schedule are shared.
@@ -17,12 +17,8 @@ from src.recourse.cluster_stats import summarize_cluster_metric, summarize_paire
 
 
 ROOT = Path(__file__).resolve().parent
-LEARNERS = ('structured_myopic', 'integrated_directq', 'optimization_anchored_residual')
-CONTRASTS = (
-    ('structured_myopic', 'integrated_directq'),
-    ('integrated_directq', 'optimization_anchored_residual'),
-    ('structured_myopic', 'optimization_anchored_residual'),
-)
+LEARNERS = ('integrated_directq', 'optimization_anchored_residual')
+CONTRASTS = (('integrated_directq', 'optimization_anchored_residual'),)
 
 
 def parse_args(argv=None):

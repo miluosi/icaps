@@ -64,7 +64,7 @@ def test_every_registered_learner_receives_probability_and_roundtrips(env, mode)
         value.load_extra_checkpoint_state(bad)
 
 
-@pytest.mark.parametrize('mode', ['integrated_directq', 'optimization_anchored_residual', 'bayes', 'time-only'])
+@pytest.mark.parametrize('mode', ['integrated_directq', 'optimization_anchored_residual'])
 def test_replay_probability_is_pre_offer_not_live_or_outcome(env, mode):
     value = make_value(env, mode)
     state = StateSnapshotBuilder.build(env)
@@ -125,33 +125,6 @@ def test_probability_column_has_td_gradient_and_preserves_initialization(env, mo
         assert torch.equal(tensor, off.graph_encoder.state_dict()[key])
 
 
-@pytest.mark.parametrize('mode', ['bayes', 'time-only', 'st_masac_gat_queue_demand_gurobi'])
-def test_legacy_learning_end_to_end_with_probability(env, mode):
-    model_state = env.ev_acceptance_model.to_dict()
-    env = make_environment(parse_args(['--num-vehicles', '20', '--num-ev', '10']), 883)
-    configure_acceptance_feature(env, 'predicted', model_state=model_state)
-    cls = get_value_function_class(mode)
-    pair = [cls(env=env, num_vehicles=20, grid_size=env.grid_size,
-                episode_length=env.episode_length, zone_distribution_mode=mode) for _ in range(2)]
-    for vf in pair:
-        vf.learner_variant = 'legacy'
-    env.set_value_function(pair[0])
-    env.set_value_function_ev(pair[1])
-    env.adp_value = 1
-    env.evaluatemode = False
-    for _ in range(45):
-        actions, stored, stored_ev = env.simulate_motion(
-            agents=[], current_requests=list(env.active_requests.values()), rebalance=True)
-        env.step(actions, stored, stored_ev)
-    before = [p.detach().clone() for p in pair[1].network.parameters()]
-    # Legacy residual beta starts at zero; subsequent updates activate TD
-    # gradients on the residual critic.
-    for _ in range(3):
-        loss = pair[1].train_step(batch_size=8, ifEV=True)
-    assert np.isfinite(loss)
-    assert any(not torch.equal(a, b) for a, b in zip(before, pair[1].network.parameters()))
-
-
 def test_nyc_dispatch_uses_startup_features_and_joint_training_counter():
     from src.NYCEnvironment import NYCEnvironment
     ready = NYCEnvironment._value_function_ready_for_dispatch
@@ -189,24 +162,3 @@ def test_full_feature_vector_matches_snapshot_and_survives_live_mutation(env):
     for vehicle in env.vehicles.values():
         vehicle.update(battery=.01, is_online=False, idle_timer=500, penalty_timer=10)
     assert live == offer_features(env, vid, saved_request, snapshot=state)
-
-
-def test_bayes_probability_adapter_preserves_supplied_edge_features(env, monkeypatch):
-    value = make_value(env, 'bayes')
-    vid = next(k for k, v in env.vehicles.items() if v['type'] == 1)
-    req = next(iter(env.active_requests.values()))
-    captured = {}
-    def forward(**kwargs):
-        captured.update(kwargs)
-        return [0.0]
-    monkeypatch.setattr(value, 'batch_get_mixed_q_values', forward)
-    value.batch_get_assignment_q_value([dict(
-        vehicle_id=vid, target_id=req.request_id, vehicle_location=env.vehicles[vid]['location'],
-        target_location=req.pickup, pickup_dist=7.5, pick_zone=3, vehicle_idle_time=4.0,
-        post_action_distance=12.0, post_action_duration=18.0, post_action_zoneid=5)])
-    assert captured['target_distances'] == [7.5]
-    assert captured['target_zoneids'] == [3]
-    assert captured['vehicle_idle_times'] == [4.0]
-    assert captured['post_action_distances'] == [12.0]
-    assert captured['post_action_durations'] == [18.0]
-    assert captured['post_action_zoneids'] == [5]

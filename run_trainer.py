@@ -13,7 +13,9 @@ from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 from src.recourse.config import VARIANT_CHOICES, add_method_arguments, resolve_method_arguments
 from src.recourse.manifest import write_experiment_manifest
 from src.value_function_registry import (
+    VALUE_FUNCTION_CHOICES,
     get_value_function_class,
+    resolve_value_function_mode,
     validate_value_function_registry,
 )
 from src.synthetic_scenario import (
@@ -152,21 +154,15 @@ def parse_args():
     parser.add_argument(
         "--learner-variant",
         choices=LEARNER_VARIANTS,
-        default="legacy",
-        help="Integrated learner target family",
+        default=None,
+        help="Learning family; only MASAC residual and full-Q are supported",
     )
     parser.add_argument(
         "--distribution-mode",
         type=str,
-        default="st_masac_gat_queue_demand_gurobi",
-        choices=[
-            "bayes", "time-only", "none",
-            "st_masac_gat_post_demand_direct",
-            "st_masac_gat_queue_demand_gurobi",
-            "optimization_anchored_residual",
-            "integrated_directq",
-        ],
-        help="ICAPS core value-function mode",
+        default=None,
+        choices=VALUE_FUNCTION_CHOICES,
+        help="Compatibility alias for --learner-variant",
     )
     parser.add_argument("--post-demand-q-weight", type=float, default=0.0, help="Initial action-head weight for direct post-demand MASAC")
     parser.add_argument("--post-demand-head-lr-multiplier", type=float, default=10.0, help="Learning-rate multiplier for the direct post-demand action head")
@@ -209,7 +205,12 @@ def parse_args():
 
 
 def main():
-    args = resolve_method_arguments(parse_args())
+    args = parse_args()
+    args.learner_variant = resolve_value_function_mode(
+        args.learner_variant, args.distribution_mode
+    )
+    args.distribution_mode = args.learner_variant
+    args = resolve_method_arguments(args)
     if args.recourse_variant != "legacy" and (
         args.all_modes
         or any(mode != "evfirst" for mode in args.transportation_mode)
@@ -219,18 +220,7 @@ def main():
         )
     if args.useauction:
         args.usemcmf = True
-    zone_distribution_mode = (
-        args.learner_variant
-        if args.learner_variant != "legacy"
-        else (args.distribution_mode or "none")
-    )
-    if args.learner_variant == "integrated_directq" and (
-        args.all_modes
-        or any(mode not in {"integrated", "integrated_repair"} for mode in args.transportation_mode)
-    ):
-        raise ValueError(
-            "integrated_directq requires --transportation-mode integrated"
-        )
+    zone_distribution_mode = args.learner_variant
     validate_value_function_registry()
     adp_trainer_module.PyTorchChargingValueFunction = get_value_function_class(
         zone_distribution_mode
@@ -241,11 +231,7 @@ def main():
     print(f"Mode={args.transportation_mode}, use_intense_requests={args.use_intense_requests}, assignment_gurobi={args.assignment_gurobi}")
     print(f"known_reject={args.known_reject}, heuristic_battery_threshold={args.heuristic_battery_threshold}, grid_size={args.grid_size}, stations={args.num_stations}, station_capacity={args.station_capacity}, charge_duration={args.charge_duration}, seed={args.random_seed}")
     print(f"distribution_mode={zone_distribution_mode}")
-    if zone_distribution_mode in {
-        "masac_baseline",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-    }:
+    if zone_distribution_mode == "optimization_anchored_residual":
         print(
             "masac_target_entropy_ratio="
             f"{args.masac_target_entropy_ratio:g}"

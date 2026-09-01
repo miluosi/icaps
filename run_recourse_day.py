@@ -202,12 +202,8 @@ def run_worker(args):
             initial_hash = weight_hash(pair)
             trained = rollout(args, env, pair, method, training=True, progress_path=folder / 'progress.json')
             trained_hash = weight_hash(pair)
-            if (env.learner_variant != 'structured_myopic'
-                    and initial_hash == trained_hash):
+            if initial_hash == trained_hash:
                 raise AssertionError('Training did not change any model weights')
-            if (env.learner_variant == 'structured_myopic'
-                    and initial_hash != trained_hash):
-                raise AssertionError('Myopic control unexpectedly changed model weights')
             spec = METHODS[method]
             save_pair(pair, checkpoint, dict(method=method, initial_weight_hash=initial_hash,
                 trained_weight_hash=trained_hash, train_date=args.train_date, test_date=args.test_date,

@@ -24,8 +24,10 @@ from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
 from src.value_function_registry import (
+    DEFAULT_VALUE_FUNCTION,
     VALUE_FUNCTION_CHOICES,
     get_value_function_class,
+    resolve_value_function_mode,
     validate_value_function_registry,
 )
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
@@ -324,34 +326,37 @@ def parse_args():
     parser.add_argument(
         "--learner-variant",
         choices=LEARNER_VARIANTS,
-        default="legacy",
-        help="Integrated learner target family",
+        default=None,
+        help=(
+            "Learning family; default optimization_anchored_residual. "
+            "Only MASAC residual and full-Q learning are supported."
+        ),
     )
     parser.add_argument(
         "--pretrained-zone-dir",
         type=str,
         default="checkpoints/zone_pretrain",
-        help="Root directory produced by pretrain_zonepredictor/pretrain_zone.py and consumed by bayes_simple_pretrain",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--iftransformer", action="store_true",
                         help="Enable path self-attention before the LSTM path encoder. Default off for old checkpoint compatibility")
     parser.set_defaults(iftransformer=False)
     parser.add_argument("--zone-pretrain-output-dir", type=str, default=None,
-                        help="Output root for --distribution-mode pretrain_zonepredictor; defaults to --pretrained-zone-dir")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-max-steps", type=int, default=None,
-                        help="Optional per-episode rollout cap for zone predictor pretraining")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-epochs", type=int, default=100,
-                        help="Gradient epochs for zone predictor pretraining")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-batch-size", type=int, default=64,
-                        help="Batch size for zone predictor pretraining")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-learning-rate", type=float, default=1e-3,
-                        help="Learning rate for zone predictor pretraining")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-validation-fraction", type=float, default=0.2,
-                        help="Validation fraction for zone predictor pretraining")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-label-smoothing", type=float, default=0.02,
-                        help="Target label smoothing for zone predictor KL training")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-top-k", type=int, default=8,
-                        help="Top-K zones to save/print in zone predictor diagnostics")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--all-modes", action="store_true", help="Run all transportation modes instead of only the specified mode")
     parser.add_argument("--all-demand-patterns", action="store_true", help="Compatibility flag only; NYC real-demand runs ignore synthetic demand-pattern sweeps")
     parser.add_argument("--benchmark-solvers-only", action="store_true",
@@ -870,7 +875,7 @@ def run_nyc_training(
     start_hour: float = 7.0,
     stop_hour: float = 22.0,
     epoch_length: float = 30.0,
-    zone_distribution_mode: str = "none",
+    zone_distribution_mode: str = DEFAULT_VALUE_FUNCTION,
     daily_drop_off: bool = False,
     ifreject: bool = True,
     ifdropoff: bool = False,
@@ -903,7 +908,7 @@ def run_nyc_training(
     integrated_repair_hold_enabled: bool = True,
     target_solver_policy: str = "same_as_rollout_exact",
     state_variant: str = "joint_state_separate_critics",
-    learner_variant: str = "legacy",
+    learner_variant: str = DEFAULT_VALUE_FUNCTION,
     ev_acceptance_feature: str = "off",
     ev_acceptance_model: str | None = None,
         ev_response_anchor: str = 'auto',
@@ -1010,7 +1015,12 @@ def run_nyc_training(
 
 
 def main():
-    args = resolve_method_arguments(apply_paper_parameter_preset(parse_args()))
+    args = apply_paper_parameter_preset(parse_args())
+    args.learner_variant = resolve_value_function_mode(
+        args.learner_variant, args.distribution_mode
+    )
+    args.distribution_mode = args.learner_variant
+    args = resolve_method_arguments(args)
     validate_value_function_registry()
     if args.recourse_variant != "legacy":
         invalid_modes = [
@@ -1037,18 +1047,7 @@ def main():
             f"{inferred_end_year_month} derived from date range and episodes={args.episodes}"
         )
     args.end_year_month = inferred_end_year_month
-    zone_distribution_mode = (
-        args.learner_variant
-        if args.learner_variant != "legacy"
-        else (args.distribution_mode or "none")
-    )
-    if args.learner_variant == "integrated_directq" and (
-        args.all_modes
-        or any(mode not in {"integrated", "integrated_repair"} for mode in args.transportation_mode)
-    ):
-        raise ValueError(
-            "integrated_directq requires --transportation-mode integrated"
-        )
+    zone_distribution_mode = args.learner_variant
     experiment_namespace = (
         f"rec-{args.recourse_variant}_state-{args.state_variant}_"
         f"learner-{args.learner_variant}_shift-{args.rejection_logit_shift:g}"
@@ -1070,40 +1069,15 @@ def main():
         print(f"  hvfhv_parquet={args.hvfhv_parquet_path}")
     print(f"  dates={args.start_date}..{args.end_date}")
     print(f"  distribution_mode={zone_distribution_mode}")
-    if zone_distribution_mode in {
-        "st_masac_gat",
-        "st_masac_gat_post_demand",
-        "st_masac_gat_post_demand_direct",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-        "optimization_anchored_residual",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-        "st_masac_gat_frozen",
-        "st_masac_gat_neighbour_frozen",
-    }:
+    if zone_distribution_mode in VALUE_FUNCTION_CHOICES:
         print(f"  gat_neighbour_number={args.gat_neighbour_number}")
-    if zone_distribution_mode in {
-        "st_masac_gat_post_demand_direct",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-        "optimization_anchored_residual",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
+    if zone_distribution_mode == "optimization_anchored_residual":
         print(f"  post_demand_q_weight={args.post_demand_q_weight:g}")
         print(
             "  post_demand_head_lr_multiplier="
             f"{args.post_demand_head_lr_multiplier:g}"
         )
-    if zone_distribution_mode in {
-        "masac_baseline",
-        "standard_masac_gat",
-        "standard_masac_gat_total_q",
-        "optimization_anchored_residual",
-        "standard_masac_gat_greedy_alpha",
-        "standard_masac_gat_fixed_alpha",
-    }:
+    if zone_distribution_mode == "optimization_anchored_residual":
         print(
             "  masac_target_entropy_ratio="
             f"{args.masac_target_entropy_ratio:g}"

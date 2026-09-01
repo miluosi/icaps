@@ -258,8 +258,7 @@ def rollout(
         reward += sum(map(float, rewards.values()))
         for vid, returned_reward in rewards.items():
             fleet_rewards[int(env.vehicles[vid]['type'])] += float(returned_reward)
-        if (training and env.learner_variant != 'structured_myopic'
-                and (step + 1) % args.train_every == 0):
+        if training and (step + 1) % args.train_every == 0:
             for value, is_ev in ((pair[0], False), (pair[1], True)):
                 loss = value.train_step(batch_size=args.batch_size, ifEV=is_ev)
                 if not np.isfinite(loss):
@@ -404,12 +403,9 @@ def rollout(
             for name in modules
             for parameter in getattr(value, name).parameters()
         ))
-        stats['effective_trainable_parameter_count'] = (
-            0 if env.learner_variant == 'structured_myopic'
-            else stats['model_parameter_count']
-        )
+        stats['effective_trainable_parameter_count'] = stats['model_parameter_count']
         stats['gradient_update_count'] = int(sum(stats['optimizer_steps_joint']))
-        if env.learner_variant != 'structured_myopic' and sum(stats['optimizer_steps_joint']) == 0:
+        if sum(stats['optimizer_steps_joint']) == 0:
             raise AssertionError('No joint critic update; extend rollout or reduce train-every')
         if any(stats['optimizer_steps_edge']):
             raise AssertionError('Main recourse must not execute edge Bellman TD')

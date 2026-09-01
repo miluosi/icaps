@@ -10,19 +10,21 @@ import run_recourse_sensitivity
 from run_recourse_spatiotemporal_analysis import aggregate as aggregate_spatiotemporal
 from src.NYCEnvironment import NYCEnvironment
 from src.recourse.integrated_repair import apply_hold_policy
-from src.value_function_registry import get_value_function_class
+from src.value_function_registry import VALUE_FUNCTION_CHOICES, get_value_function_class
 from test_recourse_must_fix import _graph
 from test_recourse_reaudit import _single_edge_graph, _transition
 
 
-def test_structured_myopic_is_registry_backed_and_never_updates_or_switches():
-    cls = get_value_function_class('structured_myopic')
-    value = cls.__new__(cls)
-    value.planning_objective_mode = 'structured_only'
-    assert value.set_planning_objective_mode('learned') == 'structured_only'
-    assert value.planning_objective_mode == 'structured_only'
-    assert value.train_step(batch_size=2, ifEV=True) == 0.0
-    assert value.train_queue_predictor() == 0.0
+def test_public_registry_contains_only_residual_and_full_q_learners():
+    assert VALUE_FUNCTION_CHOICES == (
+        'optimization_anchored_residual', 'integrated_directq',
+    )
+    assert get_value_function_class('optimization_anchored_residual').learner_variant == (
+        'optimization_anchored_residual'
+    )
+    assert get_value_function_class('integrated_directq').learner_variant == (
+        'integrated_directq'
+    )
 
 
 def test_nyc_demand_scaling_is_keyed_deterministic_and_assigns_unique_ids():

@@ -36,7 +36,7 @@
 
 这些训练函数是显式、可测试的命名入口，最终都调用同一个经过验证的 `run_training_worker`，再由所选配置决定物理补救、credit/target 和 motion；不是复制九份训练算法。
 
-九种方法默认使用 `optimization_anchored_residual` 和 `joint_state_separate_critics`，便于比较 repair/credit；状态实验可通过 `--state-variant` 显式改变信息集。**本脚本不声称覆盖 Full-Q、所有历史 MASAC 网络或所有非学习基线。** 项目原有这些模式未删除，也未修改。
+九种方法默认使用 `optimization_anchored_residual` 和 `joint_state_separate_critics`，便于比较 repair/credit；也可统一指定 `--learner-variant integrated_directq` 运行 full-Q。公开入口只保留这两种 learner，历史 learner 不再出现在注册表或命令行选择中。
 
 ## 与 ADP/NYC train/test 的关系
 
@@ -73,6 +73,7 @@ python test_all_nyc_models.py --list-models
 # 仅训练指定方法，保存 checkpoint 后结束
 python test_all_nyc_models.py --action train \
   --train-models no_repair evfirst_no_rejection evfirst_no_repair evfirst_no_repair_structured repair_only repair_learning recourse_macro recourse_nested_q2 samitha \
+  --learner-variant optimization_anchored_residual \
   --output-dir results/nyc_all_models/train-selected
 
 # 只测试已有训练结果中的指定子集，不重新训练
@@ -83,6 +84,7 @@ python test_all_nyc_models.py --action test \
 
 # 同一列表连续训练与测试
 python test_all_nyc_models.py --action train-test --train-models all \
+  --learner-variant integrated_directq \
   --output-dir results/nyc_all_models/train-test-all
 
 # 直接输入 R1--R4；内部结果仍保存规范方法名
@@ -215,7 +217,7 @@ output-dir/
 
 配套入口：
 
-- `run_assignment_learner_experiment.py`：同一 Macro 架构下比较 structured myopic、DirectQ、optimization-anchored residual；
+- `run_assignment_learner_experiment.py`：同一 Macro 架构下比较 DirectQ 与 optimization-anchored residual；
 - `run_assignment_state_experiment.py` 与 `run_assignment_state_audit.py`：state performance paired summary 和 pre/residual/stage-graph 泄漏审计；
 - `run_assignment_scalability_experiment.py`：100–3000 车、reduction/backend、图规模、延迟和内存；
 - `run_recourse_sensitivity.py`：拒单 logit、AEV share、需求、站点容量、耗电、初始 SOC 和充电时长；

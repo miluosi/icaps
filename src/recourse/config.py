@@ -173,7 +173,7 @@ def validate_joint_learner(mode, variant, value_function_class):
     if requires_joint and not callable(getattr(value_function_class, "_train_joint_step", None)):
         raise ValueError(
             "Repair/Macro learning requires a solver-consistent joint critic; "
-            "use --learner-variant optimization_anchored_residual"
+            "use --learner-variant optimization_anchored_residual or integrated_directq"
         )
 
 
@@ -221,15 +221,7 @@ def resolve_method_arguments(args):
         spec = METHODS[args.recourse_method]
         args.transportation_mode = [spec.operating_mode]
         args.recourse_variant = spec.variant
-        if args.learner_variant == "legacy" and spec.repair_policy != "none":
-            args.learner_variant = "optimization_anchored_residual"
         if args.all_modes:
             raise ValueError("--recourse-method cannot be combined with --all-modes")
     args.recourse_variant = canonical_variant(args.recourse_variant)
-    if (args.recourse_variant in {"r1_structured", "r2", "r3", "r4", "recourse_macro"}
-            and args.learner_variant == "legacy" and args.distribution_mode in {None, "none"}):
-        args.learner_variant = "optimization_anchored_residual"
-    if ("integrated_repair" in args.transportation_mode and args.learner_variant == "legacy"
-            and args.distribution_mode in {None, "none"}):
-        args.learner_variant = "optimization_anchored_residual"
     return args

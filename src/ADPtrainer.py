@@ -968,7 +968,7 @@ class ADPTrainer:
         days_per_week: int = 7,
         episode_length: int = None,
         encoder: bool = True,
-        zone_distribution_mode: str = None,
+        zone_distribution_mode: str = "optimization_anchored_residual",
         battery_first: bool = False,
         daily_drop_off: bool = False,
         iftest_aev: bool = False,
@@ -995,7 +995,7 @@ class ADPTrainer:
         integrated_repair_hold_enabled: bool = True,
         target_solver_policy: str = "same_as_rollout_exact",
         state_variant: str = "joint_state_separate_critics",
-        learner_variant: str = "legacy",
+        learner_variant: str = "optimization_anchored_residual",
         ev_acceptance_feature: str = "off",
         ev_acceptance_model: str | None = None,
         ev_response_anchor: str = 'auto',
@@ -1076,9 +1076,7 @@ class ADPTrainer:
 
         episode_days = None if episode_length is None else max(1, int(np.ceil(episode_length / max(simulation_period, 1))))
 
-        effective_zone_distribution_mode = zone_distribution_mode or ("bayes" if encoder else "none")
-        if learner_variant == "legacy" and effective_zone_distribution_mode in {"integrated_directq", "optimization_anchored_residual"}:
-            learner_variant = effective_zone_distribution_mode
+        effective_zone_distribution_mode = zone_distribution_mode or "optimization_anchored_residual"
         encoder_enabled = effective_zone_distribution_mode in {"bayes", "bayes_simple"}
 
         def get_distribution_suffix() -> str:

@@ -23,38 +23,42 @@ class ValueFunctionSpec:
 
 
 VALUE_FUNCTION_REGISTRY: dict[str, ValueFunctionSpec] = {
-    "bayes": ValueFunctionSpec("src.ValueFunction_pytorch_bayes"),
-    "time-only": ValueFunctionSpec("src.ValueFunction_pytorch_bayes"),
-    "st_masac_gat": ValueFunctionSpec("src.ValueFunction_st_masac_gat"),
-    "st_masac_gat_frozen": ValueFunctionSpec("src.ValueFunction_st_masac_gat"),
-    "st_masac_gat_neighbour_frozen": ValueFunctionSpec("src.ValueFunction_st_masac_gat"),
-    "st_masac_gat_post_demand": ValueFunctionSpec(
-        "src.ValueFunction_st_masac_gat_post_demand"
-    ),
-    "st_masac_gat_post_demand_direct": ValueFunctionSpec(
-        "src.ValueFunction_st_masac_gat_post_demand_direct"
-    ),
-    "st_masac_gat_queue_demand_gurobi": ValueFunctionSpec(
-        "src.ValueFunction_st_masac_gat_post_demand_direct"
-    ),
     "optimization_anchored_residual": ValueFunctionSpec(
         "src.ValueFunction_optimization_anchored_residual"
     ),
     "integrated_directq": ValueFunctionSpec("src.ValueFunction_integrated_directq"),
-    # Formal no-learning comparator. It is addressable by the experiment
-    # registry but is intentionally not a general neural distribution mode.
-    "structured_myopic": ValueFunctionSpec(
-        "src.ValueFunction_structured_myopic", public=False
-    ),
-    # `none` is a control condition.  The trainer never constructs this class
-    # when ADP is disabled, but mapping it keeps registry validation total.
-    "none": ValueFunctionSpec("src.ValueFunction_pytorch_bayes"),
+    # Internal ADP=0 compatibility sentinel. It is deliberately not a public
+    # learning choice; public CLIs expose only the two learners above.
+    "none": ValueFunctionSpec("src.ValueFunction_pytorch_bayes", public=False),
 }
 
 
 VALUE_FUNCTION_CHOICES = tuple(
     key for key, spec in VALUE_FUNCTION_REGISTRY.items() if spec.public
 )
+DEFAULT_VALUE_FUNCTION = "optimization_anchored_residual"
+
+
+def resolve_value_function_mode(
+    learner_variant: str | None,
+    distribution_mode: str | None,
+) -> str:
+    """Resolve the compatibility flags to one of the two retained learners."""
+    learner = None if learner_variant is None else str(learner_variant).strip().lower()
+    distribution = (
+        None if distribution_mode is None else str(distribution_mode).strip().lower()
+    )
+    for label, value in (("learner variant", learner), ("distribution mode", distribution)):
+        if value is not None and value not in VALUE_FUNCTION_CHOICES:
+            raise ValueError(
+                f"unknown {label} {value!r}; choose one of "
+                f"{', '.join(VALUE_FUNCTION_CHOICES)}"
+            )
+    if learner is not None and distribution is not None and learner != distribution:
+        raise ValueError(
+            "--learner-variant and --distribution-mode must select the same learner"
+        )
+    return learner or distribution or DEFAULT_VALUE_FUNCTION
 
 
 def get_value_function_class(distribution_mode: str) -> type:

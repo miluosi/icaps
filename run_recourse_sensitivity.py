@@ -18,6 +18,7 @@ from run_recourse_multiday_panel import (
     policy_folder, train_window_id,
 )
 from src.recourse.cluster_stats import summarize_cluster_metric
+from src.recourse.types import LEARNER_VARIANTS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -49,6 +50,8 @@ def parse_args(argv=None):
     parser.add_argument('--initial-battery-means', nargs='+', type=float, default=[0.875])
     parser.add_argument('--charge-duration-scales', nargs='+', type=float, default=[1.0])
     parser.add_argument('--methods', nargs='+', default=list(DEFAULT_METHODS))
+    parser.add_argument('--learner-variant', choices=LEARNER_VARIANTS,
+                        default='optimization_anchored_residual')
     parser.add_argument('--train-days', nargs='+', required=True)
     parser.add_argument('--test-days', nargs='+', required=True)
     parser.add_argument('--seeds', nargs='+', type=int, required=True)
@@ -145,6 +148,7 @@ def multiday_command(args, config, output):
         '--initial-battery-mean', str(config['initial_battery_mean']),
         '--charge-duration-scale', str(config['charge_duration_scale']),
         '--energy-model', args.energy_model, '--workers', str(args.workers),
+        '--learner-variant', args.learner_variant,
         '--event-contract-mode', 'record', '--output-dir', str(output),
     ]
     if args.smoke_steps is not None:

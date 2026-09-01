@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 from src.recourse.cluster_stats import summarize_cluster_metric, summarize_paired_cluster_difference
-from src.recourse.types import STATE_VARIANTS
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -23,6 +23,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state-variants', nargs='+', choices=STATE_VARIANTS,
                         default=list(STATE_VARIANTS))
+    parser.add_argument('--learner-variant', choices=LEARNER_VARIANTS,
+                        default='optimization_anchored_residual')
     parser.add_argument('--train-days', nargs='+', required=True)
     parser.add_argument('--test-days', nargs='+', required=True)
     parser.add_argument('--seeds', nargs='+', type=int, required=True)
@@ -60,6 +62,7 @@ def main(argv=None):
         command = [
             sys.executable, str(ROOT / 'run_recourse_multiday_panel.py'),
             '--methods', 'recourse_macro', '--state-variant', variant,
+            '--learner-variant', args.learner_variant,
             '--train-days', *args.train_days,
             '--test-days', *args.test_days,
             '--seeds', *map(str, args.seeds),

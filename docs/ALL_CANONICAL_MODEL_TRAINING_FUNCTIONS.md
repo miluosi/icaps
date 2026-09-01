@@ -650,25 +650,16 @@ python test_all_nyc_models.py test-only \
 
 测试阶段先验证 checkpoint schema、两个 learner、method axes、state/learner variant 和 solver configuration，再加载 tensors；测试不调用训练更新，并要求完整模型 weight hash 保持不变。
 
-## 12. 其余 value-function registry 条目
+## 12. Value-function registry
 
-`src/value_function_registry.py` 还保留以下历史或专项 value-function 路由。它们是网络/特征消融，不等于新增的 recourse method，也不进入九方法 runner 的默认主表。
+公开训练/测试入口只保留两种 learner：
 
+| learner | 实际类/用途 |
+| --- | --- |
+| `optimization_anchored_residual` | solver-consistent MASAC residual learner，部署分数为 structured anchor 加 learned residual |
+| `integrated_directq` | full-Q learner，直接学习部署 Q 值 |
 
-| distribution mode                  | 实际类/用途                                                 |
-| ---------------------------------- | ----------------------------------------------------------- |
-| `bayes`、`time-only`               | `ValueFunction_pytorch_bayes`，历史 Bayes/time feature 路径 |
-| `st_masac_gat`                     | 基础 ST-MASAC-GAT twin critic                               |
-| `st_masac_gat_frozen`              | 冻结 graph encoder 的基础 ST-MASAC-GAT                      |
-| `st_masac_gat_neighbour_frozen`    | 冻结 neighbour context 的 ST-MASAC-GAT                      |
-| `st_masac_gat_post_demand`         | 将 post-demand prediction 加入 edge feature 的版本          |
-| `st_masac_gat_post_demand_direct`  | action-specific direct demand-value head                    |
-| `st_masac_gat_queue_demand_gurobi` | 指向同一 post-demand direct 实现的兼容名称                  |
-| `optimization_anchored_residual`   | 九方法默认 solver-consistent residual learner               |
-| `integrated_directq`               | Integrated/Integrated-repair full-Q comparator              |
-| `none`                             | ADP 关闭时的兼容 control 映射；trainer 不构造学习模型       |
-
-顶层 `learner_variant` 只有三种正式语义：`legacy`、`integrated_directq`、`optimization_anchored_residual`。当选择后两者时，trainer 直接按 learner name 路由类；`legacy` 则继续由 `distribution_mode` 选择历史 value function。
+`none` 只作为 `adp=0` 内部兼容 sentinel，不在 CLI 选择列表中。历史网络文件仍可能作为这两个保留类的继承实现依赖，但不再是可注册、可命令行选择的独立学习方法。
 
 ## 13. 关键源码位置
 

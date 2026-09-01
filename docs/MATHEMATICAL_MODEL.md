@@ -313,12 +313,12 @@ $$
 
 ## 10. Learner、Samitha 与状态消融
 
-系统收益严格满足 $r_t^{\mathrm{sys}}=r_t^{\mathrm{EV}}+r_t^{\mathrm{AEV}}$。在同一 Macro 物理架构、同一 exact feasible graph 下，正式 learner 对照为：
+系统收益严格满足 $r_t^{\mathrm{sys}}=r_t^{\mathrm{EV}}+r_t^{\mathrm{AEV}}$。在同一 Macro 物理架构、同一 exact feasible graph 下，只保留两种 learner：
 
 $$
-\Psi^{\mathrm{myopic}}_\theta(e,S)=G(e,S),\qquad \Psi^{\mathrm{DirectQ}}_\theta(e,S)=Q_\theta(e,S),\qquad \Psi^{\mathrm{residual}}_\theta(e,S)=G(e,S)+\Delta_\theta(e,S).
+\Psi^{\mathrm{DirectQ}}_\theta(e,S)=Q_\theta(e,S),\qquad \Psi^{\mathrm{residual}}_\theta(e,S)=G(e,S)+\Delta_\theta(e,S).
 $$
 
-`structured_myopic` 不读取神经分数且不执行 optimizer step。Samitha 与 Integrated 共用 stage-0 graph builder；Samitha 只允许明确 hold 的 AEV 进入 outcome 后 repair，已 commitment 的 AEV 不可重派。固定 10%/25%/50% hold 是显式物理控制臂，learned hold 则由相同 exact projection 选择。
+Samitha 与 Integrated 共用 stage-0 graph builder；Samitha 只允许明确 hold 的 AEV 进入 outcome 后 repair，已 commitment 的 AEV 不可重派。固定 10%/25%/50% hold 是显式物理控制臂，learned hold 则由相同 exact projection 选择。
 
 状态消融由同一个原始 `SystemSnapshot` 的确定性 mask 得到：joint-state 变体保留两类车状态，fleet-local 变体只把另一类车的字段清零。`shared_critic` 与 `separate_critics` 只控制参数共享；可行动作图、transition ID 和采集到的原始状态保持不变。

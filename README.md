@@ -196,7 +196,7 @@ python run_trainer.py \
   --transportation-mode integrated \
   --assignment-heuristic \
   --no-mcmf \
-  --distribution-mode st_masac_gat_queue_demand_gurobi
+  --learner-variant optimization_anchored_residual
 ```
 
 Exact training, which creates `gurobi` checkpoints for legacy `ADP-HEU`:
@@ -210,7 +210,7 @@ python run_trainer.py \
   --transportation-mode integrated \
   --assignment-gurobi \
   --no-mcmf \
-  --distribution-mode st_masac_gat_queue_demand_gurobi
+  --learner-variant integrated_directq
 ```
 
 Train both checkpoint types under one synthetic scenario and compare the three heuristic strategies:
@@ -232,7 +232,7 @@ python run_nyctrainer.py \
   --transportation-mode integrated \
   --assignment-heuristic \
   --no-mcmf \
-  --distribution-mode st_masac_gat_post_demand_direct \
+  --learner-variant optimization_anchored_residual \
   --parquet-path nyedata/nye_simulation/parquet/yellow_tripdata_2025-12-18_sample.parquet \
   --station-csv nyedata/nyc_all_charging_stations.csv \
   --start-year-month 2025-12 \

@@ -10,6 +10,7 @@ import sys
 
 from run_recourse_multiday_panel import FORMAL_METRICS
 from src.recourse.cluster_stats import summarize_cluster_metric
+from src.recourse.types import LEARNER_VARIANTS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,7 +38,7 @@ def parse_args(argv=None):
     parser.add_argument('--reductions', nargs='+', choices=['on', 'off'],
                         default=['on', 'off'])
     parser.add_argument('--learner-variant',
-                        choices=['structured_myopic', 'integrated_directq', 'optimization_anchored_residual'],
+                        choices=LEARNER_VARIANTS,
                         default='optimization_anchored_residual')
     parser.add_argument('--train-days', nargs='+', required=True)
     parser.add_argument('--test-days', nargs='+', required=True)

@@ -23,10 +23,8 @@ STATE_VARIANTS = (
     "strict_fleet_local_shared_critic",
 )
 LEARNER_VARIANTS = (
-    "legacy",
-    "structured_myopic",
-    "integrated_directq",
     "optimization_anchored_residual",
+    "integrated_directq",
 )
 
 

@@ -216,10 +216,7 @@ def run_policy(args):
             del env
             gc.collect()
         trained_hash = weight_hash(pair)
-        if args.learner_variant == 'structured_myopic':
-            if trained_hash != initial_hash:
-                raise AssertionError('myopic policy changed neural tensors')
-        elif trained_hash == initial_hash:
+        if trained_hash == initial_hash:
             raise AssertionError('multiday training did not change model tensors')
         spec = METHODS[method]
         checkpoint = folder / 'checkpoint.pt'
