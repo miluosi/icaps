@@ -83,7 +83,7 @@ def build_report(summary, manifest):
         lines += ['', '失败记录：`' + str(summary['failures']) + '`；查看对应 `worker.log`。']
     lines += ['', '## 解释限制', '',
         '- 每个已执行阶段仅一个日期和一个随机种子；可检查运行与该次实际表现，不足以确认收敛或统计显著优势。',
-        '- R1 保留。R1→R2→R3→Macro 是 EV-first 消融；Integrated→Samitha 是架构内比较，不能把 Integrated 与 EV-first 的差异全部归因于 repair。',
+        '- Learned R1 仅保留为诊断对照。主 EV-first 因果链为 Structured R1/C0→R2→R3→Macro→R4；Integrated→Samitha 是架构比较，不能把 Integrated 与 EV-first 的差异全部归因于 repair。',
         '- Samitha 的额外 repair 统计还包括初始未分配订单；上述 Recourse number 仅统计 EV 拒单补救。',
         '- 原始详细数据位于各方法的 `training.json`、`results.json`、`checkpoint.pt`、`run.log`；进度在 `progress.json`，不当作最终结果，也不单凭旧进度认定进程仍在运行。',
         '- `reward_ledgers` 等训练 replay 明细只覆盖保留的回放窗口；本表累计 reward / recourse / completed 来自本阶段完整环境统计，不受回放容量截断；完整 2880 步运行才是全天结果。', '',

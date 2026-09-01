@@ -6,6 +6,7 @@ The repair solver is myopic; its outcome is part of one integrated macro TD.
 """
 from collections import Counter
 from dataclasses import replace
+import hashlib
 import time
 
 import numpy as np
@@ -39,6 +40,50 @@ def add_hold_edges(env, graph, vehicle_ids):
             target_location=v['location'], post_action_location=v['location'],
             post_action_duration=0., response_model_hash=getattr(env, 'ev_response_model_hash', None),
             metadata=(('repair_reserve', True),)))
+    return replace(graph, edges=tuple(edges))
+
+
+def apply_hold_policy(env, graph):
+    """Apply the declared learned or deterministic fixed-reserve policy.
+
+    A fixed arm is a physical control: selected AEVs have only their hold edge
+    available in stage 0, so the exact projection must reserve exactly that
+    deterministic subset.  Nonselected AEVs cannot choose a hold edge.
+    """
+    rule = str(getattr(env, 'samitha_hold_rule', 'learned'))
+    if rule == 'learned':
+        return graph
+    if rule != 'fixed':
+        raise ValueError(f'unknown Samitha hold rule: {rule}')
+    fraction = float(getattr(env, 'samitha_fixed_hold_fraction', 0.0))
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError('samitha_fixed_hold_fraction must be in [0, 1]')
+    hold_edges = {
+        edge.vehicle_id: edge for edge in graph.edges
+        if bool(dict(edge.metadata).get('repair_reserve', False))
+    }
+    count = int(round(fraction * len(hold_edges)))
+    epoch = int(getattr(env, 'current_time', 0) or 0)
+    run_id = str(getattr(env, 'recourse_run_id', ''))
+    ranked = sorted(
+        hold_edges,
+        key=lambda vehicle_id: hashlib.blake2b(
+            f'{run_id}|{epoch}|fixed-hold|{vehicle_id}'.encode(),
+            digest_size=8,
+        ).digest(),
+    )
+    selected = set(ranked[:count])
+    edges = []
+    for edge in graph.edges:
+        is_hold = bool(dict(edge.metadata).get('repair_reserve', False))
+        if edge.vehicle_id in hold_edges:
+            if edge.vehicle_id in selected:
+                if is_hold or bool(dict(edge.metadata).get('continuing', False)):
+                    edges.append(edge)
+            elif not is_hold:
+                edges.append(edge)
+        else:
+            edges.append(edge)
     return replace(graph, edges=tuple(edges))
 
 
@@ -108,6 +153,7 @@ def build_stage_graph(
     if stage == 0:
         if include_hold_edges:
             graph = add_hold_edges(env, graph, vehicle_ids)
+            graph = apply_hold_policy(env, graph)
     else:
         graph = residual_graph(graph, initial, set(vehicle_ids), set(candidates))
         if not candidates:
@@ -392,6 +438,20 @@ def simulate_integrated_repair(
         stats.get('hold_selected_count', 0) /
         max(1, stats.get('hold_candidate_count', 0))
     )
+    hold_history = getattr(env, '_samitha_hold_history', [])
+    hold_history.append(dict(
+        epoch_id=int(getattr(env, 'current_time', 0) or 0),
+        hour=int(env.get_hour_of_day()) if hasattr(env, 'get_hour_of_day') else None,
+        hold_rule=str(getattr(env, 'samitha_hold_rule', 'learned')),
+        hold_fraction=float(getattr(env, 'samitha_fixed_hold_fraction', 0.0)),
+        hold_candidate_count=int(hold_candidates),
+        hold_selected_count=int(len(held)),
+        hold_utilized_count=int(repair_assignments),
+        unused_hold_count=int(max(0, len(held) - repair_assignments)),
+        rejected_repair_candidate_count=int(len(repair_candidates & rejected)),
+        unassigned_repair_candidate_count=int(len(repair_candidates - rejected)),
+    ))
+    env._samitha_hold_history = hold_history
     env._last_integrated_repair_graphs = (initial, repair)
     env._active_recourse_stage, env._active_stage_state_snapshot = 0, None
     env._last_simulation_profile = {'total_time_sec': time.perf_counter() - started}

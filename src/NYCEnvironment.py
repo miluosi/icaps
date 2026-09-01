@@ -11,6 +11,7 @@ trainers (run_trainer.py etc.) can use it with minimal changes.
 from __future__ import annotations
 
 from datetime import date
+from copy import copy
 import hashlib
 import inspect
 import math
@@ -188,8 +189,10 @@ class NYCEnvironment:
         operating_cost_per_km: float = 0.08,
         battery_consumption_ratio: float = 1.0,
         initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
+        charge_duration_scale: float = 1.0,
         charge_wait_bool: bool = True,
         human_ev_charge_decision_interval_minutes: float = 120.0,
+        demand_scale: float = 1.0,
     ):
         # --- base directory of data files ---
         _base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "nyedata", "nye_simulation")
@@ -276,6 +279,15 @@ class NYCEnvironment:
             self.EPOCH_LENGTH,
         )
         self.initial_battery_mean = float(initial_battery_mean)
+        self.charge_duration_scale = float(charge_duration_scale)
+        self.demand_scale = float(demand_scale)
+        if not math.isfinite(self.demand_scale) or self.demand_scale <= 0.0:
+            raise ValueError("demand_scale must be finite and positive")
+        if (
+            not math.isfinite(self.charge_duration_scale)
+            or self.charge_duration_scale <= 0.0
+        ):
+            raise ValueError("charge_duration_scale must be finite and positive")
         (
             self.initial_battery_low,
             self.initial_battery_high,
@@ -372,6 +384,7 @@ class NYCEnvironment:
                 int(math.ceil(
                     max(0.0, self.charge_target_soc - self.min_battery_level)
                     / max(self.chargeincrease_per_epoch, 1e-6)
+                    * self.charge_duration_scale
                 )),
             ),
         )
@@ -1490,6 +1503,7 @@ class NYCEnvironment:
         self._ensure_recourse_runtime()
         self.request_lifecycle.reset()
         self._integrated_repair_metrics = {}
+        self._samitha_hold_history = []
         self.charge_wait_bool = bool(getattr(self, 'charge_wait_bool', True))
         self.charge_index = int(getattr(self, 'charge_index', 5))
         self.recourse_coordinator.pending = None
@@ -1783,6 +1797,56 @@ class NYCEnvironment:
             history['surge_bonus'] = surge_bonus
             history['demand_supply_ratio'] = request.demand_supply_ratio
 
+    def _apply_demand_scale(
+        self,
+        requests: list,
+        request_history: list[dict],
+        *,
+        date_label,
+        epoch_bin: int,
+    ) -> tuple[list, list[dict]]:
+        """Deterministically thin or replicate a real-demand epoch.
+
+        The keyed draw makes every method in a CRN comparison see the same
+        scaled request set.  Integer scale components create exact copies;
+        only the fractional component is sampled.  Copies retain the physical
+        trip but receive unique request identifiers.
+        """
+        scale = float(getattr(self, "demand_scale", 1.0))
+        if abs(scale - 1.0) <= 1e-12 or not requests:
+            return requests, request_history
+        whole = int(math.floor(scale))
+        fraction = scale - whole
+        scaled_requests: list = []
+        scaled_history: list[dict] = []
+        next_id = max(
+            [int(getattr(request, "request_id", 0)) for request in requests]
+            + [int(getattr(self, "request_counter", 0))]
+        )
+        day = str(date_label.date() if hasattr(date_label, "date") else date_label)
+        seed = int(getattr(self, "request_generation_seed", 0) or 0)
+        for request, history in zip(requests, request_history):
+            key = (
+                f"nyc-demand-scale|{seed}|{day}|{int(epoch_bin)}|"
+                f"{int(request.request_id)}|{int(request.pickup)}|{int(request.dropoff)}"
+            ).encode("utf-8")
+            draw = (int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") + 0.5) / 2**64
+            copies = whole + int(draw < fraction)
+            for copy_index in range(copies):
+                if copy_index == 0:
+                    current = request
+                else:
+                    current = copy(request)
+                    next_id += 1
+                    current.request_id = next_id
+                row = dict(history)
+                row["demand_scale"] = scale
+                row["demand_scale_copy_index"] = copy_index
+                scaled_requests.append(current)
+                scaled_history.append(row)
+        self.request_counter = max(int(getattr(self, "request_counter", 0)), next_id)
+        return scaled_requests, scaled_history
+
     def generate_requests(self, day=None) -> list:
         """
         Generate requests for the current epoch from real taxi trip data.
@@ -1867,6 +1931,12 @@ class NYCEnvironment:
             idx += 1
 
         self._demand_cursor = idx
+        generated, request_history = self._apply_demand_scale(
+            generated,
+            request_history,
+            date_label=date_label,
+            epoch_bin=int(self._day_step_offset()),
+        )
         self._apply_dynamic_surge_to_requests(generated, request_history)
         return self._finalize_generated_requests(generated, request_history)
 
@@ -1888,6 +1958,7 @@ class NYCEnvironment:
             ]
 
         for req, history in zip(generated, request_history):
+            history['request_id'] = int(req.request_id)
             self.active_requests[req.request_id] = req
             self.request_generation_history.append(history)
 
@@ -2143,6 +2214,13 @@ class NYCEnvironment:
                     sampled_indices = rng.sample(range(len(generated)), sample_size)
                     generated = [generated[idx] for idx in sampled_indices]
                     request_history = [request_history[idx] for idx in sampled_indices]
+
+        generated, request_history = self._apply_demand_scale(
+            generated,
+            request_history,
+            date_label=date_label,
+            epoch_bin=chosen_bin,
+        )
 
         if generated:
             self.request_counter = max(req.request_id for req in generated)
@@ -3597,7 +3675,10 @@ class NYCEnvironment:
     def _charge_duration_for_battery(self, battery: float) -> int:
         target = self._charge_target_for_battery(battery)
         deficit = max(0.0, target - float(battery))
-        raw_epochs = int(math.ceil(deficit / max(float(self.chargeincrease_per_epoch), 1e-6)))
+        raw_epochs = int(math.ceil(
+            deficit / max(float(self.chargeincrease_per_epoch), 1e-6)
+            * float(self.charge_duration_scale)
+        ))
         return int(min(
             int(getattr(self, 'max_charging_session_epochs', max(1, raw_epochs))),
             max(int(getattr(self, 'min_charging_session_epochs', 1)), raw_epochs),
@@ -4953,6 +5034,11 @@ class NYCEnvironment:
             'qvalue_time_sec',
             'solver_time_sec',
             'solve_total_time_sec',
+            'graph_serialization_time_sec',
+            'exact_build_time_sec',
+            'exact_solve_time_sec',
+            'exact_original_edges',
+            'exact_reduced_edges',
         ]
         max_fields = [
             'available_requests',
@@ -5055,7 +5141,9 @@ class NYCEnvironment:
                     result = self.gurobi_optimizer._heuristic_assignment_with_reject(
                         vehicles_to_rebalance, ar, charging_stations, heuristic_action_matrix)
 
+        graph_serialization_time = 0.0
         if can_snapshot_graph:
+            graph_serialization_start = time.perf_counter()
             stage_state = getattr(self, "_active_stage_state_snapshot", None)
             graph = StateSnapshotBuilder.feasible_graph_from_matrix(
                 self,
@@ -5077,9 +5165,11 @@ class NYCEnvironment:
             graph = graph.with_selected(selected_edge_ids, status="selected")
             RecourseTargetBuilder.verify_feasible(graph, graph.selected_edge_ids)
             self._last_feasible_graph_snapshot = graph
+            graph_serialization_time = time.perf_counter() - graph_serialization_start
 
         solver_time = time.time() - solver_start
         total_time = time.time() - solve_start
+        exact_stats = dict(getattr(self, 'mcmf_last_result', {}) or {})
         self.time_stats['gurobi_solve'].append(solver_time)
         if qvalue_mode == 'network':
             self.time_stats['qvalue_with_network'].append(qvalue_time)
@@ -5105,6 +5195,14 @@ class NYCEnvironment:
             'qvalue_time_sec': qvalue_time,
             'solver_time_sec': solver_time,
             'solve_total_time_sec': total_time,
+            'graph_serialization_time_sec': graph_serialization_time,
+            'exact_build_time_sec': float(exact_stats.get('build_time', 0.0) or 0.0),
+            'exact_solve_time_sec': float(exact_stats.get('solve_time', 0.0) or 0.0),
+            'exact_original_edges': float(exact_stats.get('original_edges', 0.0) or 0.0),
+            'exact_reduced_edges': float(exact_stats.get('reduced_edges', 0.0) or 0.0),
+            'exact_edge_reduction_ratio': float(exact_stats.get('edge_reduction_ratio', 0.0) or 0.0),
+            'solver_fallback_used': float(bool(exact_stats.get('solver_fallback_used', False))),
+            'solver_objective_gap': float(exact_stats.get('solver_objective_gap', 0.0) or 0.0),
             'solver_name': solver_name,
             'qvalue_mode': qvalue_mode,
             'onlyev': float(bool(onlyev)),
@@ -7307,6 +7405,44 @@ class NYCEnvironment:
         self._ensure_recourse_runtime()
         self.request_lifecycle.assert_reconciled()
         lifecycle_metrics = self.request_lifecycle.metrics()
+        lifecycle_events = self.request_lifecycle.outcome_summary().events
+        hourly_recourse_map = {}
+        request_zone = {
+            int(row['request_id']): int(row['pickup_zone'])
+            for row in self.request_generation_history
+            if row.get('request_id') is not None and row.get('pickup_zone') is not None
+        }
+        spatial_recourse_events = []
+        for event in lifecycle_events:
+            if event.residual_category != 'rejected':
+                continue
+            hour = int((self.START_EPOCH + int(event.epoch_id) * self.EPOCH_LENGTH) // 3600) % 24
+            bucket = hourly_recourse_map.setdefault(hour, dict(
+                hour=hour, rejected_count=0, eligible_count=0,
+                assigned_count=0, pickup_count=0, completion_count=0,
+            ))
+            bucket['rejected_count'] += 1
+            bucket['eligible_count'] += int(event.eligible)
+            bucket['assigned_count'] += int(event.same_epoch_recourse_link)
+            bucket['pickup_count'] += int(event.picked_up)
+            bucket['completion_count'] += int(event.completed)
+            spatial_recourse_events.append(dict(
+                request_id=int(event.request_id), hour=hour,
+                pickup_zone_id=request_zone.get(int(event.request_id)),
+                eligible=bool(event.eligible), assigned=bool(event.same_epoch_recourse_link),
+                picked_up=bool(event.picked_up), completed=bool(event.completed),
+                repair_architecture=str(event.repair_architecture),
+            ))
+        hourly_recourse_events = []
+        for hour in sorted(hourly_recourse_map):
+            bucket = hourly_recourse_map[hour]
+            denominator = max(1, bucket['eligible_count'])
+            hourly_recourse_events.append({
+                **bucket,
+                'conditional_assignment_recovery': bucket['assigned_count'] / denominator,
+                'conditional_pickup_recovery': bucket['pickup_count'] / denominator,
+                'conditional_completion_recovery': bucket['completion_count'] / denominator,
+            })
 
         avg_reb = 0
         total_reb = 0
@@ -7531,6 +7667,8 @@ class NYCEnvironment:
             )),
             'charging_station_csv': str(self.station_csv),
             'battery_consumption_ratio': self.battery_consumption_ratio,
+            'charge_duration_scale': self.charge_duration_scale,
+            'demand_scale': self.demand_scale,
             'ev_consumption_wh_per_mile': self.ev_consumption_wh_per_mile,
             'ev_consumption_kwh_per_km': self.ev_consumption_kwh_per_km,
             'battery_capacity_kwh': self.battery_capacity_kwh,
@@ -7584,6 +7722,7 @@ class NYCEnvironment:
             'mean_station_pressure_ratio': float(mean_station_pressure_ratio),
             'station_pressure_snapshot_count': pressure_snapshot_count,
             'avg_station_utilization': avg_util,
+            'vehicles_unable_to_reach_charging': self._count_vehicles_unable_to_reach_charging(),
             'avg_vehicles_per_station': avg_per_station,
             'ev_rejected': ev_rej,
             'aev_rejected': aev_rej,
@@ -7726,6 +7865,9 @@ class NYCEnvironment:
             'hourly_zone_vehicle_counts': hourly_zone_vehicle_counts,
             'hourly_zone_charge_station_counts': hourly_zone_charge_station_counts,
             'hourly_completed_orders': hourly_completed_orders,
+            'hourly_recourse_events': hourly_recourse_events,
+            'spatial_recourse_events': spatial_recourse_events,
+            'samitha_hold_history': list(getattr(self, '_samitha_hold_history', [])),
             'current_real_date': str(self._current_date_label()),
         }
 
@@ -7758,6 +7900,8 @@ class NYCEnvironment:
             'avg_battery': avg_bat,
             'average_battery': avg_bat,
             'battery_consumption_ratio': self.battery_consumption_ratio,
+            'charge_duration_scale': self.charge_duration_scale,
+            'demand_scale': self.demand_scale,
             'ev_consumption_wh_per_mile': self.ev_consumption_wh_per_mile,
             'ev_consumption_kwh_per_km': self.ev_consumption_kwh_per_km,
             'battery_capacity_kwh': self.battery_capacity_kwh,

@@ -10,6 +10,8 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import resource
+import sys
 import time
 
 import numpy as np
@@ -34,7 +36,7 @@ from src.recourse.contracts import (
     evaluate_method_event_contract,
 )
 from src.recourse.metrics import summarize_paired_crn_difference, summarize_joint_targets, ordinary_service_displacement
-from src.recourse.types import STATE_VARIANTS, is_true_same_epoch_recourse
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS, is_true_same_epoch_recourse
 from src.value_function_registry import get_value_function_class
 
 ROOT = Path(__file__).resolve().parent
@@ -71,6 +73,21 @@ def parse_args(argv=None):
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--train-every', type=int, default=10)
     parser.add_argument('--state-variant', choices=STATE_VARIANTS, default='joint_state_separate_critics')
+    parser.add_argument('--learner-variant', choices=LEARNER_VARIANTS,
+                        default='optimization_anchored_residual')
+    parser.add_argument('--rejection-logit-shift', type=float, default=0.0)
+    parser.add_argument('--nyc-demand-scale', type=float, default=1.0)
+    parser.add_argument('--station-capacity-scale', type=float, default=1.0)
+    parser.add_argument('--battery-consumption-ratio', type=float, default=1.0)
+    parser.add_argument('--initial-battery-mean', type=float, default=0.875)
+    parser.add_argument('--charge-duration-scale', type=float, default=1.0)
+    parser.add_argument('--energy-model', choices=['general_charging', 'fixed_swap'],
+                        default='general_charging')
+    parser.add_argument('--samitha-hold-rule', choices=['learned', 'fixed'], default='learned')
+    parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
+    parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--mcmf-backend', choices=['primal_dual', 'ortools', 'gurobi_network'],
+                        default='primal_dual')
     parser.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'], default='none')
     parser.add_argument('--checkpoint-replay-recent', type=int, default=5000)
     parser.add_argument('--date', default='2025-12-18')
@@ -87,6 +104,19 @@ def parse_args(argv=None):
         parser.error('max-steps must allow linked joint transitions (>1)')
     if args.checkpoint_replay_recent <= 0:
         parser.error('checkpoint-replay-recent must be positive')
+    if min(args.nyc_demand_scale, args.station_capacity_scale,
+           args.battery_consumption_ratio, args.initial_battery_mean,
+           args.charge_duration_scale) <= 0:
+        parser.error('demand and energy sensitivity values must be positive')
+    if args.initial_battery_mean > 1.0:
+        parser.error('initial-battery-mean must not exceed 1')
+    if not 0.0 <= args.samitha_fixed_hold_fraction <= 1.0:
+        parser.error('samitha-fixed-hold-fraction must be in [0, 1]')
+    if args.energy_model == 'fixed_swap':
+        parser.error(
+            'fixed_swap is not a parameter alias for the current charging system; '
+            'select general_charging or implement/retrain a dedicated swap environment'
+        )
     try:
         args.methods = [canonical_method(method) for method in args.methods]
     except ValueError as exc:
@@ -106,15 +136,29 @@ def build_env(args, seed, method, *, training):
     day = args.date if training else getattr(args, 'test_date', args.date)
     settings = environment_args(['--environment', args.environment, '--num-vehicles', str(args.num_vehicles),
                                  '--num-ev', str(args.num_ev), '--date', day])
-    for name in ('parquet_path', 'start_hour', 'stop_hour', 'epoch_length'):
+    for name in ('parquet_path', 'start_hour', 'stop_hour', 'epoch_length',
+                 'nyc_demand_scale', 'station_capacity_scale',
+                 'battery_consumption_ratio', 'initial_battery_mean',
+                 'charge_duration_scale'):
         if getattr(args, name, None) is not None:
             setattr(settings, name, getattr(args, name))
     env = make_environment(settings, seed)
     spec = METHODS[method]
-    env.configure_recourse_experiment(spec.variant, common_random_numbers=True)
+    env.configure_recourse_experiment(
+        spec.variant,
+        rejection_logit_shift=float(getattr(args, 'rejection_logit_shift', 0.0)),
+        common_random_numbers=True,
+    )
     configure_acceptance_feature(env, 'off')
     env.state_variant = args.state_variant
-    env.learner_variant = 'optimization_anchored_residual'
+    env.learner_variant = str(getattr(
+        args, 'learner_variant', 'optimization_anchored_residual'
+    ))
+    env.energy_model = str(getattr(args, 'energy_model', 'general_charging'))
+    env.samitha_hold_rule = str(getattr(args, 'samitha_hold_rule', 'learned'))
+    env.samitha_fixed_hold_fraction = float(
+        getattr(args, 'samitha_fixed_hold_fraction', 0.0)
+    )
     env.adp_value, env.evaluatemode = 1., not training
     # Offer-keyed CRN includes run_id: it must be identical across methods.
     env.recourse_run_id = f'recourse-audit-{seed}'
@@ -123,8 +167,8 @@ def build_env(args, seed, method, *, training):
     # assignment oracle. Solver audits vary these axes in a separate runner.
     env.mcmf_solver = 'exact'
     env.useauction = False
-    env.mcmf_backend = 'primal_dual'
-    env.mcmf_graph_reduction = True
+    env.mcmf_backend = str(getattr(args, 'mcmf_backend', 'primal_dual'))
+    env.mcmf_graph_reduction = bool(getattr(args, 'graph_reduction', True))
     env.mcmf_verify = True
     env.mcmf_cost_scale = 10_000
     env.mcmf_strict = True
@@ -175,6 +219,10 @@ def rollout(
     reward = 0.
     fleet_rewards = {1: 0., 2: 0.}
     solver_seconds = 0.
+    runtime_profiles = []
+    decision_latencies = []
+    observation_node_counts = []
+    episode_ordinary_displacement = 0
     demand = {}
     action_trace = []
     for value in pair:
@@ -184,18 +232,34 @@ def rollout(
         for req in env.active_requests.values():
             demand[req.request_id] = (req.request_id, req.pickup, req.dropoff, req.created_time)
         actions, stored, stored_ev = motion(current_requests=list(env.active_requests.values()))
-        for graph in getattr(env, '_last_integrated_repair_graphs', ()):
-            if graph is not None:
-                action_trace.extend(graph.selected_edge_ids)
-        graph = getattr(env, '_last_feasible_graph_snapshot', None)
-        if graph is not None and not getattr(env, '_last_integrated_repair_graphs', ()):
+        profile = dict(getattr(env, '_last_rebalancing_profile', {}) or {})
+        simulation_profile = dict(getattr(env, '_last_simulation_profile', {}) or {})
+        runtime_profiles.append(profile)
+        decision_latencies.append(float(
+            simulation_profile.get('total_time_sec', profile.get('solve_total_time_sec', 0.0)) or 0.0
+        ))
+        integrated_graphs = tuple(
+            graph for graph in getattr(env, '_last_integrated_repair_graphs', ())
+            if graph is not None
+        )
+        for graph in integrated_graphs:
             action_trace.extend(graph.selected_edge_ids)
+            observation_node_counts.append(len(graph.state.vehicles))
+        graph = getattr(env, '_last_feasible_graph_snapshot', None)
+        if graph is not None and not integrated_graphs:
+            action_trace.extend(graph.selected_edge_ids)
+            observation_node_counts.append(len(graph.state.vehicles))
+        displacement_graphs = integrated_graphs[-1:] or ((graph,) if graph is not None else ())
+        episode_ordinary_displacement += sum(
+            ordinary_service_displacement(item) for item in displacement_graphs
+        )
         solver_seconds += getattr(env, '_last_rebalancing_profile', {}).get('solver_time_sec', 0.)
         _, rewards, _, done, _ = env.step(actions, stored, stored_ev)
         reward += sum(map(float, rewards.values()))
         for vid, returned_reward in rewards.items():
             fleet_rewards[int(env.vehicles[vid]['type'])] += float(returned_reward)
-        if training and (step + 1) % args.train_every == 0:
+        if (training and env.learner_variant != 'structured_myopic'
+                and (step + 1) % args.train_every == 0):
             for value, is_ev in ((pair[0], False), (pair[1], True)):
                 loss = value.train_step(batch_size=args.batch_size, ifEV=is_ev)
                 if not np.isfinite(loss):
@@ -217,6 +281,46 @@ def rollout(
     stats = env.get_episode_stats()
     stats.update(env.request_lifecycle.metrics())
     stats.update(reward=float(reward), steps=step + 1, elapsed_seconds=time.perf_counter()-started)
+    stats['ordinary_aev_service_displacement_fixed_graph'] = episode_ordinary_displacement
+    def profile_sum(key):
+        return float(sum(float(row.get(key, 0.0) or 0.0) for row in runtime_profiles))
+
+    positive_latencies = np.asarray(decision_latencies, dtype=float)
+    stats.update(
+        candidate_generation_runtime_seconds=profile_sum('qmatrix_time_sec'),
+        neural_edge_scoring_runtime_seconds=profile_sum('qvalue_time_sec'),
+        graph_serialization_runtime_seconds=profile_sum('graph_serialization_time_sec'),
+        graph_reduction_runtime_seconds=profile_sum('exact_build_time_sec'),
+        exact_solve_runtime_seconds=profile_sum('exact_solve_time_sec'),
+        total_decision_runtime_seconds=float(sum(decision_latencies)),
+        decision_latency_p50_seconds=(float(np.quantile(positive_latencies, .50)) if positive_latencies.size else 0.0),
+        decision_latency_p90_seconds=(float(np.quantile(positive_latencies, .90)) if positive_latencies.size else 0.0),
+        decision_latency_p95_seconds=(float(np.quantile(positive_latencies, .95)) if positive_latencies.size else 0.0),
+        decision_latency_p99_seconds=(float(np.quantile(positive_latencies, .99)) if positive_latencies.size else 0.0),
+        feasible_edge_count=int(sum(
+            float(row.get('feasible_request_edges', 0.0) or 0.0)
+            + float(row.get('feasible_charging_edges', 0.0) or 0.0)
+            + float(row.get('feasible_zone_edges', 0.0) or 0.0)
+            for row in runtime_profiles
+        )),
+        exact_original_edge_count=int(profile_sum('exact_original_edges')),
+        exact_reduced_edge_count=int(profile_sum('exact_reduced_edges')),
+        solver_fallback_count=int(profile_sum('solver_fallback_used')),
+        max_solver_objective_gap=max(
+            [float(row.get('solver_objective_gap', 0.0) or 0.0) for row in runtime_profiles]
+            or [0.0]
+        ),
+        observation_node_count_mean=(float(np.mean(observation_node_counts))
+                                     if observation_node_counts else 0.0),
+    )
+    rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    stats['process_peak_memory_mb'] = rss / (1024.0 * 1024.0 if sys.platform == 'darwin' else 1024.0)
+    stats['peak_memory_scope'] = 'worker_process_lifetime'
+    original_edges = stats['exact_original_edge_count']
+    stats['graph_reduction_ratio'] = (
+        1.0 - stats['exact_reduced_edge_count'] / original_edges
+        if original_edges else 0.0
+    )
     stats.update(reward_ev=fleet_rewards[1], reward_aev=fleet_rewards[2],
                  solver_runtime_seconds=solver_seconds,
                  deployment_clipping_rate=sum(v.deployment_edges_clipped for v in pair)
@@ -288,10 +392,24 @@ def rollout(
             ledger=asdict(r.reward_ledger) if r.reward_ledger else None) for r in rows]
         stats['reward_ledger_scope'] = 'retained_replay_window'
         stats['replay_true_recourse_fraction'] = sum(any(is_true_same_epoch_recourse(e) for e in r.outcome_summary.events) for r in rows) / max(1, len(rows))
-        stats['ordinary_aev_service_displacement_fixed_graph'] = sum(ordinary_service_displacement(r.stage2_graph) for r in rows)
+        stats['retained_replay_ordinary_aev_service_displacement_fixed_graph'] = sum(
+            ordinary_service_displacement(r.stage2_graph) for r in rows
+        )
         stats['charging_wait_reward_ledger'] = {key: sum(getattr(r.reward_ledger, key) for r in rows if r.reward_ledger)
             for key in ('aev_charging', 'aev_waiting', 'ev_rejection_penalty', 'request_expiry_penalty')}
-        if sum(stats['optimizer_steps_joint']) == 0:
+        modules = ('network', 'critic2', 'graph_encoder', 'mixer', 'actor')
+        stats['model_parameter_count'] = int(sum(
+            parameter.numel()
+            for value in pair
+            for name in modules
+            for parameter in getattr(value, name).parameters()
+        ))
+        stats['effective_trainable_parameter_count'] = (
+            0 if env.learner_variant == 'structured_myopic'
+            else stats['model_parameter_count']
+        )
+        stats['gradient_update_count'] = int(sum(stats['optimizer_steps_joint']))
+        if env.learner_variant != 'structured_myopic' and sum(stats['optimizer_steps_joint']) == 0:
             raise AssertionError('No joint critic update; extend rollout or reduce train-every')
         if any(stats['optimizer_steps_edge']):
             raise AssertionError('Main recourse must not execute edge Bellman TD')

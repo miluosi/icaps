@@ -22,7 +22,7 @@ from src.recourse.config import (
     CAUSAL_CONTRASTS,
     DIAGNOSTIC_CONTRASTS,
 )
-from src.recourse.types import STATE_VARIANTS
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -45,6 +45,21 @@ def parse_args(argv=None):
     parser.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'], default='recent')
     parser.add_argument('--checkpoint-replay-recent', type=int, default=5000)
     parser.add_argument('--state-variant', choices=STATE_VARIANTS, default='joint_state_separate_critics')
+    parser.add_argument('--learner-variant', choices=LEARNER_VARIANTS,
+                        default='optimization_anchored_residual')
+    parser.add_argument('--rejection-logit-shift', type=float, default=0.0)
+    parser.add_argument('--nyc-demand-scale', type=float, default=1.0)
+    parser.add_argument('--station-capacity-scale', type=float, default=1.0)
+    parser.add_argument('--battery-consumption-ratio', type=float, default=1.0)
+    parser.add_argument('--initial-battery-mean', type=float, default=0.875)
+    parser.add_argument('--charge-duration-scale', type=float, default=1.0)
+    parser.add_argument('--energy-model', choices=['general_charging', 'fixed_swap'],
+                        required=False, default='general_charging')
+    parser.add_argument('--samitha-hold-rule', choices=['learned', 'fixed'], default='learned')
+    parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
+    parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--mcmf-backend', choices=['primal_dual', 'ortools', 'gurobi_network'],
+                        default='primal_dual')
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--smoke-steps', type=int)
     parser.add_argument('--event-contract-mode', choices=['required', 'record', 'off'], default='record')
@@ -68,6 +83,16 @@ def parse_args(argv=None):
         parser.error('derived test seeds must be unique and disjoint from train seeds')
     if args.checkpoint_replay_recent <= 0:
         parser.error('checkpoint-replay-recent must be positive')
+    if args.energy_model == 'fixed_swap':
+        parser.error('fixed_swap is not implemented by the current physical environment')
+    if min(args.nyc_demand_scale, args.station_capacity_scale,
+           args.battery_consumption_ratio, args.initial_battery_mean,
+           args.charge_duration_scale) <= 0:
+        parser.error('demand and energy sensitivity values must be positive')
+    if args.initial_battery_mean > 1.0:
+        parser.error('initial-battery-mean must not exceed 1')
+    if not 0.0 <= args.samitha_fixed_hold_fraction <= 1.0:
+        parser.error('samitha-fixed-hold-fraction must be in [0, 1]')
     args.output_dir = (args.output_dir or ROOT / 'results/recourse_panel' /
                        datetime.now().strftime('%Y%m%d-%H%M%S')).resolve()
     args.parquet_path = args.parquet_path.resolve()
@@ -101,6 +126,18 @@ def cluster_command(args, cluster, output):
         '--checkpoint-replay', args.checkpoint_replay,
         '--checkpoint-replay-recent', str(args.checkpoint_replay_recent),
         '--state-variant', args.state_variant,
+        '--learner-variant', args.learner_variant,
+        '--rejection-logit-shift', str(args.rejection_logit_shift),
+        '--nyc-demand-scale', str(args.nyc_demand_scale),
+        '--station-capacity-scale', str(args.station_capacity_scale),
+        '--battery-consumption-ratio', str(args.battery_consumption_ratio),
+        '--initial-battery-mean', str(args.initial_battery_mean),
+        '--charge-duration-scale', str(args.charge_duration_scale),
+        '--energy-model', args.energy_model,
+        '--samitha-hold-rule', args.samitha_hold_rule,
+        '--samitha-fixed-hold-fraction', str(args.samitha_fixed_hold_fraction),
+        '--graph-reduction' if args.graph_reduction else '--no-graph-reduction',
+        '--mcmf-backend', args.mcmf_backend,
         '--workers', str(args.workers), '--output-dir', str(output),
         '--event-contract-mode', args.event_contract_mode,
     ]
@@ -119,6 +156,17 @@ def aggregate(args, clusters):
         summary = json.loads((folder / 'summary.json').read_text())
         for result in summary['runs']:
             testing = dict(result['testing'])
+            training = dict(result.get('training', {}))
+            for key in (
+                'ordinary_aev_service_displacement_fixed_graph',
+                'model_parameter_count', 'effective_trainable_parameter_count',
+                'gradient_update_count', 'leader_td_target_mean',
+                'leader_td_target_std', 'follower_td_target_mean',
+                'follower_td_target_std', 'joint_prediction_abs_mean',
+                'gradient_clipping_rate', 'replay_true_recourse_fraction',
+            ):
+                if key in training:
+                    testing.setdefault(key, training[key])
             contract = dict(result.get('event_contract', {}))
             rows.append({
                 **testing,
@@ -145,11 +193,36 @@ def aggregate(args, clusters):
                     f'same fitted-policy key changed weights: {model_key}'
                 )
     metric_names = (
-        'reward', 'completed_orders', 'expired_request_count',
+        'reward', 'reward_ev', 'reward_aev', 'completed_orders', 'service_ratio',
+        'expired_request_count', 'lost_requests', 'unresolved_requests',
         'ev_rejected_offer_count', 'eligible_rejected_residual_count',
         'same_epoch_aev_assignment_count', 'completion_after_rejection_count',
+        'aev_pickup_after_rejection_count', 'unrecovered_rejected_count',
+        'ordinary_aev_service_displacement_fixed_graph',
         'conditional_recovery_rate_assignment',
-        'conditional_recovery_rate_completion', 'contract_passed',
+        'conditional_recovery_rate_pickup', 'conditional_recovery_rate_completion',
+        'initial_integrated_aev_commit_count', 'hold_candidate_count',
+        'hold_selected_count', 'repair_usage_per_hold', 'unused_hold_count',
+        'samitha_repair_assignment_count', 'samitha_repair_pickup_count',
+        'samitha_repair_completion_count', 'committed_aev_reassignment_count',
+        'human_ev_charging_sessions', 'aev_charging_sessions',
+        'positive_charging_wait_count', 'waiting_vehicle_count',
+        'avg_station_utilization', 'vehicles_unable_to_reach_charging',
+        'realized_initial_battery_mean_human_ev',
+        'realized_initial_battery_mean_aev',
+        'final_battery_mean_human_ev', 'final_battery_mean_aev',
+        'battery_consumption_ratio', 'charge_duration_scale',
+        'candidate_generation_runtime_seconds', 'neural_edge_scoring_runtime_seconds',
+        'graph_serialization_runtime_seconds', 'graph_reduction_runtime_seconds',
+        'exact_solve_runtime_seconds', 'total_decision_runtime_seconds',
+        'decision_latency_p50_seconds', 'decision_latency_p90_seconds',
+        'decision_latency_p95_seconds', 'decision_latency_p99_seconds',
+        'process_peak_memory_mb',
+        'model_parameter_count', 'effective_trainable_parameter_count',
+        'gradient_update_count', 'leader_td_target_mean', 'leader_td_target_std',
+        'follower_td_target_mean', 'follower_td_target_std',
+        'joint_prediction_abs_mean', 'gradient_clipping_rate',
+        'replay_true_recourse_fraction', 'contract_passed',
         'eligible_repair_exposure', 'repair_assignment_exposure',
     )
     metrics = {}
@@ -188,6 +261,21 @@ def aggregate(args, clusters):
         heldout_seed_day_count=len(clusters),
         cluster_count=len(clusters),
         methods=args.methods, clusters=clusters, rows=rows, metrics=metrics,
+        experiment_axes=dict(
+            state_variant=getattr(args, 'state_variant', 'joint_state_separate_critics'),
+            learner_variant=getattr(args, 'learner_variant', 'optimization_anchored_residual'),
+            rejection_logit_shift=getattr(args, 'rejection_logit_shift', 0.0),
+            demand_scale=getattr(args, 'nyc_demand_scale', 1.0),
+            station_capacity_scale=getattr(args, 'station_capacity_scale', 1.0),
+            battery_consumption_ratio=getattr(args, 'battery_consumption_ratio', 1.0),
+            initial_battery_mean=getattr(args, 'initial_battery_mean', 0.875),
+            charge_duration_scale=getattr(args, 'charge_duration_scale', 1.0),
+            energy_model=getattr(args, 'energy_model', 'general_charging'),
+            samitha_hold_rule=getattr(args, 'samitha_hold_rule', 'learned'),
+            samitha_fixed_hold_fraction=getattr(args, 'samitha_fixed_hold_fraction', 0.0),
+            graph_reduction=getattr(args, 'graph_reduction', True),
+            mcmf_backend=getattr(args, 'mcmf_backend', 'primal_dual'),
+        ),
         paired_differences=paired_differences,
         repeated_training_hashes={
             str(key): value for key, value in trained_hashes.items()

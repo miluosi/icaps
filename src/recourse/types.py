@@ -24,6 +24,7 @@ STATE_VARIANTS = (
 )
 LEARNER_VARIANTS = (
     "legacy",
+    "structured_myopic",
     "integrated_directq",
     "optimization_anchored_residual",
 )

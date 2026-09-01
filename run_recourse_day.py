@@ -21,7 +21,7 @@ from run_acceptance_ablation import attach_pair, json_default, save_pair, seed_e
 from run_recourse_audit import MAIN_METHODS, ROOT, build_env, build_pair, rollout
 from src.recourse.contracts import assert_method_event_contract, evaluate_method_event_contract
 from src.recourse.config import METHODS, method_metadata
-from src.recourse.types import STATE_VARIANTS
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 
 
 def parse_args(argv=None):
@@ -41,6 +41,21 @@ def parse_args(argv=None):
     parser.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'], default='recent')
     parser.add_argument('--checkpoint-replay-recent', type=int, default=5000)
     parser.add_argument('--state-variant', choices=STATE_VARIANTS, default='joint_state_separate_critics')
+    parser.add_argument('--learner-variant', choices=LEARNER_VARIANTS,
+                        default='optimization_anchored_residual')
+    parser.add_argument('--rejection-logit-shift', type=float, default=0.0)
+    parser.add_argument('--nyc-demand-scale', type=float, default=1.0)
+    parser.add_argument('--station-capacity-scale', type=float, default=1.0)
+    parser.add_argument('--battery-consumption-ratio', type=float, default=1.0)
+    parser.add_argument('--initial-battery-mean', type=float, default=0.875)
+    parser.add_argument('--charge-duration-scale', type=float, default=1.0)
+    parser.add_argument('--energy-model', choices=['general_charging', 'fixed_swap'],
+                        default='general_charging')
+    parser.add_argument('--samitha-hold-rule', choices=['learned', 'fixed'], default='learned')
+    parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
+    parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--mcmf-backend', choices=['primal_dual', 'ortools', 'gurobi_network'],
+                        default='primal_dual')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--resume', action='store_true', help='Resume completed train/test phase boundaries, not partial epochs')
@@ -60,6 +75,19 @@ def parse_args(argv=None):
         parser.error('Replay must retain at least one successor in addition to the batch')
     if args.checkpoint_replay_recent <= 0:
         parser.error('checkpoint-replay-recent must be positive')
+    if min(args.nyc_demand_scale, args.station_capacity_scale,
+           args.battery_consumption_ratio, args.initial_battery_mean,
+           args.charge_duration_scale) <= 0:
+        parser.error('demand and energy sensitivity values must be positive')
+    if args.initial_battery_mean > 1.0:
+        parser.error('initial-battery-mean must not exceed 1')
+    if not 0.0 <= args.samitha_fixed_hold_fraction <= 1.0:
+        parser.error('samitha-fixed-hold-fraction must be in [0, 1]')
+    if args.energy_model == 'fixed_swap':
+        parser.error(
+            'fixed_swap requires a dedicated physical environment; the formal '
+            'runner currently supports the declared general_charging model'
+        )
     if args.smoke_steps is not None and args.smoke_steps < args.train_every:
         parser.error('Preflight must reach at least one training update')
     if len(set(args.methods)) != len(args.methods):
@@ -118,6 +146,25 @@ def validate_checkpoint_payload(payload, method, env):
         'learner_variant': env.learner_variant,
     }
     metadata = dict(payload.get('metadata', {}))
+    hold_expected = {
+        'samitha_hold_rule': str(getattr(env, 'samitha_hold_rule', 'learned')),
+        'samitha_fixed_hold_fraction': float(
+            getattr(env, 'samitha_fixed_hold_fraction', 0.0)
+        ),
+        'energy_model': str(getattr(env, 'energy_model', 'general_charging')),
+    }
+    for key, value in hold_expected.items():
+        # Schema-2 checkpoints produced before the formal experiment axes were
+        # added are equivalent to these defaults and remain loadable.
+        legacy_default = key == 'samitha_hold_rule' and value == 'learned' or (
+            key == 'samitha_fixed_hold_fraction' and value == 0.0
+        ) or (key == 'energy_model' and value == 'general_charging')
+        if key not in metadata and legacy_default:
+            continue
+        if metadata.get(key) != value:
+            raise ValueError(
+                f'checkpoint {key} mismatch: {metadata.get(key)!r} != {value!r}'
+            )
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(
@@ -155,14 +202,21 @@ def run_worker(args):
             initial_hash = weight_hash(pair)
             trained = rollout(args, env, pair, method, training=True, progress_path=folder / 'progress.json')
             trained_hash = weight_hash(pair)
-            if initial_hash == trained_hash:
+            if (env.learner_variant != 'structured_myopic'
+                    and initial_hash == trained_hash):
                 raise AssertionError('Training did not change any model weights')
+            if (env.learner_variant == 'structured_myopic'
+                    and initial_hash != trained_hash):
+                raise AssertionError('Myopic control unexpectedly changed model weights')
             spec = METHODS[method]
             save_pair(pair, checkpoint, dict(method=method, initial_weight_hash=initial_hash,
                 trained_weight_hash=trained_hash, train_date=args.train_date, test_date=args.test_date,
                 seed=args.seed, test_seed=args.test_seed,
                 **method_metadata(spec.operating_mode, spec.variant),
                 state_variant=env.state_variant, learner_variant=env.learner_variant,
+                energy_model=env.energy_model,
+                samitha_hold_rule=env.samitha_hold_rule,
+                samitha_fixed_hold_fraction=env.samitha_fixed_hold_fraction,
                 solver_config=dict(
                     rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
                     backend=getattr(env, 'mcmf_backend', 'primal_dual'),

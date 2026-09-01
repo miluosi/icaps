@@ -41,6 +41,11 @@ VALUE_FUNCTION_REGISTRY: dict[str, ValueFunctionSpec] = {
         "src.ValueFunction_optimization_anchored_residual"
     ),
     "integrated_directq": ValueFunctionSpec("src.ValueFunction_integrated_directq"),
+    # Formal no-learning comparator. It is addressable by the experiment
+    # registry but is intentionally not a general neural distribution mode.
+    "structured_myopic": ValueFunctionSpec(
+        "src.ValueFunction_structured_myopic", public=False
+    ),
     # `none` is a control condition.  The trainer never constructs this class
     # when ADP is disabled, but mapping it keeps registry validation total.
     "none": ValueFunctionSpec("src.ValueFunction_pytorch_bayes"),
@@ -65,7 +70,8 @@ def get_value_function_class(distribution_mode: str) -> type:
 
 
 def validate_value_function_registry() -> dict[str, type]:
-    loaded = {key: spec.load() for key, spec in VALUE_FUNCTION_REGISTRY.items()}
-    if set(VALUE_FUNCTION_CHOICES) != set(VALUE_FUNCTION_REGISTRY):
-        raise AssertionError("every registry entry must be deliberately public or internal")
+    public = {key: spec for key, spec in VALUE_FUNCTION_REGISTRY.items() if spec.public}
+    loaded = {key: spec.load() for key, spec in public.items()}
+    if set(VALUE_FUNCTION_CHOICES) != set(public):
+        raise AssertionError("public registry choices are inconsistent")
     return loaded

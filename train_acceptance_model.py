@@ -40,6 +40,11 @@ def parse_args(argv=None):
     parser.add_argument("--simulation-period", type=int, default=scenario.DEFAULT_SIMULATION_PERIOD)
     parser.add_argument("--episode-days", type=int, default=scenario.DEFAULT_EPISODE_DAYS)
     parser.add_argument("--synthetic-demand-scale", type=float, default=scenario.DEFAULT_SYNTHETIC_DEMAND_SCALE)
+    parser.add_argument("--nyc-demand-scale", type=float, default=1.0)
+    parser.add_argument("--station-capacity-scale", type=float, default=1.0)
+    parser.add_argument("--battery-consumption-ratio", type=float, default=1.0)
+    parser.add_argument("--initial-battery-mean", type=float, default=0.875)
+    parser.add_argument("--charge-duration-scale", type=float, default=1.0)
     parser.add_argument("--parquet-path", type=Path, default=ROOT / "nyedata/nye_simulation/parquet/yellow_tripdata_2025-12-18_sample.parquet")
     parser.add_argument("--station-csv", type=Path, default=ROOT / "nyedata/nyc_all_charging_stations.csv")
     parser.add_argument("--date", default="2025-12-18")
@@ -78,6 +83,12 @@ def parse_args(argv=None):
         parser.error("Require 0 < num-ev <= num-vehicles")
     if min(args.grid_size, args.simulation_period, args.episode_days, args.epoch_length) <= 0:
         parser.error("Grid size and simulation durations must be positive")
+    if min(args.nyc_demand_scale, args.station_capacity_scale,
+           args.battery_consumption_ratio, args.initial_battery_mean,
+           args.charge_duration_scale) <= 0:
+        parser.error('NYC demand/energy sensitivity parameters must be positive')
+    if args.initial_battery_mean > 1.0:
+        parser.error('initial-battery-mean must not exceed 1')
     if not 0 <= args.start_hour < args.stop_hour <= 24:
         parser.error("Require 0 <= start-hour < stop-hour <= 24")
     if min(args.nn_epochs, args.nn_patience) <= 0:
@@ -117,6 +128,11 @@ def make_environment(args, seed):
             start_hour=args.start_hour, stop_hour=args.stop_hour,
             epoch_length_sec=args.epoch_length,
             episode_length=int(np.ceil((args.stop_hour - args.start_hour) * 3600 / args.epoch_length)),
+            demand_scale=args.nyc_demand_scale,
+            station_capacity_scale=args.station_capacity_scale,
+            battery_consumption_ratio=args.battery_consumption_ratio,
+            initial_battery_mean=args.initial_battery_mean,
+            charge_duration_scale=args.charge_duration_scale,
         )
     # Ordinary MCMF, no ADP score, no known-probability MCMF-K correction.
     # Evaluation here disables RL updates only; our passive offer collector

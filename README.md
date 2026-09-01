@@ -163,7 +163,7 @@ These commands validate the complete software path; they are not paper-scale exp
 
 ## Recourse experiments
 
-EV-first runs expose the audit-defined `R0`--`R4` variants. Recourse variants are rejected for integrated and AEV-first execution because those modes do not have the EV-leader/AEV-follower semantics.
+The paper's main EV-first method is `recourse_macro` with separate critics and an optimization-anchored residual learner. `recourse_nested_q2` (R4) is the nested-estimator comparator, while Samitha is an operating-architecture comparator. Recourse variants are rejected for integrated and AEV-first execution because those modes do not have the EV-leader/AEV-follower semantics.
 
 ```bash
 python run_trainer.py \
@@ -171,15 +171,17 @@ python run_trainer.py \
   --num-vehicles 20 \
   --num-ev 10 \
   --transportation-mode evfirst \
-  --recourse-variant r4 \
+  --recourse-variant recourse_macro \
   --learner-variant optimization_anchored_residual \
-  --state-variant joint_state_shared_critic \
+  --state-variant joint_state_separate_critics \
   --common-random-numbers \
   --assignment-heuristic \
   --no-mcmf
 ```
 
-The corresponding NYC flags are identical. `R0` disables behavioral rejection; `R1` blocks same-epoch repair; `R2` uses only structured follower scores; `R3` learns the follower without coupling its value into the EV target; and `R4` uses the full structured-plus-correction AEV target value in the EV leader target. Checkpoint namespaces include the recourse, state, learner, and rejection-stress settings. `--checkpoint-replay {none,recent,full}` controls replay persistence (`recent` stores the newest 5,000 transitions by default). Replay/checkpoint files use Python pickle through `torch.save`/`pickle`; load only artifacts created by a trusted local run. Each completed CLI run writes a `*.manifest.json` beside its statistics workbook with the resolved arguments, commit, data/checkpoint hashes, effective model and replay hyperparameters, seed-clustered uncertainty, and runtime metadata. `config/recourse_experiment.example.json` is a documentation template, not a runner input; the CLI arguments and generated manifest are the executable and resolved configuration sources.
+The main causal ladder is structured no-repair (C0) → Repair Only (R2) → Repair Learning (R3) → Macro → nested Q2 (R4). Learned R1 remains a diagnostic control. Macro uses the sampled two-stage system return; R4 substitutes a learned follower bootstrap without changing the physical inference path. Checkpoint namespaces include recourse, state, learner, hold, energy, solver, and rejection-stress settings. `--checkpoint-replay {none,recent,full}` controls replay persistence (`recent` stores the newest 5,000 transitions by default). Replay/checkpoint files use Python pickle through `torch.save`/`pickle`; load only artifacts created by a trusted local run.
+
+Formal NYC experiments use `run_recourse_multiday_panel.py`, which trains one checkpoint on a date window and reloads it independently on every held-out day. The companion runners are `run_assignment_learner_experiment.py`, `run_assignment_state_experiment.py`, `run_assignment_scalability_experiment.py`, `run_recourse_sensitivity.py`, `run_samitha_hold_ablation.py`, and `run_recourse_spatiotemporal_analysis.py`. Each formal training runner requires an explicit `--energy-model general_charging`. `fixed_swap` fails closed because it would require a different physical environment. Integrated and Samitha currently use their exact shared stage-0 adapter; auction/heuristic labels are not accepted for those architectures.
 
 ## Synthetic training
 

@@ -44,17 +44,18 @@ def train_samitha(settings):
 
 完整映射如下。
 
-| 显示名 | canonical method | 入口函数 | motion | variant | repair policy | leader credit |
-| --- | --- | --- | --- | --- | --- | --- |
-| Integrated | `no_repair` | `train_integrated` | `simulate_motion_integrated_control` | `legacy` | none | uncoupled/system |
-| R0 | `evfirst_no_rejection` | `train_r0` | `simulate_motion_evfirst` | `r0` | none | uncoupled |
-| learned R1 | `evfirst_no_repair` | `train_r1` | `simulate_motion_evfirst` | `r1` | none | uncoupled |
-| C0 / structured R1 | `evfirst_no_repair_structured` | `train_structured_r1` | `simulate_motion_evfirst` | `r1_structured` | structured | uncoupled |
-| R2 | `repair_only` | `train_r2` | `simulate_motion_evfirst` | `r2` | structured | uncoupled |
-| R3 | `repair_learning` | `train_r3` | `simulate_motion_evfirst` | `r3` | learned | uncoupled |
-| Macro | `recourse_macro` | `train_macro` | `simulate_motion_evfirst` | `recourse_macro` | learned | macro realized |
-| R4 | `recourse_nested_q2` | `train_r4` | `simulate_motion_evfirst` | `r4` | learned | nested follower |
-| Samitha | `samitha` | `train_samitha` | `simulate_motion_integrated_repair` | `legacy` | structured limited hold | macro realized |
+
+| 显示名             | canonical method               | 入口函数              | motion                               | variant          | repair policy           | leader credit    |
+| ------------------ | ------------------------------ | --------------------- | ------------------------------------ | ---------------- | ----------------------- | ---------------- |
+| Integrated         | `no_repair`                    | `train_integrated`    | `simulate_motion_integrated_control` | `legacy`         | none                    | uncoupled/system |
+| R0                 | `evfirst_no_rejection`         | `train_r0`            | `simulate_motion_evfirst`            | `r0`             | none                    | uncoupled        |
+| learned R1         | `evfirst_no_repair`            | `train_r1`            | `simulate_motion_evfirst`            | `r1`             | none                    | uncoupled        |
+| C0 / structured R1 | `evfirst_no_repair_structured` | `train_structured_r1` | `simulate_motion_evfirst`            | `r1_structured`  | structured              | uncoupled        |
+| R2                 | `repair_only`                  | `train_r2`            | `simulate_motion_evfirst`            | `r2`             | structured              | uncoupled        |
+| R3                 | `repair_learning`              | `train_r3`            | `simulate_motion_evfirst`            | `r3`             | learned                 | uncoupled        |
+| Macro              | `recourse_macro`               | `train_macro`         | `simulate_motion_evfirst`            | `recourse_macro` | learned                 | macro realized   |
+| R4                 | `recourse_nested_q2`           | `train_r4`            | `simulate_motion_evfirst`            | `r4`             | learned                 | nested follower  |
+| Samitha            | `samitha`                      | `train_samitha`       | `simulate_motion_integrated_repair`  | `legacy`         | structured limited hold | macro realized   |
 
 注册表的唯一来源是 `src/recourse/config.py` 中的 `PAPER_METHODS` 和 `METHODS`。
 
@@ -551,7 +552,7 @@ $$
 $$
 
 $$
-\mathcal L_{\mathrm{post\mbox{-}demand}}
+\mathcal L_{\mathrm{post{-}demand}}
 =\frac{1}{N}\sum_{i=1}^{N}
 \left(\widehat d_i^{\mathrm{post}}-d_i^{\mathrm{observed}}\right)^2.
 $$
@@ -570,17 +571,18 @@ $$
 
 ## 9. 九方法更新矩阵
 
-| 方法 | EV 拒单 | 同轮 AEV repair | EV critic | AEV critic/follower | auxiliary predictor | EV leader target |
-| --- | --- | --- | --- | --- | --- | --- |
-| Integrated | realized | 无独立 repair stage | system joint 更新 | 同一 system joint loss 中更新 | 非 causal frozen set | system temporal |
-| R0 | 禁止 | 无拒单可修复 | learned | learned | 非 causal frozen set | uncoupled temporal |
-| learned R1 | 允许 | 禁止 | learned | learned residual，但不含本轮 rejected requests | 非 causal frozen set | uncoupled temporal |
-| C0 | 允许 | 禁止 | learned | structured-only、冻结 | frozen P0 | uncoupled temporal |
-| R2 | 允许 | structured repair | learned | structured-only、冻结 | frozen P0 | uncoupled temporal |
-| R3 | 允许 | learned repair | learned | learned | frozen P0 | uncoupled temporal |
-| Macro | 允许 | learned repair | learned | learned | frozen P0 | realized system reward |
-| R4 | 允许 | learned repair | learned | learned | frozen P0 | nested follower target |
-| Samitha | 允许 | held AEV structured repair | stage-0 system joint 更新 | stage-0 selected AEV edge参与 joint loss；无单独 stage-2 TD | 非 causal frozen set | system temporal |
+
+| 方法       | EV 拒单  | 同轮 AEV repair            | EV critic                 | AEV critic/follower                                         | auxiliary predictor  | EV leader target       |
+| ---------- | -------- | -------------------------- | ------------------------- | ----------------------------------------------------------- | -------------------- | ---------------------- |
+| Integrated | realized | 无独立 repair stage        | system joint 更新         | 同一 system joint loss 中更新                               | 非 causal frozen set | system temporal        |
+| R0         | 禁止     | 无拒单可修复               | learned                   | learned                                                     | 非 causal frozen set | uncoupled temporal     |
+| learned R1 | 允许     | 禁止                       | learned                   | learned residual，但不含本轮 rejected requests              | 非 causal frozen set | uncoupled temporal     |
+| C0         | 允许     | 禁止                       | learned                   | structured-only、冻结                                       | frozen P0            | uncoupled temporal     |
+| R2         | 允许     | structured repair          | learned                   | structured-only、冻结                                       | frozen P0            | uncoupled temporal     |
+| R3         | 允许     | learned repair             | learned                   | learned                                                     | frozen P0            | uncoupled temporal     |
+| Macro      | 允许     | learned repair             | learned                   | learned                                                     | frozen P0            | realized system reward |
+| R4         | 允许     | learned repair             | learned                   | learned                                                     | frozen P0            | nested follower target |
+| Samitha    | 允许     | held AEV structured repair | stage-0 system joint 更新 | stage-0 selected AEV edge参与 joint loss；无单独 stage-2 TD | 非 causal frozen set | system temporal        |
 
 ## 10. 正确的比较路径
 
@@ -652,37 +654,39 @@ python test_all_nyc_models.py test-only \
 
 `src/value_function_registry.py` 还保留以下历史或专项 value-function 路由。它们是网络/特征消融，不等于新增的 recourse method，也不进入九方法 runner 的默认主表。
 
-| distribution mode | 实际类/用途 |
-| --- | --- |
-| `bayes`、`time-only` | `ValueFunction_pytorch_bayes`，历史 Bayes/time feature 路径 |
-| `st_masac_gat` | 基础 ST-MASAC-GAT twin critic |
-| `st_masac_gat_frozen` | 冻结 graph encoder 的基础 ST-MASAC-GAT |
-| `st_masac_gat_neighbour_frozen` | 冻结 neighbour context 的 ST-MASAC-GAT |
-| `st_masac_gat_post_demand` | 将 post-demand prediction 加入 edge feature 的版本 |
-| `st_masac_gat_post_demand_direct` | action-specific direct demand-value head |
-| `st_masac_gat_queue_demand_gurobi` | 指向同一 post-demand direct 实现的兼容名称 |
-| `optimization_anchored_residual` | 九方法默认 solver-consistent residual learner |
-| `integrated_directq` | Integrated/Integrated-repair full-Q comparator |
-| `none` | ADP 关闭时的兼容 control 映射；trainer 不构造学习模型 |
+
+| distribution mode                  | 实际类/用途                                                 |
+| ---------------------------------- | ----------------------------------------------------------- |
+| `bayes`、`time-only`               | `ValueFunction_pytorch_bayes`，历史 Bayes/time feature 路径 |
+| `st_masac_gat`                     | 基础 ST-MASAC-GAT twin critic                               |
+| `st_masac_gat_frozen`              | 冻结 graph encoder 的基础 ST-MASAC-GAT                      |
+| `st_masac_gat_neighbour_frozen`    | 冻结 neighbour context 的 ST-MASAC-GAT                      |
+| `st_masac_gat_post_demand`         | 将 post-demand prediction 加入 edge feature 的版本          |
+| `st_masac_gat_post_demand_direct`  | action-specific direct demand-value head                    |
+| `st_masac_gat_queue_demand_gurobi` | 指向同一 post-demand direct 实现的兼容名称                  |
+| `optimization_anchored_residual`   | 九方法默认 solver-consistent residual learner               |
+| `integrated_directq`               | Integrated/Integrated-repair full-Q comparator              |
+| `none`                             | ADP 关闭时的兼容 control 映射；trainer 不构造学习模型       |
 
 顶层 `learner_variant` 只有三种正式语义：`legacy`、`integrated_directq`、`optimization_anchored_residual`。当选择后两者时，trainer 直接按 learner name 路由类；`legacy` 则继续由 `distribution_mode` 选择历史 value function。
 
 ## 13. 关键源码位置
 
-| 内容 | 文件 |
-| --- | --- |
-| 九方法注册与 causal contrasts | `src/recourse/config.py` |
-| 九个命名训练函数 | `test_all_nyc_models.py` |
-| 训练日/测试日 worker | `run_recourse_day.py` |
-| 公共 rollout 与定期 `train_step` | `run_recourse_audit.py` |
-| Residual/Direct-Q 的 twin critic 与 joint loss | `src/ValueFunction_st_masac_gat.py` |
-| Optimization-anchored residual override | `src/ValueFunction_optimization_anchored_residual.py` |
-| Integrated Direct-Q comparator | `src/ValueFunction_integrated_directq.py` |
-| R0--R4 policy 与 target builder | `src/recourse/target_builder.py` |
-| Integrated/Samitha 共享 stage-0 与 limited-hold stage 2 | `src/recourse/integrated_repair.py` |
-| EV-first NYC 执行 | `src/NYCEnvironment.py` |
-| EV-first synthetic 执行 | `src/Environment.py` |
-| Critic wiring 与共享 replay identity | `src/recourse/critics.py` |
-| Replay/PER | `src/recourse/replay.py` |
-| 拒单概率神经网络 | `src/acceptance_model.py`、`train_acceptance_model.py` |
-| Queue/post-demand predictors | `src/ValueFunction_st_masac_gat.py`、`src/ValueFunction_st_masac_gat_post_demand.py` |
+
+| 内容                                                    | 文件                                                                                 |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| 九方法注册与 causal contrasts                           | `src/recourse/config.py`                                                             |
+| 九个命名训练函数                                        | `test_all_nyc_models.py`                                                             |
+| 训练日/测试日 worker                                    | `run_recourse_day.py`                                                                |
+| 公共 rollout 与定期`train_step`                         | `run_recourse_audit.py`                                                              |
+| Residual/Direct-Q 的 twin critic 与 joint loss          | `src/ValueFunction_st_masac_gat.py`                                                  |
+| Optimization-anchored residual override                 | `src/ValueFunction_optimization_anchored_residual.py`                                |
+| Integrated Direct-Q comparator                          | `src/ValueFunction_integrated_directq.py`                                            |
+| R0--R4 policy 与 target builder                         | `src/recourse/target_builder.py`                                                     |
+| Integrated/Samitha 共享 stage-0 与 limited-hold stage 2 | `src/recourse/integrated_repair.py`                                                  |
+| EV-first NYC 执行                                       | `src/NYCEnvironment.py`                                                              |
+| EV-first synthetic 执行                                 | `src/Environment.py`                                                                 |
+| Critic wiring 与共享 replay identity                    | `src/recourse/critics.py`                                                            |
+| Replay/PER                                              | `src/recourse/replay.py`                                                             |
+| 拒单概率神经网络                                        | `src/acceptance_model.py`、`train_acceptance_model.py`                               |
+| Queue/post-demand predictors                            | `src/ValueFunction_st_masac_gat.py`、`src/ValueFunction_st_masac_gat_post_demand.py` |

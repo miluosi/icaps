@@ -279,23 +279,27 @@ $$
 
 其中 $G_t^{(1)}$ 与 $G_t^{(2)}$ 保存当时的全部可行边、结构化分数、采集分数和资源容量。历史 replay 的编码和 target projection 只能读取这些快照，不能读取当前模拟器的可变图。
 
-## 9. R0--R4 与 solver-consistent target
+## 9. Canonical 因果链、Macro 与 Nested $Q_2$
 
-- `R0`：无 EV 拒单；
-- `R1`：有拒单，但被拒请求不能进入同轮 AEV follower 可行域；
-- `R2`：允许恢复，follower 只使用结构化分数 $g$；
-- `R3`：follower 使用学习分数，但 EV leader target 不包含 follower value；
-- `R4`：follower 使用学习分数，且 EV leader target 与同轮 follower value 耦合。
-
-R4 的 leader target 为：
+主文的同架构因果链固定为：
 
 $$
-y_t^{(1)}=r_t^{\mathrm{EV}}+\gamma_{\mathrm{within}}\,
-V_{\bar\theta}^{(2)}(s_t^{\mathrm{res}}),
-\qquad \gamma_{\mathrm{within}}=1.
+\text{Structured no-repair (C0)}\rightarrow\text{Repair Only (R2)}\rightarrow\text{Repair Learning (R3)}\rightarrow\text{Macro}\rightarrow\text{Nested }Q_2\text{ (R4)}.
 $$
 
-拒单是已观察到的阶段结果，而不是 terminal mask，因此不会把同轮 follower continuation 置零。R3 使用普通的下一 epoch bootstrap，R2 的 follower target 对 residual-network 参数不敏感。
+Learned R1 只作为诊断对照；Integrated 与 Samitha 属于 commitment architecture 对照，不混入这条学习因果链。Macro 主方法使用实现后的同轮两阶段系统收益：
+
+$$
+y_t^{\mathrm{Macro}}=R_t^{\mathrm{EV}}+R_t^{\mathrm{AEV}}+\gamma^{\Delta t_t}V_{1,t+1}^{-}(S_{t+1}).
+$$
+
+Nested R4 保持相同物理执行，只把 leader credit estimator 改为：
+
+$$
+y_t^{R4}=R_t^{\mathrm{EV}}+V_{2,t}^{-}(\bar S_t^2),\qquad y_t^{(2)}=R_t^{\mathrm{AEV}}+\gamma^{\Delta t_t}V_{1,t+1}^{-}(S_{t+1}).
+$$
+
+拒单是已观察到的阶段结果，而不是 terminal mask，因此不会把同轮 follower continuation 置零。R3、Macro 和 R4 使用相同的 predictor control、可行图和 exact execution solver。
 
 target 动作采用 double-Q 语义：online critic 在序列化可行图上通过与执行相同的联合资源约束选择动作，target critic 只评估已选联合动作：
 
@@ -307,9 +311,14 @@ $$
 
 这里的投影同时执行每车至多一项、请求互斥和充电站容量约束。
 
-## 10. Integrated learner 与状态消融
+## 10. Learner、Samitha 与状态消融
 
-Integrated execution 使用单个联合 replay target，系统收益严格满足
-$r_t^{\mathrm{sys}}=r_t^{\mathrm{EV}}+r_t^{\mathrm{AEV}}$。可选 learner 为 myopic legacy、`integrated_directq` 和 `optimization_anchored_residual`。
+系统收益严格满足 $r_t^{\mathrm{sys}}=r_t^{\mathrm{EV}}+r_t^{\mathrm{AEV}}$。在同一 Macro 物理架构、同一 exact feasible graph 下，正式 learner 对照为：
+
+$$
+\Psi^{\mathrm{myopic}}_\theta(e,S)=G(e,S),\qquad \Psi^{\mathrm{DirectQ}}_\theta(e,S)=Q_\theta(e,S),\qquad \Psi^{\mathrm{residual}}_\theta(e,S)=G(e,S)+\Delta_\theta(e,S).
+$$
+
+`structured_myopic` 不读取神经分数且不执行 optimizer step。Samitha 与 Integrated 共用 stage-0 graph builder；Samitha 只允许明确 hold 的 AEV 进入 outcome 后 repair，已 commitment 的 AEV 不可重派。固定 10%/25%/50% hold 是显式物理控制臂，learned hold 则由相同 exact projection 选择。
 
 状态消融由同一个原始 `SystemSnapshot` 的确定性 mask 得到：joint-state 变体保留两类车状态，fleet-local 变体只把另一类车的字段清零。`shared_critic` 与 `separate_critics` 只控制参数共享；可行动作图、transition ID 和采集到的原始状态保持不变。

@@ -253,12 +253,20 @@ def _environment_metadata() -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "python": sys.version,
         "platform": platform.platform(),
+        "processor": platform.processor(),
+        "machine": platform.machine(),
         "github_actions": os.environ.get("GITHUB_ACTIONS") == "true",
     }
     try:
         import numpy
 
         metadata["numpy"] = numpy.__version__
+    except ImportError:
+        pass
+    try:
+        import pandas
+
+        metadata["pandas"] = pandas.__version__
     except ImportError:
         pass
     try:
@@ -283,7 +291,29 @@ def _environment_metadata() -> dict[str, Any]:
         )
     except ImportError:
         pass
+    try:
+        import gurobipy
+
+        metadata["gurobi"] = '.'.join(map(str, gurobipy.gurobi.version()))
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import ortools
+
+        metadata["ortools"] = ortools.__version__
+    except ImportError:
+        pass
     return metadata
+
+
+def environment_metadata() -> dict[str, Any]:
+    """Public environment snapshot used by standalone formal runners."""
+    return _environment_metadata()
+
+
+def git_commit(start: str | Path) -> str | None:
+    """Return the checked-out revision for an experiment source tree."""
+    return _git_commit(Path(start))
 
 
 def _git_commit(start: Path) -> str | None:

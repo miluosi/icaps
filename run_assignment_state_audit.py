@@ -52,24 +52,52 @@ def audit_checkpoint(checkpoint: Path, variants):
     for variant in variants:
         rows = []
         for transition in transitions:
-            for fleet_type in (1, 2):
-                state = transition.pre_state.masked(variant, vehicle_type=fleet_type)
-                visible = [vehicle for vehicle in state.vehicles if vehicle.online]
-                rows.append(dict(
-                    transition_id=transition.transition_id,
-                    fleet_type=fleet_type,
-                    node_count=len(state.vehicles),
-                    online_vehicle_count=len(visible),
-                    other_fleet_node_count=sum(
+            sources = [('pre_state', transition.pre_state)]
+            residual = getattr(transition, 'residual_state', None)
+            if residual is not None:
+                sources.append(('residual_state', residual))
+            for graph_name in ('ev_stage_graph', 'aev_stage_graph'):
+                graph = getattr(transition, graph_name, None)
+                if graph is not None:
+                    sources.append((f'{graph_name}_state', graph.state))
+            for source_name, source_state in sources:
+                for fleet_type in (1, 2):
+                    state = source_state.masked(variant, vehicle_type=fleet_type)
+                    visible = [vehicle for vehicle in state.vehicles if vehicle.online]
+                    other_count = sum(
                         vehicle.vehicle_type != fleet_type for vehicle in state.vehicles
-                    ),
-                    state=asdict(state),
-                ))
+                    )
+                    if variant.startswith('strict_fleet_local') and other_count:
+                        raise AssertionError(
+                            f'{source_name} leaks the other fleet under {variant}'
+                        )
+                    rows.append(dict(
+                        transition_id=transition.transition_id,
+                        state_source=source_name,
+                        fleet_type=fleet_type,
+                        node_count=len(state.vehicles),
+                        online_vehicle_count=len(visible),
+                        other_fleet_node_count=other_count,
+                        request_label_count=len(getattr(state, 'request_labels', ())),
+                        state=asdict(state),
+                    ))
+        source_summaries = {}
+        for source_name in sorted({row['state_source'] for row in rows}):
+            selected = [row for row in rows if row['state_source'] == source_name]
+            source_summaries[source_name] = dict(
+                row_count=len(selected),
+                observation_hash=_stable_hash(selected),
+                mean_node_count=(sum(row['node_count'] for row in selected) / len(selected)),
+                max_other_fleet_node_count=max(
+                    row['other_fleet_node_count'] for row in selected
+                ),
+            )
         observations[variant] = dict(
             observation_hash=_stable_hash(rows),
             trajectory_hash=trajectory_hash,
             row_count=len(rows),
             strict_local=variant.startswith('strict_fleet_local'),
+            state_sources=source_summaries,
         )
     if len({row['trajectory_hash'] for row in observations.values()}) != 1:
         raise AssertionError('state ablation recollected or changed the execution trace')

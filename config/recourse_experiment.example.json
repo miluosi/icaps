@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "nyc_evfirst_r4_joint_state",
+    "name": "nyc_evfirst_macro_joint_separate",
     "commit_sha": "record-at-run-time",
     "seeds": [11, 23, 37, 53, 71],
     "train_dates": ["2025-12-01", "2025-12-14"],
@@ -8,16 +8,17 @@
   },
   "policy": {
     "transportation_mode": "evfirst",
-    "recourse_variant": "r4",
+    "recourse_variant": "recourse_macro",
     "learner_variant": "optimization_anchored_residual",
-    "state_variant": "joint_state_shared_critic",
+    "state_variant": "joint_state_separate_critics",
+    "energy_model": "general_charging",
     "planner_backend": "exact_mcmf",
     "target_planner_backend": "exact_mcmf",
     "rejection_logit_shift": 0.0,
     "common_random_numbers": true
   },
   "replay": {
-    "schema_version": 2,
+    "schema_version": 3,
     "capacity_joint": 100000,
     "capacity_edge": 500000,
     "sampler": "td_priority_with_rejection_recourse_bonus",

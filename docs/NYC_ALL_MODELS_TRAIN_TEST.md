@@ -209,6 +209,21 @@ output-dir/
 
 一日训练、一日测试、单 seed 只能检查运行和本次表现，不能证明收敛或统计显著优势。主要因果路径是 C0（structured no-repair）→R2→R3→Macro→R4；learned R1 是诊断对照，Integrated→Samitha 是另一条架构比较路径。
 
+## 正式多日实验入口
+
+`run_recourse_multiday_panel.py` 对每个 `(seed, train_window, method)` 只训练一次 checkpoint，再为每个 held-out 日期重新加载该不可变 checkpoint。正式主实验应显式指定 `--energy-model general_charging`；当前 `fixed_swap` 会直接报错，因为固定换电中心不是 general charging 的参数别名。
+
+配套入口：
+
+- `run_assignment_learner_experiment.py`：同一 Macro 架构下比较 structured myopic、DirectQ、optimization-anchored residual；
+- `run_assignment_state_experiment.py` 与 `run_assignment_state_audit.py`：state performance paired summary 和 pre/residual/stage-graph 泄漏审计；
+- `run_assignment_scalability_experiment.py`：100–3000 车、reduction/backend、图规模、延迟和内存；
+- `run_recourse_sensitivity.py`：拒单 logit、AEV share、需求、站点容量、耗电、初始 SOC 和充电时长；
+- `run_samitha_hold_ablation.py`：0%、固定比例、learned hold 与 EV-first limit；
+- `run_recourse_spatiotemporal_analysis.py`：把 panel 中的逐小时、TLC zone、hold、车辆与充电统计整理为 CSV/JSON。
+
+这些 runner 生成实验计划和基础设施；只有实际完成预先冻结的多 seed/date 运行后，才能声称论文数值结果已经完成。
+
 ## 本地验证
 
 ```bash
