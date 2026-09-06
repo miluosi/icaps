@@ -179,7 +179,7 @@ recourse-aware residual：
 
 ```bash
 python run_nyctrainer.py \
-  --recourse-method recourse-aware \
+  --methods macro \
   --learner-variant optimization_anchored_residual \
   --episodes 1 --num-vehicles 200 --num-ev 100 \
   --start-date 2025-12-18 --end-date 2025-12-18
@@ -189,7 +189,7 @@ Samitha full-Q：
 
 ```bash
 python run_nyctrainer.py \
-  --recourse-method samitha \
+  --methods samitha \
   --learner-variant integrated_directq \
   --episodes 1 --num-vehicles 200 --num-ev 100 \
   --start-date 2025-12-18 --end-date 2025-12-18

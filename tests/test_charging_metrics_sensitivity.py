@@ -113,9 +113,19 @@ def _wait_test_environment(charge_wait_bool=True):
     return env
 
 
-def test_wait_feasibility_uses_reachable_current_charging_capacity():
+def test_low_battery_aev_wait_is_gated_only_when_charge_edge_is_feasible():
     env = _wait_test_environment(charge_wait_bool=True)
-    wait = env.generate_vehicle_wait([1, 2, 3, 4])
+    env.min_battery_level = 0.20
+    charge_feasibility = np.asarray([
+        [1.0],  # Human EV: wait/outside action is unchanged.
+        [1.0],  # Low-SOC AEV with a feasible charging window.
+        [0.0],  # Low-SOC AEV with no feasible charging window.
+        [1.0],  # Higher-SOC AEV.
+    ], dtype=np.float32)
+    wait = env.generate_vehicle_wait(
+        [1, 2, 3, 4],
+        charge_feasibility=charge_feasibility,
+    )
     np.testing.assert_array_equal(
         wait,
         np.asarray([[1.0], [0.0], [1.0], [1.0]], dtype=np.float32),
@@ -127,7 +137,10 @@ def test_wait_feasibility_uses_reachable_current_charging_capacity():
 def test_disabling_charge_wait_gate_restores_all_one_wait_column():
     env = _wait_test_environment(charge_wait_bool=False)
     np.testing.assert_array_equal(
-        env.generate_vehicle_wait([1, 2, 3]),
+        env.generate_vehicle_wait(
+            [1, 2, 3],
+            charge_feasibility=np.ones((3, 1), dtype=np.float32),
+        ),
         np.ones((3, 1), dtype=np.float32),
     )
 
@@ -138,7 +151,10 @@ def test_notarrived_aev_reservations_reduce_current_charging_capacity():
     station.charging_queue_notarrived.append("88")
     assert env.generate_capacity_charge(env.vehicles[2]) == 0
     np.testing.assert_array_equal(
-        env.generate_vehicle_wait([2]),
+        env.generate_vehicle_wait(
+            [2],
+            charge_feasibility=np.zeros((1, 1), dtype=np.float32),
+        ),
         np.ones((1, 1), dtype=np.float32),
     )
 

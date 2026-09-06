@@ -53,13 +53,13 @@ NYC 可选择基础 `--distribution-mode st_masac_gat`，该类不创建 post-de
 
 ## 3. EVF 已有 r3 / r4，但“独立”需要区分含义
 
-EVF 对应 `--transportation-mode evfirst`，不是另一个独立训练脚本。
+R0--R4 和 Macro 由公开的 `--methods` 方法名选择；底层执行顺序由注册表解析，不再作为命令行参数。
 
 | 配置 | 同轮 AEV 补救拒单 | EV 训练目标 | 含义 |
 | --- | --- | --- | --- |
-| `--recourse-variant r3` | 有，AEV 使用学习值函数 | `r_EV + gamma^elapsed * V_next_EV` | EV 目标不接入当轮 AEV follower 值；可作为不带当轮补救价值耦合的对照。 |
-| `--recourse-variant r4` | 有，AEV 使用学习值函数 | `r_EV + within_epoch_gamma * V_AEV_residual` | Recourse-aware EVF；EV 目标显式计入当轮拒单结果之后的 AEV 补救值。 |
-| `--recourse-variant r1` | 当轮不允许 AEV 接回被拒订单；未派订单仍可接 | 普通跨轮目标 | 如果“独立”指不做同轮拒单补救，应区分此模式与 r3。 |
+| `--methods r3` | 有，AEV 使用学习值函数 | `r_EV + gamma^elapsed * V_next_EV` | EV 目标不接入当轮 AEV follower 值；可作为不带当轮补救价值耦合的对照。 |
+| `--methods r4` | 有，AEV 使用学习值函数 | `r_EV + within_epoch_gamma * V_AEV_residual` | EV 目标显式计入当轮拒单结果之后的 AEV 补救值。 |
+| `--methods r1` | 当轮不允许 AEV 接回被拒订单；未派订单仍可接 | 普通跨轮目标 | 如果“独立”指不做同轮拒单补救，应区分此方法与 r3。 |
 
 默认 `recourse_variant=legacy`，不会自动选择 r4。r0—r4 只接受 evfirst。
 
@@ -90,10 +90,9 @@ EVF 对应 `--transportation-mode evfirst`，不是另一个独立训练脚本�
 
 ```bash
 cd /Users/seinzhou/Desktop/icaps
-for variant in r3 r4; do
+for method in r3 r4; do
   /opt/anaconda3/bin/python run_nyctrainer.py \
-    --transportation-mode evfirst \
-    --recourse-variant "$variant" \
+    --methods "$method" \
     --learner-variant optimization_anchored_residual \
     --state-variant joint_state_separate_critics \
     --ev-response-feature off \
@@ -104,7 +103,7 @@ for variant in r3 r4; do
     --start-hour 8 --stop-hour 9 --epoch-length 30 \
     --assignment-gurobi --use-mcmf --mcmf-backend primal_dual \
     --batch-size 64 --training-frequency 10 --start-training-episode 0 \
-    --checkpoint-suffix "evf-check-$variant"
+    --checkpoint-suffix "evf-check-$method"
 done
 ```
 

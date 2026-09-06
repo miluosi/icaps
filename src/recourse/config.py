@@ -54,6 +54,10 @@ PAPER_METHODS = (
     "recourse_nested_q2",
     "samitha",
 )
+
+# Public train/test selection used by the ICAPS NYC entrypoints.  Execution
+# modes (integrated/evfirst/aevfirst) are deliberately not part of this API.
+ICAPS_METHODS = ("r0", "r1", "r2", "r3", "r4", "macro", "samitha")
 METHODS = {
     "no_repair": RecourseMethod("integrated", "legacy", "none", "uncoupled"),
     "evfirst_no_rejection": RecourseMethod("evfirst", "r0", "none", "uncoupled"),
@@ -198,11 +202,9 @@ def method_metadata(mode, variant):
     )
 
 
-def add_method_arguments(parser):
-    parser.add_argument(
-        "--recourse-method", choices=(*PAPER_METHODS, *METHOD_ALIASES), default=None,
-        help="Named architecture/repair/credit preset; aliases resolve before execution",
-    )
+def _add_method_policy_arguments(parser):
+    """Add controls shared by the single- and multi-method CLIs."""
+
     parser.add_argument("--integrated-repair-policy", choices=["limited_hold"], default="limited_hold")
     parser.add_argument(
         "--integrated-repair-hold-enabled", action=argparse.BooleanOptionalAction,
@@ -213,6 +215,76 @@ def add_method_arguments(parser):
         "--target-solver-policy", choices=TARGET_SOLVER_POLICIES,
         default="same_as_rollout_exact",
     )
+
+
+def add_method_arguments(parser):
+    parser.add_argument(
+        "--recourse-method", choices=(*PAPER_METHODS, *METHOD_ALIASES), default=None,
+        help="Named architecture/repair/credit preset; aliases resolve before execution",
+    )
+    _add_method_policy_arguments(parser)
+
+
+def add_method_list_arguments(parser, *, method_choices=ICAPS_METHODS):
+    """Expose ICAPS methods as the only public experiment-selection axis."""
+
+    method_choices = tuple(method_choices)
+    if method_choices != ICAPS_METHODS:
+        raise ValueError(
+            "NYC train/test method index must match the canonical ICAPS method list"
+        )
+    parser.add_argument(
+        "--methods", "--models", "--recourse-method",
+        dest="methods",
+        nargs="+",
+        choices=("all", *method_choices),
+        default=["r0"],
+        help=(
+            "One or more ICAPS assignment methods. Use 'all' for the complete "
+            "ICAPS train/test list."
+        ),
+    )
+    _add_method_policy_arguments(parser)
+
+
+def resolve_method_list_arguments(methods):
+    """Canonicalize a public method list without exposing execution modes."""
+
+    requested = [str(method).strip().lower() for method in (methods or ("r0",))]
+    if "all" in requested:
+        if len(requested) != 1:
+            raise ValueError("'all' cannot be combined with another ICAPS method")
+        return list(ICAPS_METHODS)
+    invalid = [method for method in requested if method not in ICAPS_METHODS]
+    if invalid:
+        raise ValueError(
+            f"unknown ICAPS method(s): {invalid}; choose from {ICAPS_METHODS}"
+        )
+    if len(set(requested)) != len(requested):
+        raise ValueError("duplicate ICAPS methods are not allowed")
+    return requested
+
+
+def method_checkpoint_suffix(
+    base: str,
+    method: str,
+    *,
+    state_variant: str,
+    learner_variant: str,
+    rejection_logit_shift: float,
+) -> str:
+    """Build the shared train/test checkpoint namespace for an ICAPS method."""
+
+    public_method = str(method).strip().lower()
+    if public_method not in ICAPS_METHODS:
+        raise ValueError(f"unknown ICAPS method: {method}")
+    canonical_name = canonical_method(public_method)
+    variant = METHODS[canonical_name].variant
+    namespace = (
+        f"method-{public_method}_rec-{variant}_state-{state_variant}_"
+        f"learner-{learner_variant}_shift-{float(rejection_logit_shift):g}"
+    )
+    return "_".join(part for part in (str(base or ""), namespace) if part)
 
 
 def resolve_method_arguments(args):

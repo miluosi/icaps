@@ -1,4 +1,4 @@
-"""Legacy solver/inference evaluator (not the ICAPS recourse paper runner).
+"""NYC evaluator for the public ICAPS method list.
 
 Test trained models on unseen seeds.
 Compare assignment backends explicitly so MCMF results are not mislabeled as
@@ -16,7 +16,8 @@ with heuristic assignment:
    10. ADP-HEU-HEU-K: heuristic-trained checkpoint + heuristic + known reject
    11. HEU       : no checkpoint   + heuristic assignment (pure heuristic)
    12. HEU-K     : no checkpoint   + heuristic assignment (request value * known acceptance probability)
-Loops over transportation_mode × demand_pattern × seed × strategy.
+Loops over ICAPS method × seed × strategy.  Internal execution modes are
+resolved from the canonical method registry and are not CLI inputs.
 """
 import argparse
 import json
@@ -28,8 +29,23 @@ from datetime import date, datetime
 from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
-from src.recourse.types import LEARNER_VARIANTS
+from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.recourse.config import (
+    ICAPS_METHODS,
+    METHODS,
+    add_method_list_arguments,
+    canonical_method,
+    method_checkpoint_suffix,
+    resolve_method_list_arguments,
+)
 from run_nyctrainer import run_nyc_training
+
+
+# Public argparse index.  Testing intentionally exposes the exact same seven
+# choices as training; operating modes remain an internal registry detail.
+NYC_TEST_METHODS = ("r0", "r1", "r2", "r3", "r4", "macro", "samitha")
+if NYC_TEST_METHODS != ICAPS_METHODS:
+    raise RuntimeError("NYC test method index is out of sync with ICAPS_METHODS")
 
 
 # ── Test strategies ───────────────────────────────────────────────
@@ -77,10 +93,11 @@ def _json_dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=_json_default)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate trained Q-network checkpoints across ILP, MCMF, and heuristic backends")
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
+    add_method_list_arguments(parser, method_choices=NYC_TEST_METHODS)
     parser.add_argument('--checkpoint-suffix', default='', help='Experiment namespace printed by the training CLI, excluding the auto-added EV predictor hash')
     parser.add_argument("--paper-parameter-preset", action="store_true",
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
@@ -90,10 +107,6 @@ def parse_args():
     parser.add_argument("--num-ev", type=int, default=25, help="EV vehicles")
     parser.add_argument("--seeds", type=int, nargs="+", default=[256],
                         help="Random seeds for evaluation (different from training seed)")
-    parser.add_argument("--transportation-modes", type=str, nargs="+",
-                        default=["integrated", "evfirst", "aevfirst"],
-                        choices=["integrated", "evfirst", "aevfirst"],
-                        help="Transportation modes to test")
     parser.add_argument("--start-date", type=str, default="2025-12-18", help="Start date for NYC evaluation dataset (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, default=None, help="End date for NYC evaluation dataset (YYYY-MM-DD); defaults to --start-date")
     parser.add_argument("--parquet-path", type=str, default=None,
@@ -109,6 +122,22 @@ def parse_args():
                         help="Path to nyc_charging_stations.csv")
     parser.add_argument("--station-capacity-scale", type=float, default=None,
                         help="Multiply NYC charging station capacity by this factor")
+    parser.add_argument(
+        "--aev-charging-center-count",
+        type=int,
+        choices=(0, 3, 4, 5),
+        default=0,
+        help=(
+            "AEV-only Manhattan charging-center scenario. 0 keeps legacy "
+            "public-station access; 3/4/5 selects the workbook-derived centers."
+        ),
+    )
+    parser.add_argument(
+        "--aev-charging-center-csv",
+        type=str,
+        default=None,
+        help="Optional override for manhattan_aev_charging_centers.csv",
+    )
     parser.add_argument("--only-manhattan-zones", action="store_true",
                         help="Restrict NYC demand, relocation zones, and charging stations to Manhattan zones")
     parser.set_defaults(only_manhattan_zones=True)
@@ -181,6 +210,19 @@ def parse_args():
         choices=LEARNER_VARIANTS,
         help="Checkpoint learner: MASAC residual or full-Q",
     )
+    parser.add_argument(
+        "--state-variant",
+        choices=STATE_VARIANTS,
+        default="joint_state_separate_critics",
+        help="State visibility and critic-sharing configuration used by the checkpoint",
+    )
+    parser.add_argument(
+        "--rejection-logit-shift",
+        type=float,
+        default=0.0,
+        help="Acceptance-utility shift used during both training and evaluation",
+    )
+    parser.add_argument("--common-random-numbers", action="store_true")
     parser.add_argument("--iftransformer", action="store_true",
                         help="Enable path self-attention before the LSTM path encoder. Default off for old checkpoint compatibility")
     parser.add_argument(
@@ -210,7 +252,7 @@ def parse_args():
     parser.set_defaults(iftransformer=False)
     parser.add_argument('--allow-online-adaptation', action='store_true',
                         help='Allow ADP-MCMF-FT as a separately labeled online-adaptation run')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if 'ADP-MCMF-FT' in args.strategies and not args.allow_online_adaptation:
         parser.error('ADP-MCMF-FT trains during test; use --allow-online-adaptation and exclude it from fixed-policy tables')
     return args
@@ -593,9 +635,21 @@ def resolve_dataset_dates(start_date: str, end_date: str | None) -> tuple[str, s
     )
 
 
-def main():
-    args = apply_paper_parameter_preset(parse_args())
+def main(argv=None):
+    args = apply_paper_parameter_preset(parse_args(argv))
+    try:
+        args.methods = resolve_method_list_arguments(args.methods)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     zone_distribution_mode = normalize_distribution_mode(args.distribution_mode)
+    if args.aev_charging_center_count:
+        args.checkpoint_suffix = "_".join(
+            part for part in (
+                args.checkpoint_suffix,
+                f"aev-centers-{args.aev_charging_center_count}",
+            )
+            if part
+        )
     from src.acceptance_features import acceptance_checkpoint_suffix
     acceptance_lookup_suffix = acceptance_checkpoint_suffix(args.ev_acceptance_feature, args.ev_acceptance_model,
         anchor=args.ev_response_anchor, critic_input=args.ev_response_critic_input)
@@ -627,9 +681,14 @@ def main():
     print("=" * 80)
     print("Model Evaluation")
     print(f"   Strategies: {[s['name'] for s in selected_strategies]}")
-    print(f"   Modes: {args.transportation_modes}")
+    print(f"   ICAPS methods: {args.methods}")
     print(f"   Seeds: {args.seeds}")
     print(f"   Episodes per config: {args.episodes}")
+    print(
+        "   AEV charging centers: "
+        f"{args.aev_charging_center_count} "
+        "(capacity 50 per selected center)"
+    )
     print(f"   Vehicles: {args.num_vehicles} (EV={args.num_ev})")
     print(f"   Grid: {args.grid_size}x{args.grid_size}")
     print(f"   Dataset dates: {dataset_start_date} -> {dataset_end_date}")
@@ -655,20 +714,30 @@ def main():
         for strategy in selected_strategies
         if strategy["load_ckpt"]
     })
-    ckpt_available = {}  # (mode, training assignment tag) -> bool
+    ckpt_available = {}  # (ICAPS method, training assignment tag) -> bool
     if need_ckpt:
         checkpoint_preference = checkpoint_selection.replace("_", " ")
         print(
             "\nCheckpoint check "
             f"(training tags = {checkpoint_tags}, prefer {checkpoint_preference}):"
         )
-        for mode in args.transportation_modes:
+        for method in args.methods:
+            canonical_name = canonical_method(method)
+            spec = METHODS[canonical_name]
+            internal_mode = spec.operating_mode
+            method_suffix = method_checkpoint_suffix(
+                args.checkpoint_suffix,
+                method,
+                state_variant=args.state_variant,
+                learner_variant=zone_distribution_mode,
+                rejection_logit_shift=args.rejection_logit_shift,
+            )
             for checkpoint_tag in checkpoint_tags:
                 ok = True
                 for vtype in ("aev", "ev"):
                     ckpt_dir = build_checkpoint_dir(
                         checkpoint_tag,
-                        mode,
+                        internal_mode,
                         args.num_ev,
                         intense,
                         vtype,
@@ -677,7 +746,7 @@ def main():
                         zone_distribution_mode,
                         args.only_manhattan_zones,
                         args.full_demand,
-                        checkpoint_suffix=(args.checkpoint_suffix + acceptance_lookup_suffix),
+                        checkpoint_suffix=(method_suffix + acceptance_lookup_suffix),
                     )
                     latest = ADPTrainer.find_latest_checkpoint(
                         ckpt_dir,
@@ -685,10 +754,10 @@ def main():
                         prefer_best_loss=ifload_bestloss,
                     )
                     status = latest if latest else "NOT FOUND"
-                    print(f"   [{mode}/{checkpoint_tag}/{vtype}] {ckpt_dir} -> {status}")
+                    print(f"   [{method}/{checkpoint_tag}/{vtype}] {ckpt_dir} -> {status}")
                     if latest is None:
                         ok = False
-                ckpt_available[(mode, checkpoint_tag)] = ok
+                ckpt_available[(method, checkpoint_tag)] = ok
         missing_count = sum(1 for v in ckpt_available.values() if not v)
         if missing_count:
             print(f"\n⚠  {missing_count} config(s) missing checkpoint — ADP strategies will be skipped for those.")
@@ -698,23 +767,34 @@ def main():
     all_results = []
     demand_baselines = {}
 
-    for mode in args.transportation_modes:
+    for method in args.methods:
+        canonical_name = canonical_method(method)
+        spec = METHODS[canonical_name]
+        internal_mode = spec.operating_mode
+        recourse_variant = spec.variant
+        method_suffix = method_checkpoint_suffix(
+            args.checkpoint_suffix,
+            method,
+            state_variant=args.state_variant,
+            learner_variant=zone_distribution_mode,
+            rejection_logit_shift=args.rejection_logit_shift,
+        )
         for strat in selected_strategies:
             checkpoint_assign_tag = strat.get("checkpoint_assign_tag", "gurobi")
             # Skip ADP strategies if checkpoint not available
             if strat["load_ckpt"] and not ckpt_available.get(
-                (mode, checkpoint_assign_tag),
+                (method, checkpoint_assign_tag),
                 False,
             ):
                 print(
-                    f"⏭  Skipping {strat['name']} for {mode}: "
+                    f"⏭  Skipping {strat['name']} for {method}: "
                     f"{checkpoint_assign_tag} checkpoint not found"
                 )
                 continue
 
             for seed in args.seeds:
                 print(f"\n{'─' * 70}")
-                print(f"▶ {strat['name']}  mode={mode}  seed={seed}")
+                print(f"▶ {strat['name']}  method={method}  seed={seed}")
                 print(f"{'─' * 70}")
 
                 fine_tune = bool(strat.get("train_during_test", False))
@@ -728,7 +808,7 @@ def main():
                     num_vehicles=args.num_vehicles,
                     num_ev=args.num_ev,
                     heuristic_battery_threshold=args.heuristic_battery_threshold,
-                    transportation_mode=mode,
+                    transportation_mode=internal_mode,
                     start_training_episode=0 if fine_tune else 999,
                     usemcmf=strat["usemcmf"],
                     knownreject=strat.get("known_reject", args.known_reject),
@@ -758,6 +838,8 @@ def main():
                     coord_csv=args.coord_csv,
                     station_csv=args.station_csv,
                     station_capacity_scale=args.station_capacity_scale,
+                    aev_charging_center_count=args.aev_charging_center_count,
+                    aev_charging_center_csv=args.aev_charging_center_csv,
                     start_hour=args.start_hour,
                     stop_hour=args.stop_hour,
                     epoch_length=args.epoch_length,
@@ -765,9 +847,15 @@ def main():
                     learner_variant=zone_distribution_mode,
                     ev_acceptance_feature=args.ev_acceptance_feature,
                     ev_acceptance_model=args.ev_acceptance_model,
-                ev_response_anchor=args.ev_response_anchor,
-                ev_response_critic_input=args.ev_response_critic_input,
-                    checkpoint_suffix=args.checkpoint_suffix,
+                    ev_response_anchor=args.ev_response_anchor,
+                    ev_response_critic_input=args.ev_response_critic_input,
+                    checkpoint_suffix=method_suffix,
+                    recourse_variant=recourse_variant,
+                    rejection_logit_shift=args.rejection_logit_shift,
+                    common_random_numbers=args.common_random_numbers,
+                    integrated_repair_hold_enabled=args.integrated_repair_hold_enabled,
+                    target_solver_policy=args.target_solver_policy,
+                    state_variant=args.state_variant,
                     only_manhattan_zones=args.only_manhattan_zones,
                     human_ev_charge_decision_interval_minutes=(
                         args.human_ev_charge_decision_interval_minutes
@@ -799,12 +887,12 @@ def main():
                     )
                     for d in detailed
                 )
-                demand_key = (mode, seed)
+                demand_key = (method, seed)
                 baseline = demand_baselines.setdefault(demand_key, demand_signature)
                 if demand_signature != baseline:
                     raise RuntimeError(
                         "Evaluation demand mismatch across strategies for "
-                        f"mode={mode}, seed={seed}: expected {baseline}, got {demand_signature} "
+                        f"method={method}, seed={seed}: expected {baseline}, got {demand_signature} "
                         f"for {strat['name']}"
                     )
                 total_accept = sum(d.get("accepted_orders", 0) for d in detailed)
@@ -902,7 +990,7 @@ def main():
                         completed_aev_orders = int(hourly_row.get("completed_aev_orders", 0))
                         hourly_completed_rows.append({
                             "strategy": strat["name"],
-                            "mode": mode,
+                            "method": method,
                             "seed": seed,
                             "episode_number": episode_idx,
                             "completed_date": completed_date,
@@ -941,7 +1029,7 @@ def main():
 
                 entry = {
                     "strategy": strat["name"],
-                    "mode": mode,
+                    "method": method,
                     "seed": seed,
                     "avg_reward": avg_reward,
                     "total_reward": sum(rewards),
@@ -1019,27 +1107,27 @@ def main():
     print("\n" + "=" * 120)
     print("Evaluation Summary")
     print("=" * 120)
-    header = f"{'Strategy':<12} {'Mode':<12} {'Seed':<8} {'AvgReward':>10} {'Orders':>8} {'Accept':>8} {'Reject':>8} {'Complete':>10} {'AccRate':>8} {'SvcRate':>8} {'AvgWait':>9} {'DropOff':>8}"
+    header = f"{'Strategy':<12} {'Method':<12} {'Seed':<8} {'AvgReward':>10} {'Orders':>8} {'Accept':>8} {'Reject':>8} {'Complete':>10} {'AccRate':>8} {'SvcRate':>8} {'AvgWait':>9} {'DropOff':>8}"
     print(header)
     print("-" * 120)
     for r in all_results:
         acc_rate = r['accept'] / r['total_orders'] * 100 if r['total_orders'] > 0 else 0
         service_rate = r.get('mean_service_ratio', 0.0) * 100.0
-        print(f"{r['strategy']:<12} {r['mode']:<12} {r['seed']:<8} "
+        print(f"{r['strategy']:<12} {r['method']:<12} {r['seed']:<8} "
               f"{r['avg_reward']:>10.2f} {r['total_orders']:>8} {r['accept']:>8} {r['reject']:>8} {r['complete']:>10} {acc_rate:>7.1f}% {service_rate:>7.1f}% {r['avg_wait']:>9.2f} {r['mean_drop_off_rate']:>8.4f}")
 
-    # Aggregate per (strategy, mode)
+    # Aggregate per (strategy, ICAPS method)
     print("\n" + "-" * 120)
-    print(f"{'Strategy':<12} {'Mode':<12} {'MeanReward':>12} {'StdReward':>12} {'SvcRate':>10} {'AvgWait':>10} {'DropOff':>10} {'Seeds':>6}")
+    print(f"{'Strategy':<12} {'Method':<12} {'MeanReward':>12} {'StdReward':>12} {'SvcRate':>10} {'AvgWait':>10} {'DropOff':>10} {'Seeds':>6}")
     print("-" * 120)
     seen = {}
     for r in all_results:
-        key = (r["strategy"], r["mode"])
+        key = (r["strategy"], r["method"])
         seen.setdefault(key, []).append(r["avg_reward"])
     for (s, m), rews in seen.items():
-        mean_drop_off = np.mean([r['mean_drop_off_rate'] for r in all_results if r['strategy'] == s and r['mode'] == m])
-        mean_service_ratio = np.mean([r['mean_service_ratio'] for r in all_results if r['strategy'] == s and r['mode'] == m]) * 100.0
-        wait_subset = [r for r in all_results if r['strategy'] == s and r['mode'] == m]
+        mean_drop_off = np.mean([r['mean_drop_off_rate'] for r in all_results if r['strategy'] == s and r['method'] == m])
+        mean_service_ratio = np.mean([r['mean_service_ratio'] for r in all_results if r['strategy'] == s and r['method'] == m]) * 100.0
+        wait_subset = [r for r in all_results if r['strategy'] == s and r['method'] == m]
         mean_avg_wait = aggregate_wait_metrics(wait_subset)['avg_wait']
         print(f"{s:<12} {m:<12} {np.mean(rews):>12.2f} {np.std(rews):>12.2f} {mean_service_ratio:>9.1f}% {mean_avg_wait:>10.2f} {mean_drop_off:>10.4f} {len(rews):>6}")
 
@@ -1073,7 +1161,7 @@ def main():
         for zone_row in result.get("daily_zone_request_completion_shares", []) or []:
             daily_zone_request_completion_detail_rows.append({
                 "strategy": result["strategy"],
-                "mode": result["mode"],
+                "method": result["method"],
                 "seed": result["seed"],
                 "request_date": zone_row.get("request_date"),
                 "zone_id": zone_row.get("zone_id"),
@@ -1084,7 +1172,7 @@ def main():
         for zone_row in result.get("hourly_zone_request_completed_orders", []) or []:
             hourly_zone_request_completed_detail_rows.append({
                 "strategy": result["strategy"],
-                "mode": result["mode"],
+                "method": result["method"],
                 "seed": result["seed"],
                 "request_date": zone_row.get("request_date"),
                 "request_hour": zone_row.get("request_hour"),
@@ -1096,7 +1184,7 @@ def main():
         for zone_row in result.get("hourly_zone_charge_station_counts", []) or []:
             hourly_zone_charge_station_detail_rows.append({
                 "strategy": result["strategy"],
-                "mode": result["mode"],
+                "method": result["method"],
                 "seed": result["seed"],
                 "date": zone_row.get("date"),
                 "hour": zone_row.get("hour"),
@@ -1110,7 +1198,7 @@ def main():
         for zone_row in result.get("hourly_zone_vehicle_counts", []) or []:
             hourly_zone_detail_rows.append({
                 "strategy": result["strategy"],
-                "mode": result["mode"],
+                "method": result["method"],
                 "seed": result["seed"],
                 "date": zone_row.get("date"),
                 "hour": zone_row.get("hour"),
@@ -1123,7 +1211,7 @@ def main():
         for hourly_row in result.get("hourly_completed_orders", []) or []:
             hourly_detail_rows.append({
                 "strategy": result["strategy"],
-                "mode": result["mode"],
+                "method": result["method"],
                 "seed": result["seed"],
                 "completed_date": hourly_row.get("completed_date"),
                 "completed_hour": hourly_row.get("completed_hour"),
@@ -1140,7 +1228,7 @@ def main():
     hourly_zone_charge_station_summary_rows = []
     hourly_zone_summary_rows = []
     for (s, m), rews in seen.items():
-        subset = [r for r in all_results if r["strategy"] == s and r["mode"] == m]
+        subset = [r for r in all_results if r["strategy"] == s and r["method"] == m]
         wait_summary = aggregate_wait_metrics(subset)
         total_episodes = sum(int(r.get("episodes", 0) or 0) for r in subset)
         daily_zone_request_completion_summary_map = {}
@@ -1151,7 +1239,7 @@ def main():
                     key,
                     {
                         "strategy": s,
-                        "mode": m,
+                        "method": m,
                         "request_date": zone_row.get("request_date"),
                         "zone_id": int(zone_row.get("zone_id", 0)),
                         "generated_requests": 0.0,
@@ -1187,7 +1275,7 @@ def main():
                     key,
                     {
                         "strategy": s,
-                        "mode": m,
+                        "method": m,
                         "request_date": zone_row.get("request_date"),
                         "request_hour": int(zone_row.get("request_hour", 0)),
                         "zone_id": int(zone_row.get("zone_id", 0)),
@@ -1224,7 +1312,7 @@ def main():
                     key,
                     {
                         "strategy": s,
-                        "mode": m,
+                        "method": m,
                         "date": zone_row.get("date"),
                         "hour": int(zone_row.get("hour", 0)),
                         "zone_id": int(zone_row.get("zone_id", 0)),
@@ -1264,7 +1352,7 @@ def main():
                     key,
                     {
                         "strategy": s,
-                        "mode": m,
+                        "method": m,
                         "date": zone_row.get("date"),
                         "hour": int(zone_row.get("hour", 0)),
                         "zone_id": int(zone_row.get("zone_id", 0)),
@@ -1295,7 +1383,7 @@ def main():
                     key,
                     {
                         "strategy": s,
-                        "mode": m,
+                        "method": m,
                         "completed_date": hourly_row.get("completed_date"),
                         "completed_hour": int(hourly_row.get("completed_hour", 0)),
                         "mean_completed_orders": 0.0,
@@ -1327,7 +1415,7 @@ def main():
             peak_completed_orders = 0.0
         summary_rows.append({
             "strategy": s,
-            "mode": m,
+            "method": m,
             "mean_reward": np.mean(rews),
             "std_reward": np.std(rews),
             "mean_accept": np.mean([r["accept"] for r in subset]),

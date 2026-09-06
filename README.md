@@ -163,20 +163,18 @@ These commands validate the complete software path; they are not paper-scale exp
 
 ## Recourse experiments
 
-The paper's main EV-first method is `recourse_macro` with separate critics and an optimization-anchored residual learner. `recourse_nested_q2` (R4) is the nested-estimator comparator, while Samitha is an operating-architecture comparator. Recourse variants are rejected for integrated and AEV-first execution because those modes do not have the EV-leader/AEV-follower semantics.
+The public NYC train/test axis is the ICAPS method list: `r0 r1 r2 r3 r4 macro samitha`. Execution order and recourse-target variants are resolved internally and are not command-line inputs.
 
 ```bash
-python run_trainer.py \
-  --episodes 5 \
+python run_nyctrainer.py \
+  --methods macro \
+  --episodes 1 \
   --num-vehicles 20 \
   --num-ev 10 \
-  --transportation-mode evfirst \
-  --recourse-variant recourse_macro \
   --learner-variant optimization_anchored_residual \
   --state-variant joint_state_separate_critics \
   --common-random-numbers \
-  --assignment-heuristic \
-  --no-mcmf
+  --use-mcmf
 ```
 
 The main causal ladder is structured no-repair (C0) → Repair Only (R2) → Repair Learning (R3) → Macro → nested Q2 (R4). Learned R1 remains a diagnostic control. Macro uses the sampled two-stage system return; R4 substitutes a learned follower bootstrap without changing the physical inference path. Checkpoint namespaces include recourse, state, learner, hold, energy, solver, and rejection-stress settings. `--checkpoint-replay {none,recent,full}` controls replay persistence (`recent` stores the newest 5,000 transitions by default). Replay/checkpoint files use Python pickle through `torch.save`/`pickle`; load only artifacts created by a trusted local run.
@@ -225,11 +223,11 @@ The following command uses the bundled real-data sample:
 
 ```bash
 python run_nyctrainer.py \
+  --methods r0 \
   --adp 1 \
   --episodes 1 \
   --num-vehicles 20 \
   --num-ev 10 \
-  --transportation-mode integrated \
   --assignment-heuristic \
   --no-mcmf \
   --learner-variant optimization_anchored_residual \

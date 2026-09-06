@@ -42,6 +42,14 @@ def parse_args(argv=None):
     parser.add_argument("--synthetic-demand-scale", type=float, default=scenario.DEFAULT_SYNTHETIC_DEMAND_SCALE)
     parser.add_argument("--nyc-demand-scale", type=float, default=1.0)
     parser.add_argument("--station-capacity-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--aev-charging-center-count",
+        type=int,
+        choices=(0, 3, 4, 5),
+        default=0,
+        help="NYC-only AEV-exclusive charging-center scenario",
+    )
+    parser.add_argument("--aev-charging-center-csv", type=Path, default=None)
     parser.add_argument("--battery-consumption-ratio", type=float, default=1.0)
     parser.add_argument("--initial-battery-mean", type=float, default=0.875)
     parser.add_argument("--charge-duration-scale", type=float, default=1.0)
@@ -133,6 +141,12 @@ def make_environment(args, seed):
             battery_consumption_ratio=args.battery_consumption_ratio,
             initial_battery_mean=args.initial_battery_mean,
             charge_duration_scale=args.charge_duration_scale,
+            aev_charging_center_count=args.aev_charging_center_count,
+            aev_charging_center_csv=(
+                str(args.aev_charging_center_csv)
+                if args.aev_charging_center_csv is not None
+                else None
+            ),
         )
     # Ordinary MCMF, no ADP score, no known-probability MCMF-K correction.
     # Evaluation here disables RL updates only; our passive offer collector

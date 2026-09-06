@@ -11,6 +11,12 @@ class ChargingStation:
         self.charging_queue: List[str] = []
         self.charging_queue_notarrived: List[str] = []
         self.available_slots = max_capacity
+        # Relative-epoch schedule populated by the environment when it builds
+        # the charge-action matrix.  These diagnostics do not alter the legacy
+        # station admission API.
+        self.expected_charging_occupancy: List[int] = []
+        self.expected_charging_intervals: List[Dict] = []
+        self.expected_charging_occupancy_updated_at: Optional[float] = None
 
     def is_available(self) -> bool:
         """Check if there are available charging slots"""

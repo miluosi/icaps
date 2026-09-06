@@ -522,6 +522,8 @@ class NYCTrainer:
         benchmark_steps: int,
         log_dir: str,
         only_manhattan_zones: bool = False,
+        aev_charging_center_count: int = 0,
+        aev_charging_center_csv: str | None = None,
     ):
         self._set_random_seeds(random_seed)
         parquet_paths = self._resolve_parquet_paths(
@@ -567,6 +569,8 @@ class NYCTrainer:
             ifreject=ifreject,
             ifdropoff=ifdropoff,
             only_manhattan_zones=only_manhattan_zones,
+            aev_charging_center_count=aev_charging_center_count,
+            aev_charging_center_csv=aev_charging_center_csv,
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -865,6 +869,8 @@ class NYCTrainer:
         initial_battery_mean: float = 0.875,
         charge_wait_bool: bool = True,
         human_ev_charge_decision_interval_minutes: float = 120.0,
+        aev_charging_center_count: int = 0,
+        aev_charging_center_csv: str | None = None,
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -931,6 +937,8 @@ class NYCTrainer:
             human_ev_charge_decision_interval_minutes=(
                 human_ev_charge_decision_interval_minutes
             ),
+            aev_charging_center_count=aev_charging_center_count,
+            aev_charging_center_csv=aev_charging_center_csv,
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -1223,6 +1231,13 @@ class NYCTrainer:
         total_station_capacity = sum(station.max_capacity for station in env.charging_manager.stations.values())
         print(f"✓ NYCEnvironment: {num_vehicles} vehicles, {env.NUM_ZONES} zones")
         print(f"✓ Charging stations: {len(env.charging_manager.stations)} stations, capacity={total_station_capacity}, scale={station_capacity_scale}")
+        if env.aev_charging_center_count:
+            print(
+                "✓ AEV-only charging centers: "
+                f"scenario={env.aev_charging_center_count}, "
+                f"centers={env.num_aev_charging_stations}, "
+                f"capacity={sum(env.charging_manager.stations[sid].max_capacity for sid in env.aev_charging_station_ids)}"
+            )
         print(
             "✓ Human EV charge-decision interval: "
             f"{env.human_ev_charge_decision_interval_minutes:g} min "

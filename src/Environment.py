@@ -20,6 +20,12 @@ from .charging_metrics import charging_session_metrics
 from .Action import Action, ChargingAction, ServiceAction, IdleAction
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import positive_wait_metrics
+from src.expected_charging import (
+    build_charge_action_epoch_expansion,
+    build_expected_station_schedule,
+    epoch_offset,
+    has_complete_charging_window,
+)
 from src.qvalue_precision import qvalue_rounding_diagnostics, round_qvalue_matrix
 from src.recourse.coordinator import RecourseCoordinator
 from src.recourse.lifecycle import RequestLifecycleTracker
@@ -4144,6 +4150,157 @@ class ChargingIntegratedEnvironment(Environment):
         return vehicle_zone
             
             
+    @staticmethod
+    def _coerce_charging_vehicle_id(raw_vehicle_id, vehicles):
+        if raw_vehicle_id in vehicles:
+            return raw_vehicle_id
+        try:
+            candidate = int(raw_vehicle_id)
+        except (TypeError, ValueError):
+            return None
+        return candidate if candidate in vehicles else None
+
+    def calculate_expected_entercharge_station_time_battery(
+        self, vehicle_id, station_id
+    ):
+        """Return deterministic synthetic arrival SOC and completion epoch."""
+
+        vehicle = self.vehicles[vehicle_id]
+        station = self.charging_manager.stations[station_id]
+        distance = float(self._manhattan_distance_loc(
+            int(vehicle['location']), int(station.location)
+        ))
+        expected_battery_after_travel = (
+            float(vehicle['battery']) - distance * float(self.battery_consum)
+        )
+        if expected_battery_after_travel < 0.0:
+            return None
+        travel_epochs = epoch_offset(distance)
+        charging_duration = max(1, int(getattr(self, 'charge_duration', 1)))
+        arrival_time = float(getattr(self, 'current_time', 0.0)) + travel_epochs
+        return {
+            'expected_battery_after_travel': expected_battery_after_travel,
+            'travel_time': distance,
+            'travel_epochs': travel_epochs,
+            'distance_km': distance,
+            'expected_entercharge_station_time': arrival_time,
+            'expected_charge_completion_time': arrival_time + charging_duration,
+            'charging_duration': charging_duration,
+        }
+
+    def _build_expected_charging_occupancy(self, station_id, exclude_vehicle_id=None):
+        station = self.charging_manager.stations[station_id]
+        excluded = None if exclude_vehicle_id is None else int(exclude_vehicle_id)
+        default_duration = max(1, int(getattr(self, 'charge_duration', 1)))
+        current_jobs = []
+        waiting_jobs = []
+        current_keys = set()
+
+        for raw_vehicle_id in getattr(station, 'current_vehicles', []) or []:
+            current_keys.add(str(raw_vehicle_id))
+            vehicle_id = self._coerce_charging_vehicle_id(raw_vehicle_id, self.vehicles)
+            if vehicle_id is not None and vehicle_id == excluded:
+                continue
+            vehicle = self.vehicles.get(vehicle_id, {}) if vehicle_id is not None else {}
+            current_jobs.append({
+                'vehicle_id': vehicle_id if vehicle_id is not None else raw_vehicle_id,
+                'duration': max(1, epoch_offset(
+                    vehicle.get('charging_time_left', default_duration)
+                )),
+                'source': 'charging',
+            })
+
+        for queue_index, raw_vehicle_id in enumerate(
+            getattr(station, 'charging_queue', []) or []
+        ):
+            if str(raw_vehicle_id) in current_keys:
+                continue
+            vehicle_id = self._coerce_charging_vehicle_id(raw_vehicle_id, self.vehicles)
+            if vehicle_id is not None and vehicle_id == excluded:
+                continue
+            waiting_jobs.append({
+                'vehicle_id': vehicle_id if vehicle_id is not None else raw_vehicle_id,
+                'release_offset': 0,
+                'duration': default_duration,
+                'priority': 0,
+                'queue_index': queue_index,
+                'source': 'station_queue',
+            })
+
+        queued_keys = {str(job['vehicle_id']) for job in waiting_jobs}
+        for reservation_index, raw_vehicle_id in enumerate(
+            getattr(station, 'charging_queue_notarrived', []) or []
+        ):
+            if str(raw_vehicle_id) in current_keys or str(raw_vehicle_id) in queued_keys:
+                continue
+            vehicle_id = self._coerce_charging_vehicle_id(raw_vehicle_id, self.vehicles)
+            if vehicle_id == excluded:
+                continue
+            if vehicle_id is None:
+                waiting_jobs.append({
+                    'vehicle_id': raw_vehicle_id,
+                    'release_offset': 0,
+                    'duration': default_duration,
+                    'priority': 1,
+                    'reservation_index': reservation_index,
+                    'source': 'unknown_inbound_reservation',
+                })
+                continue
+            expected = self.calculate_expected_entercharge_station_time_battery(
+                vehicle_id, station_id
+            )
+            if expected is None:
+                continue
+            waiting_jobs.append({
+                'vehicle_id': vehicle_id,
+                'release_offset': expected['travel_epochs'],
+                'duration': expected['charging_duration'],
+                'priority': 1,
+                'reservation_index': reservation_index,
+                'source': 'inbound_reservation',
+            })
+
+        return build_expected_station_schedule(
+            capacity=int(getattr(station, 'max_capacity', 0)),
+            current_jobs=current_jobs,
+            waiting_jobs=waiting_jobs,
+        )
+
+    def update_expected_charging_occupancy(
+        self,
+        vehicle_id,
+        station_id,
+        *,
+        base_schedule=None,
+    ):
+        expected = self.calculate_expected_entercharge_station_time_battery(
+            vehicle_id, station_id
+        )
+        schedule = base_schedule or self._build_expected_charging_occupancy(
+            station_id, exclude_vehicle_id=vehicle_id
+        )
+        feasible = bool(expected is not None and has_complete_charging_window(
+            schedule,
+            arrival_offset=expected['travel_epochs'],
+            charging_duration=expected['charging_duration'],
+        ))
+        station = self.charging_manager.stations[station_id]
+        station.expected_charging_occupancy = list(schedule['occupancy'])
+        station.expected_charging_intervals = [dict(item) for item in schedule['intervals']]
+        station.expected_charging_occupancy_updated_at = float(
+            getattr(self, 'current_time', 0.0)
+        )
+        result = dict(expected or {})
+        result.update({
+            'vehicle_id': int(vehicle_id),
+            'station_id': int(station_id),
+            'feasible': feasible,
+            'capacity': int(schedule['capacity']),
+            'occupancy': tuple(schedule['occupancy']),
+            'intervals': tuple(schedule['intervals']),
+        })
+        return result
+
     def generate_vehicle_chargerange(self, vehicle_ids):
         """
         计算车辆到充电站的可达性矩阵
@@ -4159,6 +4316,11 @@ class ChargingIntegratedEnvironment(Environment):
         # 建立充电站ID到矩阵列索引的映射
         station_id_to_idx = {station.id: idx for idx, station in enumerate(self.charging_manager.stations.values())}
         stations_list = list(self.charging_manager.stations.values())
+        expected_schedules = {
+            int(station.id): self._build_expected_charging_occupancy(int(station.id))
+            for station in stations_list
+        }
+        expected_windows = {}
         
         for i, vehicle_id in enumerate(vehicle_ids):
             veh_battery = self.vehicles[vehicle_id]['battery']
@@ -4169,26 +4331,26 @@ class ChargingIntegratedEnvironment(Environment):
             station_dists = []
             for station in stations_list:
                 col_idx = station_id_to_idx[station.id]
-                total_reserved = (
-                    len(getattr(station, 'current_vehicles', []) or [])
-                    + len(getattr(station, 'charging_queue', []) or [])
-                    + len(getattr(station, 'charging_queue_notarrived', []) or [])
-                )
-                admission_limit = (
-                    int(station.max_capacity)
-                    + int(getattr(self, 'station_queue_capacity', 0))
-                )
                 if (
                     is_ev_type1
                     or veh_battery > self.proactive_charging_max_battery
-                    or total_reserved >= admission_limit
                 ):
                     station_dists.append((col_idx, float('inf'), 0))
                 else:
                     distance = self._manhattan_distance_loc(veh_loc, station.location)
                     batteryloss = distance * self.battery_consum
                     battery_add = self.chargeincrease_whole
-                    if veh_battery - batteryloss + battery_add >= self.min_battery_level and veh_battery - batteryloss >= 0:
+                    expected = self.update_expected_charging_occupancy(
+                        int(vehicle_id),
+                        int(station.id),
+                        base_schedule=expected_schedules[int(station.id)],
+                    )
+                    expected_windows[(int(vehicle_id), int(station.id))] = expected
+                    if (
+                        veh_battery - batteryloss + battery_add >= self.min_battery_level
+                        and veh_battery - batteryloss >= 0
+                        and expected['feasible']
+                    ):
                         station_dists.append((col_idx, distance, 1))
                     else:
                         station_dists.append((col_idx, distance, 0))
@@ -4220,12 +4382,24 @@ class ChargingIntegratedEnvironment(Environment):
                 feasible_indices = np.flatnonzero(vehicle_chargerange[row] > 0)
                 if feasible_indices.size == 0:
                     continue
-                reservation_pressure = np.asarray([
-                    len(getattr(stations_list[index], 'current_vehicles', []) or [])
-                    + len(getattr(stations_list[index], 'charging_queue', []) or [])
-                    + len(getattr(stations_list[index], 'charging_queue_notarrived', []) or [])
-                    for index in feasible_indices
-                ], dtype=float)
+                reservation_pressure = []
+                for index in feasible_indices:
+                    station = stations_list[index]
+                    window = expected_windows.get(
+                        (int(vehicle_id), int(station.id)), {}
+                    )
+                    start = int(window.get('travel_epochs', 0))
+                    end = start + max(1, int(window.get('charging_duration', 1)))
+                    occupancy = expected_schedules[int(station.id)]['occupancy']
+                    reservation_pressure.append(max(
+                        (
+                            int(occupancy[offset])
+                            if offset < len(occupancy) else 0
+                            for offset in range(start, end)
+                        ),
+                        default=0,
+                    ))
+                reservation_pressure = np.asarray(reservation_pressure, dtype=float)
                 reservation_capacity = np.asarray([
                     max(
                         1,
@@ -4301,11 +4475,6 @@ class ChargingIntegratedEnvironment(Environment):
                 eligible_rows = np.flatnonzero(vehicle_chargerange[:, column] > 0)
                 if eligible_rows.size == 0:
                     continue
-                station_pressure = (
-                    len(getattr(station, 'current_vehicles', []) or [])
-                    + len(getattr(station, 'charging_queue', []) or [])
-                    + len(getattr(station, 'charging_queue_notarrived', []) or [])
-                )
                 aev_slot_limit = max(
                     1,
                     int(math.ceil(
@@ -4313,7 +4482,6 @@ class ChargingIntegratedEnvironment(Environment):
                         * self.queue_forecast_aev_capacity_share
                     )),
                 )
-                candidate_limit = max(0, aev_slot_limit - station_pressure)
                 ranked_rows = sorted(
                     (int(row) for row in eligible_rows),
                     key=lambda row: (
@@ -4326,15 +4494,28 @@ class ChargingIntegratedEnvironment(Environment):
                         float(self.vehicles[vehicle_ids[row]]['battery']),
                     ),
                 )
-                if candidate_limit <= 0:
-                    ranked_rows = [
-                        row for row in ranked_rows
-                        if float(self.vehicles[vehicle_ids[row]]['battery'])
-                        <= self.critical_charging_battery
-                    ][:1]
-                else:
-                    ranked_rows = ranked_rows[:candidate_limit]
-                keep_rows = set(ranked_rows)
+                occupancy = list(
+                    expected_schedules[int(station.id)]['occupancy']
+                )
+                keep_rows = set()
+                for row in ranked_rows:
+                    window = expected_windows.get(
+                        (int(vehicle_ids[row]), int(station.id))
+                    )
+                    if not window:
+                        continue
+                    start = int(window['travel_epochs'])
+                    end = start + max(1, int(window['charging_duration']))
+                    if len(occupancy) < end:
+                        occupancy.extend([0] * (end - len(occupancy)))
+                    if any(
+                        occupancy[offset] >= aev_slot_limit
+                        for offset in range(start, end)
+                    ):
+                        continue
+                    keep_rows.add(row)
+                    for offset in range(start, end):
+                        occupancy[offset] += 1
                 removed_rows = [
                     int(row) for row in eligible_rows if int(row) not in keep_rows
                 ]
@@ -4344,6 +4525,16 @@ class ChargingIntegratedEnvironment(Environment):
                     self.queue_forecast_filtered_actions += removed_count
                     self.queue_forecast_reservation_filtered_actions += removed_count
         
+        self._last_expected_charge_expansion = build_charge_action_epoch_expansion(
+            vehicle_ids=vehicle_ids,
+            station_ids=[station.id for station in stations_list],
+            feasibility=vehicle_chargerange,
+            station_schedules=expected_schedules,
+            candidate_windows=expected_windows,
+        )
+        self._last_expected_charge_expansion['current_time'] = float(
+            getattr(self, 'current_time', 0.0)
+        )
         return vehicle_chargerange
                         
                         

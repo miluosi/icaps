@@ -174,7 +174,9 @@ def test_queue_forecast_filters_slower_station_actions():
     stations[1].charging_queue_notarrived[:] = [10, 11, 12, 13]
     capacity_limited_result = env.generate_vehicle_chargerange([0])
 
-    assert capacity_limited_result.tolist() == [[0.0, 1.0, 1.0]]
+    # Static reservation count no longer closes the station.  These unknown
+    # legacy reservations occupy offset 0, while this vehicle arrives at 1.
+    assert capacity_limited_result.tolist() == [[1.0, 1.0, 1.0]]
 
 
 def test_aev_queue_admission_keeps_full_station_as_a_decision_candidate():

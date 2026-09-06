@@ -1,0 +1,6 @@
+site_id,area,candidate_location,latitude,longitude,address,minimum_center_count
+D1,Downtown / Lower East Side,Delancey and Essex Municipal Parking Garage,40.71925,-73.988159,105-113 Essex St / 112-120 Ludlow St New York NY 10002,3
+M1,Midtown East / Central Midtown,Park Avenue and East 42nd Street (Grand Central vicinity),40.751873,-73.977706,Park Avenue and East 42nd Street New York NY,3
+U1,Upper West Side,West 96th Street and Broadway,40.7941,-73.972,West 96th Street and Broadway New York NY,3
+M2,Midtown West,West 42nd Street and 8th Avenue,40.75757,-73.991,West 42nd Street and 8th Avenue New York NY,4
+U2,East Harlem / Upper East-North,East 116th Street and 2nd Avenue,40.79688,-73.93725,East 116th Street and 2nd Avenue New York NY,5

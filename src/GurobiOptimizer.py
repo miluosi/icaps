@@ -359,6 +359,103 @@ class GurobiOptimizer:
             )
         return values
 
+    def _expected_charge_expansion(self, vehicle_ids):
+        """Return compatible per-epoch charge metadata for this matrix batch."""
+
+        expansion = getattr(self.env, '_last_expected_charge_expansion', None)
+        if not isinstance(expansion, dict):
+            return None
+        try:
+            expected_ids = tuple(int(vehicle_id) for vehicle_id in vehicle_ids)
+            if tuple(expansion.get('vehicle_ids', ())) != expected_ids:
+                return None
+            if (
+                'current_time' in expansion
+                and hasattr(self.env, 'current_time')
+                and float(expansion['current_time']) != float(self.env.current_time)
+            ):
+                return None
+        except (TypeError, ValueError):
+            return None
+        if not expansion.get('candidate_windows'):
+            return None
+        return expansion
+
+    def _expected_charge_edges_to_disable(
+        self,
+        action_by_vehicle,
+        vehicle_ids,
+        layout,
+        feasibility,
+        q_values,
+    ):
+        """Find selected charge edges that violate future station-epoch capacity.
+
+        This is used as a compatibility cut loop by MCMF backends, whose public
+        input remains the legacy 2-D action matrix.  Candidate edges are kept in
+        descending opportunity-cost order and conflicting lower-value edges are
+        disabled before the next solve.
+        """
+
+        expansion = self._expected_charge_expansion(vehicle_ids)
+        if expansion is None:
+            return []
+        num_requests = int(layout['num_requests'])
+        num_charging = int(layout['num_charging'])
+        station_ids = tuple(int(item) for item in layout['charge_station_ids'])
+        windows = expansion['candidate_windows']
+        schedules = expansion['station_schedules']
+        selected_by_station = {}
+
+        for row in range(len(vehicle_ids)):
+            raw_action = (
+                action_by_vehicle.get(row, -1)
+                if hasattr(action_by_vehicle, 'get')
+                else action_by_vehicle[row]
+            )
+            action = int(raw_action)
+            local_station = action - num_requests
+            if local_station < 0 or local_station >= num_charging:
+                continue
+            if local_station >= len(station_ids):
+                continue
+            station_id = station_ids[local_station]
+            window = windows.get((int(vehicle_ids[row]), station_id))
+            if not window:
+                continue
+            alternatives = np.flatnonzero(feasibility[row])
+            alternatives = alternatives[alternatives != action]
+            best_alternative = (
+                float(np.max(q_values[row, alternatives]))
+                if alternatives.size else -np.inf
+            )
+            regret = float(q_values[row, action]) - best_alternative
+            selected_by_station.setdefault(station_id, []).append(
+                (regret, int(vehicle_ids[row]), row, action, window)
+            )
+
+        disabled = []
+        for station_id, candidates in selected_by_station.items():
+            schedule = schedules.get(station_id, {})
+            capacity = max(0, int(schedule.get('capacity', 0)))
+            occupancy = list(int(value) for value in schedule.get('occupancy', ()))
+            for _regret, _vehicle_id, row, action, window in sorted(
+                candidates,
+                key=lambda item: (-item[0], item[1], item[3]),
+            ):
+                start = max(0, int(window.get('travel_epochs', 0)))
+                end = start + max(1, int(window.get('charging_duration', 1)))
+                if len(occupancy) < end:
+                    occupancy.extend([0] * (end - len(occupancy)))
+                if capacity <= 0 or any(
+                    occupancy[offset] >= capacity for offset in range(start, end)
+                ):
+                    disabled.append((row, action))
+                    continue
+                for offset in range(start, end):
+                    occupancy[offset] += 1
+        return disabled
+
     def _build_exact_mcmf_inputs(
         self,
         vehicle_ids,
@@ -395,6 +492,7 @@ class GurobiOptimizer:
         action_capacities[:num_requests] = 1
         if not ev_only:
             station_ids = layout['charge_station_ids']
+            expanded_capacity = self._expected_charge_expansion(vehicle_ids) is not None
             for local_index in range(num_charging):
                 capacity = 0
                 if local_index < len(station_ids) and hasattr(self.env, 'charging_manager'):
@@ -403,7 +501,9 @@ class GurobiOptimizer:
                     )
                     if station is not None:
                         capacity = self._charging_station_vacancy(station)
-                action_capacities[num_requests + local_index] = capacity
+                action_capacities[num_requests + local_index] = (
+                    num_vehicles if expanded_capacity else capacity
+                )
 
         fallback_values = self._exact_mcmf_fallback_values(feasibility, q_values)
         return feasibility, q_values, action_capacities, fallback_values, layout
@@ -572,33 +672,55 @@ class GurobiOptimizer:
                 ev_only=ev_only,
             )
         )
-        problem = build_reduced_problem(
-            feasibility,
-            q_values,
-            capacities,
-            cost_scale=int(getattr(
-                self.env, 'mcmf_cost_scale', self.mcmf_cost_scale
-            )),
-            fallback_values=fallback,
-            graph_reduction=bool(getattr(
-                self.env, 'mcmf_graph_reduction', self.mcmf_graph_reduction
-            )),
-        )
-        build_time = time.perf_counter() - build_start
-
         requested_backend = self._exact_mcmf_selection() or self.mcmf_backend
-        solve_start = time.perf_counter()
-        result = solve_exact(
-            problem,
-            backend=requested_backend,
-            verify=bool(getattr(self.env, 'mcmf_verify', self.mcmf_verify)),
-            gp=(self.gp if self.mip_backend == 'gurobi' and self.available
-                and not self._gurobi_runtime_failed else None),
-            grb=(self.GRB if self.mip_backend == 'gurobi' and self.available
-                 and not self._gurobi_runtime_failed else None),
-            num_threads=self.num_threads,
-        )
-        solve_time = time.perf_counter() - solve_start
+        build_time = 0.0
+        solve_time = 0.0
+        capacity_cut_iterations = 0
+        max_iterations = max(1, int(np.count_nonzero(feasibility)))
+        while True:
+            iteration_build_start = time.perf_counter()
+            problem = build_reduced_problem(
+                feasibility,
+                q_values,
+                capacities,
+                cost_scale=int(getattr(
+                    self.env, 'mcmf_cost_scale', self.mcmf_cost_scale
+                )),
+                fallback_values=fallback,
+                graph_reduction=bool(getattr(
+                    self.env, 'mcmf_graph_reduction', self.mcmf_graph_reduction
+                )),
+            )
+            build_time += time.perf_counter() - iteration_build_start
+            solve_start = time.perf_counter()
+            result = solve_exact(
+                problem,
+                backend=requested_backend,
+                verify=bool(getattr(self.env, 'mcmf_verify', self.mcmf_verify)),
+                gp=(self.gp if self.mip_backend == 'gurobi' and self.available
+                    and not self._gurobi_runtime_failed else None),
+                grb=(self.GRB if self.mip_backend == 'gurobi' and self.available
+                    and not self._gurobi_runtime_failed else None),
+                num_threads=self.num_threads,
+            )
+            solve_time += time.perf_counter() - solve_start
+            disabled = self._expected_charge_edges_to_disable(
+                result.action_by_vehicle,
+                vehicle_ids,
+                layout,
+                feasibility,
+                q_values,
+            )
+            if not disabled:
+                break
+            capacity_cut_iterations += 1
+            for row, action in disabled:
+                feasibility[row, action] = False
+            if capacity_cut_iterations >= max_iterations:
+                raise RuntimeError(
+                    'future charging-capacity cut loop did not converge'
+                )
+        self.env.expected_charge_capacity_cut_iterations = capacity_cut_iterations
         self._record_exact_mcmf_result(
             result, build_time=build_time, solve_time=solve_time
         )
@@ -1422,9 +1544,13 @@ class GurobiOptimizer:
         G = nx.DiGraph()
 
         num_vehicles = len(vehicle_ids)
-        num_requests = len(available_requests)
-        num_charging = self.env.num_stations
-        num_zones = self._get_relocation_target_count()
+        layout = self._get_matrix_action_layout(
+            available_requests,
+            vehicle_action_matrix.shape[1],
+        )
+        num_requests = int(layout['num_requests'])
+        num_charging = int(layout['num_charging'])
+        num_zones = int(layout['num_zones'])
         
         layers = {
             'source': ['s'],
@@ -1498,7 +1624,14 @@ class GurobiOptimizer:
                 G.add_edge(f'r{j}', 't', capacity=1, weight=0)
         
         # Charging stations → sink (capacity = vacancy)
-        charging_stations_list = list(self.env.charging_manager.stations.values()) if hasattr(self.env, 'charging_manager') else []
+        charging_stations_list = (
+            [
+                self.env.charging_manager.stations[station_id]
+                for station_id in layout['charge_station_ids']
+                if station_id in self.env.charging_manager.stations
+            ]
+            if hasattr(self.env, 'charging_manager') else []
+        )
         for k in range(num_charging):
             if k < len(charging_stations_list):
                 station = charging_stations_list[k]
@@ -2050,17 +2183,67 @@ class GurobiOptimizer:
         
         
         
-        # Constraint 3: Charging station capacity constraints
-        for k in range(num_charging):
-            if k < len(charging_stations_list):
-                station = charging_stations_list[k]
-                vacancy = self._charging_station_vacancy(station)
-            else:
-                # Fallback if charging station list is shorter than expected
-                vacancy = 0
-            station_idx = k + num_requests
-            model.addConstr(self.gp.quicksum(assign_vehicle[i][station_idx] for i in range(len(vehicle_ids))) <= vacancy,
-                          name=f'charging_station_{k}_capacity')
+        # Constraint 3: charging capacity.  Keep the legacy station constraint
+        # when no expected schedule is available; otherwise expand it by future
+        # epoch because each vehicle reaches the same station at a different
+        # time and occupies a different interval.
+        charge_expansion = self._expected_charge_expansion(vehicle_ids)
+        if charge_expansion is None:
+            for k in range(num_charging):
+                if k < len(charging_stations_list):
+                    vacancy = self._charging_station_vacancy(charging_stations_list[k])
+                else:
+                    vacancy = 0
+                station_idx = k + num_requests
+                model.addConstr(
+                    self.gp.quicksum(
+                        assign_vehicle[i][station_idx]
+                        for i in range(len(vehicle_ids))
+                    ) <= vacancy,
+                    name=f'charging_station_{k}_capacity',
+                )
+        else:
+            windows = charge_expansion['candidate_windows']
+            schedules = charge_expansion['station_schedules']
+            for k, station_id in enumerate(scale_charge_station_ids[:num_charging]):
+                station_idx = k + num_requests
+                schedule = schedules.get(int(station_id), {})
+                capacity = max(0, int(schedule.get('capacity', 0)))
+                background = tuple(schedule.get('occupancy', ()))
+                covered_epochs = sorted({
+                    offset
+                    for vehicle_id in vehicle_ids
+                    for window in [windows.get((int(vehicle_id), int(station_id)))]
+                    if window
+                    for offset in range(
+                        max(0, int(window.get('travel_epochs', 0))),
+                        max(0, int(window.get('travel_epochs', 0)))
+                        + max(1, int(window.get('charging_duration', 1))),
+                    )
+                })
+                for offset in covered_epochs:
+                    eligible_rows = []
+                    for row, vehicle_id in enumerate(vehicle_ids):
+                        window = windows.get((int(vehicle_id), int(station_id)))
+                        if not window:
+                            continue
+                        start = max(0, int(window.get('travel_epochs', 0)))
+                        end = start + max(1, int(window.get('charging_duration', 1)))
+                        if start <= offset < end:
+                            eligible_rows.append(row)
+                    residual_capacity = max(
+                        0,
+                        capacity - (
+                            int(background[offset]) if offset < len(background) else 0
+                        ),
+                    )
+                    model.addConstr(
+                        self.gp.quicksum(
+                            assign_vehicle[row][station_idx]
+                            for row in eligible_rows
+                        ) <= residual_capacity,
+                        name=f'charging_station_{station_id}_epoch_{offset}_capacity',
+                    )
         
         # Objective: Maximize total Q-value
         # vehicle_action_matrix[i, a] contains the Q-value for vehicle i taking action a
@@ -3255,13 +3438,18 @@ class GurobiOptimizer:
         num_vehicles = len(vehicle_ids)
         num_action = vehicle_action_matrix.shape[1]
         num_requests = len(available_requests)
-        num_charging = 0 if ev_only else getattr(self.env, 'num_stations', 0)
+        layout = self._get_matrix_action_layout(available_requests, num_action)
+        num_charging = 0 if ev_only else int(layout['num_charging'])
         capacities = np.full(num_action, num_vehicles, dtype=np.int64)
         capacities[:num_requests] = 1
 
         if not ev_only:
             charging_stations_list = (
-                list(self.env.charging_manager.stations.values())
+                [
+                    self.env.charging_manager.stations[station_id]
+                    for station_id in layout['charge_station_ids']
+                    if station_id in self.env.charging_manager.stations
+                ]
                 if hasattr(self.env, 'charging_manager') else []
             )
             for k in range(num_charging):
@@ -3279,10 +3467,33 @@ class GurobiOptimizer:
     def _decode_auction_assignments(self, action_by_vehicle, vehicle_ids, available_requests, num_charging=None, num_zones=None):
         assignments = {}
         num_requests = len(available_requests)
-        num_charging = getattr(self.env, 'num_stations', 0) if num_charging is None else num_charging
-        num_zones = len(getattr(self.env, 'hotspot_locations', [])) if num_zones is None else num_zones
+        inferred_num_action = (
+            num_requests
+            + int(num_charging or 0)
+            + int(num_zones or 0)
+            + 1
+        )
+        if num_charging is None or num_zones is None:
+            stored_num_action = (
+                int(getattr(self.env, '_last_matrix_num_requests', num_requests))
+                + int(getattr(self.env, '_last_matrix_num_stations', 0))
+                + int(getattr(self.env, '_last_matrix_num_zones', 0))
+                + 1
+            )
+            layout = self._get_matrix_action_layout(
+                available_requests,
+                max(inferred_num_action, stored_num_action),
+            )
+        else:
+            layout = self._get_matrix_action_layout(available_requests, inferred_num_action)
+        num_charging = int(layout['num_charging']) if num_charging is None else num_charging
+        num_zones = int(layout['num_zones']) if num_zones is None else num_zones
         charging_stations_list = (
-            list(self.env.charging_manager.stations.values())
+            [
+                self.env.charging_manager.stations[station_id]
+                for station_id in layout['charge_station_ids'][:num_charging]
+                if station_id in self.env.charging_manager.stations
+            ]
             if hasattr(self.env, 'charging_manager') else []
         )
 
@@ -3540,10 +3751,13 @@ class GurobiOptimizer:
             return self._fallback_to_mcmf_after_auction(
                 vehicle_ids, available_requests, vehicle_action_matrix, batch_q_value, iflp=iflp, ev_only=False)
 
-        num_zones = len(getattr(self.env, 'hotspot_locations', []))
+        layout = self._get_matrix_action_layout(
+            available_requests,
+            vehicle_action_matrix.shape[1],
+        )
         return self._decode_auction_assignments(
             action_by_vehicle, vehicle_ids, available_requests,
-            num_charging=getattr(self.env, 'num_stations', 0), num_zones=num_zones,
+            num_charging=layout['num_charging'], num_zones=layout['num_zones'],
         )
 
     def _auction_vehicle_rebalancing_network_ev(self, vehicle_ids, available_requests, vehicle_action_matrix, batch_q_value, iflp=True):

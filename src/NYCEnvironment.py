@@ -34,6 +34,12 @@ from src.Action import Action, ChargingAction, IdleAction, ServiceAction
 from src.charging_station import ChargingStation, ChargingStationManager
 from src.charging_metrics import charging_session_metrics
 from src.charging_wait_metrics import positive_wait_metrics
+from src.expected_charging import (
+    build_charge_action_epoch_expansion,
+    build_expected_station_schedule,
+    epoch_offset,
+    has_complete_charging_window,
+)
 from src.qvalue_precision import qvalue_rounding_diagnostics, round_qvalue_matrix
 from src.Request import Request
 from src.mip_backend import normalize_mip_backend
@@ -62,6 +68,9 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 DEFAULT_INITIAL_BATTERY_MEAN = 0.875
 DEFAULT_INITIAL_BATTERY_HALF_WIDTH = 0.075
+AEV_CHARGING_CENTER_COUNTS = (0, 3, 4, 5)
+AEV_CHARGING_CENTER_CAPACITY = 50
+AEV_CHARGING_STATION_ID_BASE = 9_000_000
 
 
 def initial_battery_bounds(
@@ -195,6 +204,8 @@ class NYCEnvironment:
         charge_wait_bool: bool = True,
         human_ev_charge_decision_interval_minutes: float = 120.0,
         demand_scale: float = 1.0,
+        aev_charging_center_count: int = 0,
+        aev_charging_center_csv: str | None = None,
     ):
         # --- base directory of data files ---
         _base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "nyedata", "nye_simulation")
@@ -298,6 +309,17 @@ class NYCEnvironment:
         self.realized_initial_battery_mean_human_ev = 0.0
         self.realized_initial_battery_mean_aev = 0.0
         self.station_capacity_scale = max(0.0, float(1.0 if station_capacity_scale is None else station_capacity_scale))
+        self.aev_charging_center_count = int(aev_charging_center_count)
+        if self.aev_charging_center_count not in AEV_CHARGING_CENTER_COUNTS:
+            raise ValueError(
+                "aev_charging_center_count must be one of "
+                f"{AEV_CHARGING_CENTER_COUNTS}, got {self.aev_charging_center_count}"
+            )
+        self.aev_charging_center_csv = aev_charging_center_csv or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "nyedata",
+            "manhattan_aev_charging_centers.csv",
+        )
 
         # --- flags ---
         self.use_intense_requests = use_intense_requests
@@ -1279,8 +1301,24 @@ class NYCEnvironment:
                 zid = zone_ids[min(i * step, len(zone_ids) - 1)]
                 cap = max(1, int(round(4 * self.station_capacity_scale)))
                 self.charging_manager.add_station(i + 1, zid, cap)
+
+        # Preserve the complete legacy NYC/Manhattan station set as public
+        # infrastructure.  Human-driven EVs only see this set.
+        self.public_charging_station_ids = sorted(self.charging_manager.stations)
+        for station_id in self.public_charging_station_ids:
+            station = self.charging_manager.stations[station_id]
+            station.station_kind = "public"
+            station.aev_exclusive = False
+            station.site_id = None
+
+        # The workbook-derived centers are additional physical stations, but
+        # are exposed only to AEV actions.  A count of zero retains the legacy
+        # behaviour in which AEVs use the public stations.
+        self.aev_charging_station_ids = self._setup_aev_exclusive_charging_centers()
+        self.num_public_charging_stations = len(self.public_charging_station_ids)
+        self.num_aev_charging_stations = len(self.aev_charging_station_ids)
         self.station_zone_ids = np.array(
-            [self.charging_manager.stations[sid].location for sid in sorted(self.charging_manager.stations.keys())],
+            [self.charging_manager.stations[sid].location for sid in self.public_charging_station_ids],
             dtype=np.int32,
         ) if self.charging_manager.stations else np.array([], dtype=np.int32)
         self.nearest_charging_distance = np.zeros(self.distance_matrix.shape[0], dtype=np.float32)
@@ -1288,6 +1326,97 @@ class NYCEnvironment:
             self.nearest_charging_distance = np.min(self.distance_matrix[:, self.station_zone_ids], axis=1)
         self.idle_charging_num = {sid: s.max_capacity for sid, s in self.charging_manager.stations.items()}
         self.charge_stats = {sid: [] for sid in self.charging_manager.stations}
+
+    def _setup_aev_exclusive_charging_centers(self) -> list[int]:
+        """Load the selected 3/4/5-center Manhattan AEV-only scenario."""
+
+        if self.aev_charging_center_count == 0:
+            return []
+        csv_path = Path(self.aev_charging_center_csv).expanduser().resolve()
+        if not csv_path.exists():
+            raise FileNotFoundError(f"AEV charging-center CSV not found: {csv_path}")
+        centers = pd.read_csv(csv_path)
+        required = {
+            "site_id",
+            "latitude",
+            "longitude",
+            "minimum_center_count",
+        }
+        missing = required.difference(centers.columns)
+        if missing:
+            raise ValueError(
+                f"AEV charging-center CSV {csv_path} is missing columns: "
+                f"{sorted(missing)}"
+            )
+        centers = centers[
+            pd.to_numeric(centers["minimum_center_count"], errors="coerce")
+            <= self.aev_charging_center_count
+        ].copy()
+        if len(centers) != self.aev_charging_center_count:
+            raise ValueError(
+                f"AEV {self.aev_charging_center_count}-center scenario must contain "
+                f"exactly {self.aev_charging_center_count} centers; found {len(centers)}"
+            )
+
+        site_number = {"D1": 1, "M1": 2, "M2": 3, "U1": 4, "U2": 5}
+        station_ids: list[int] = []
+        for _, row in centers.iterrows():
+            site_id = str(row["site_id"]).strip().upper()
+            if site_id not in site_number:
+                raise ValueError(f"Unknown AEV charging-center site_id: {site_id!r}")
+            station_id = AEV_CHARGING_STATION_ID_BASE + site_number[site_id]
+            if station_id in self.charging_manager.stations:
+                raise ValueError(f"AEV charging station id collision: {station_id}")
+            latitude = float(row["latitude"])
+            longitude = float(row["longitude"])
+            zone_id = self.map_zone(latitude, longitude)
+            if zone_id < 0 or zone_id not in self.manhattan_zone_ids:
+                raise ValueError(
+                    f"AEV charging center {site_id} does not map to a Manhattan TLC zone"
+                )
+            self.charging_manager.add_station(
+                station_id,
+                zone_id,
+                AEV_CHARGING_CENTER_CAPACITY,
+            )
+            station = self.charging_manager.stations[station_id]
+            station.station_kind = "aev_exclusive"
+            station.aev_exclusive = True
+            station.site_id = site_id
+            station.latitude = latitude
+            station.longitude = longitude
+            station.area = str(row.get("area", ""))
+            station.address = str(row.get("address", ""))
+            station_ids.append(station_id)
+        return sorted(station_ids)
+
+    def _charging_station_ids_for_vehicle(self, vehicle_id: int) -> list[int]:
+        """Return stations visible to one vehicle without cross-fleet leakage."""
+
+        public_station_ids = list(getattr(
+            self,
+            "public_charging_station_ids",
+            sorted(self.charging_manager.stations),
+        ))
+        aev_station_ids = list(getattr(self, "aev_charging_station_ids", []))
+        if self._is_ev(vehicle_id):
+            return public_station_ids
+        if aev_station_ids:
+            return aev_station_ids
+        return public_station_ids
+
+    def _charging_station_ids_for_vehicle_record(self, vehicle: dict) -> list[int]:
+        public_station_ids = list(getattr(
+            self,
+            "public_charging_station_ids",
+            sorted(self.charging_manager.stations),
+        ))
+        aev_station_ids = list(getattr(self, "aev_charging_station_ids", []))
+        if vehicle.get("type") == 1:
+            return public_station_ids
+        if aev_station_ids:
+            return aev_station_ids
+        return public_station_ids
 
     def _nearest_zone(self, lat: float, lon: float, prefer_polygon: bool = True) -> int:
         """Return the containing zone if possible, otherwise the nearest centroid zone."""
@@ -1986,7 +2115,12 @@ class NYCEnvironment:
         ], dtype=np.float32)
         total_dists = pickup_dists + trip_dists[None, :]
 
-        if dropoff_ids.size > 0 and np.max(dropoff_ids) < self.nearest_charging_distance.shape[0]:
+        if getattr(self, "aev_charging_station_ids", []):
+            reserve = np.asarray([
+                [self._post_action_battery_reserve(req.dropoff, vehicle_id=vid) for req in requests]
+                for vid in vehicle_ids
+            ], dtype=np.float32)
+        elif dropoff_ids.size > 0 and np.max(dropoff_ids) < self.nearest_charging_distance.shape[0]:
             reserve = np.maximum(
                 self.min_battery_level,
                 self.nearest_charging_distance[dropoff_ids] * self.battery_consum + 0.01,
@@ -1994,7 +2128,8 @@ class NYCEnvironment:
         else:
             reserve = np.array([self._post_action_battery_reserve(req.dropoff) for req in requests], dtype=np.float32)
 
-        feasible = vehicle_battery[:, None] - total_dists * self.battery_consum >= reserve[None, :]
+        reserve_matrix = reserve if reserve.ndim == 2 else reserve[None, :]
+        feasible = vehicle_battery[:, None] - total_dists * self.battery_consum >= reserve_matrix
         if use_range:
             feasible &= pickup_dists <= range_radius
 
@@ -2432,7 +2567,8 @@ class NYCEnvironment:
             )
 
         reachable = []
-        for station_id, station in self.charging_manager.stations.items():
+        for station_id in self._charging_station_ids_for_vehicle_record(vehicle):
+            station = self.charging_manager.stations[station_id]
             distance = float(self.get_distance_km(location, int(station.location)))
             if distance > battery_supported_distance + 1e-9:
                 continue
@@ -2511,7 +2647,8 @@ class NYCEnvironment:
             return float(p_charge), {}
         vehicle_loc = int(vehicle.get('location', 0))
         station_utilities: Dict[int, float] = {}
-        for sid, station in self.charging_manager.stations.items():
+        for sid in self._charging_station_ids_for_vehicle(vehicle_id):
+            station = self.charging_manager.stations[sid]
             if not self._can_reach_charging_station(vehicle_id, int(sid)):
                 continue
             s_loc = int(station.location)
@@ -3083,7 +3220,7 @@ class NYCEnvironment:
                 continue
             pickup_distance = float(self.get_distance_km(vehicle_location, request.pickup))
             trip_distance = self._request_trip_distance_km(request)
-            reserve = self._post_action_battery_reserve(request.dropoff)
+            reserve = self._post_action_battery_reserve(request.dropoff, vehicle_id=vehicle_id)
             if vehicle_battery - (pickup_distance + trip_distance) * self.battery_consum < reserve:
                 continue
             candidate = self._candidate_from_request(vehicle_id, request)
@@ -3112,7 +3249,11 @@ class NYCEnvironment:
             zone_candidates = []
             for zone_id in list(self.relocation_target_ids)[:16]:
                 distance = float(self.get_distance_km(vehicle_location, int(zone_id)))
-                if distance * self.battery_consum > max(0.0, vehicle_battery - self._post_action_battery_reserve(zone_id)):
+                if distance * self.battery_consum > max(
+                    0.0,
+                    vehicle_battery
+                    - self._post_action_battery_reserve(zone_id, vehicle_id=vehicle_id),
+                ):
                     continue
                 zone_candidates.append((-distance, {
                     'action_type': 'reloc',
@@ -3609,6 +3750,10 @@ class NYCEnvironment:
 
     def _execute_movement_towards_charging_station(self, vehicle_id: int, station_id: int) -> float:
         vehicle = self.vehicles[vehicle_id]
+        if station_id not in self._charging_station_ids_for_vehicle(vehicle_id):
+            vehicle['charging_target'] = None
+            vehicle['target_location'] = None
+            return -self.charging_penalty
         station = self.charging_manager.stations[station_id]
         station_zone = station.location
 
@@ -3650,22 +3795,60 @@ class NYCEnvironment:
             return 0.0
         return self.get_distance_km(vehicle['location'], target_zone) * self.battery_consum
 
-    def _min_battery_required_to_reach_charging_from_location(self, location: int) -> float:
-        if not self.charging_manager.stations:
+    def _min_battery_required_to_reach_charging_from_location(
+        self,
+        location: int,
+        vehicle_id: int | None = None,
+    ) -> float:
+        station_ids = (
+            self._charging_station_ids_for_vehicle(vehicle_id)
+            if vehicle_id is not None
+            else self.public_charging_station_ids
+        )
+        if not station_ids:
             return 0.0
         nearest_distance = min(
-            self.get_distance_km(location, station.location)
-            for station in self.charging_manager.stations.values()
+            self.get_distance_km(location, self.charging_manager.stations[station_id].location)
+            for station_id in station_ids
         )
         return nearest_distance * self.battery_consum
 
-    def _post_action_battery_reserve(self, location: int) -> float:
+    def _post_action_battery_reserve(
+        self,
+        location: int,
+        vehicle_id: int | None = None,
+    ) -> float:
+        if (
+            vehicle_id is None
+            or self._is_ev(vehicle_id)
+            or not getattr(self, "aev_charging_station_ids", [])
+        ):
+            if 0 <= int(location) < self.nearest_charging_distance.shape[0]:
+                nearest_distance = float(self.nearest_charging_distance[int(location)])
+                return max(self.min_battery_level, nearest_distance * self.battery_consum + 0.01)
+        if vehicle_id is not None:
+            station_ids = self._charging_station_ids_for_vehicle(vehicle_id)
+            if station_ids:
+                nearest_distance = min(
+                    self.get_distance_km(
+                        location,
+                        self.charging_manager.stations[station_id].location,
+                    )
+                    for station_id in station_ids
+                )
+                return max(
+                    self.min_battery_level,
+                    nearest_distance * self.battery_consum + 0.01,
+                )
         if 0 <= int(location) < self.nearest_charging_distance.shape[0]:
             nearest_distance = float(self.nearest_charging_distance[int(location)])
             return max(self.min_battery_level, nearest_distance * self.battery_consum + 0.01)
         return max(
             self.min_battery_level,
-            self._min_battery_required_to_reach_charging_from_location(location) + 0.01,
+            self._min_battery_required_to_reach_charging_from_location(
+                location,
+                vehicle_id=vehicle_id,
+            ) + 0.01,
         )
 
     def _charge_target_for_battery(self, battery: float) -> float:
@@ -3704,7 +3887,7 @@ class NYCEnvironment:
 
     def _can_reach_charging_station(self, vehicle_id: int, station_id: int, reserve: float = 0.01) -> bool:
         station = self.charging_manager.stations.get(station_id)
-        if station is None:
+        if station is None or station_id not in self._charging_station_ids_for_vehicle(vehicle_id):
             return False
         return self._can_reach_location_with_battery(vehicle_id, station.location, reserve=reserve)
 
@@ -3724,7 +3907,10 @@ class NYCEnvironment:
         for vid, vehicle in self.vehicles.items():
             if not vehicle.get('is_online', True):
                 continue
-            if not any(self._can_reach_charging_station(vid, sid) for sid in self.charging_manager.stations):
+            if not any(
+                self._can_reach_charging_station(vid, sid)
+                for sid in self._charging_station_ids_for_vehicle(vid)
+            ):
                 count += 1
         return count
 
@@ -3750,7 +3936,11 @@ class NYCEnvironment:
         return self._movement_cost(dist)
 
     def _move_vehicle_to_charging_station(self, vehicle_id: int, station_id: int):
-        if vehicle_id in self.vehicles and station_id in self.charging_manager.stations:
+        if (
+            vehicle_id in self.vehicles
+            and station_id in self.charging_manager.stations
+            and station_id in self._charging_station_ids_for_vehicle(vehicle_id)
+        ):
             vehicle = self.vehicles[vehicle_id]
             vehicle['assigned_request'] = None
             vehicle['passenger_onboard'] = None
@@ -3907,7 +4097,10 @@ class NYCEnvironment:
             vehicle['idle_target'] = None
             if vehicle['charging_station'] is None:
                 sid = action.charging_station_id
-                if sid in self.charging_manager.stations:
+                if (
+                    sid in self.charging_manager.stations
+                    and sid in self._charging_station_ids_for_vehicle(vehicle_id)
+                ):
                     if vehicle['location'] == self.charging_manager.stations[sid].location:
                         vehicle['charging_target'] = None
                         self._clear_aev_notarrived_if_arrived(vehicle_id, sid)
@@ -5126,7 +5319,15 @@ class NYCEnvironment:
                     else:
                         result = self.gurobi_optimizer.optimize_vehicle_rebalancing_integrated(vehicles_to_rebalance)
             else:
-                charging_stations = [s for s in self.charging_manager.stations.values() if s.available_slots > 0]
+                matrix_station_ids = list(
+                    getattr(self, "_last_matrix_charge_station_ids", [])
+                )
+                charging_stations = [
+                    self.charging_manager.stations[station_id]
+                    for station_id in matrix_station_ids
+                    if station_id in self.charging_manager.stations
+                    and self.charging_manager.stations[station_id].available_slots > 0
+                ]
                 heuristic_action_matrix = vam if getattr(self, 'heuristic_use_scale', True) else None
                 if onlyev:
                     if self.adp_value > 0 and self.value_function_ev is not None:
@@ -6342,11 +6543,17 @@ class NYCEnvironment:
             self._request_trip_distance_km(request) for request in avail
         ], dtype=np.float32)
         total_dists = pickup_dists + trip_dists[None, :]
-        if dropoff_ids.size > 0 and np.max(dropoff_ids) < self.nearest_charging_distance.shape[0]:
+        if getattr(self, "aev_charging_station_ids", []):
+            reserve = np.asarray([
+                [self._post_action_battery_reserve(req.dropoff, vehicle_id=vid) for req in avail]
+                for vid in vehicle_ids
+            ], dtype=np.float32)
+        elif dropoff_ids.size > 0 and np.max(dropoff_ids) < self.nearest_charging_distance.shape[0]:
             reserve = np.maximum(self.min_battery_level, self.nearest_charging_distance[dropoff_ids] * self.battery_consum + 0.01)
         else:
             reserve = np.array([self._post_action_battery_reserve(req.dropoff) for req in avail], dtype=np.float32)
-        feasible = vehicle_battery[:, None] - total_dists * self.battery_consum >= reserve[None, :]
+        reserve_matrix = reserve if reserve.ndim == 2 else reserve[None, :]
+        feasible = vehicle_battery[:, None] - total_dists * self.battery_consum >= reserve_matrix
         if use_range:
             feasible &= pickup_dists <= range_radius
         request_top_k = getattr(self, 'request_top_k', None)
@@ -6374,11 +6581,17 @@ class NYCEnvironment:
         vehicle_battery = np.array([self.vehicles[vid]['battery'] for vid in vehicle_ids], dtype=np.float32)
         zone_ids = np.array(zones, dtype=np.int32)
         zone_dists = self.distance_matrix[vehicle_locations[:, None], zone_ids[None, :]]
-        if np.max(zone_ids) < self.nearest_charging_distance.shape[0]:
+        if getattr(self, "aev_charging_station_ids", []):
+            reserve = np.asarray([
+                [self._post_action_battery_reserve(zone_id, vehicle_id=vid) for zone_id in zones]
+                for vid in vehicle_ids
+            ], dtype=np.float32)
+        elif np.max(zone_ids) < self.nearest_charging_distance.shape[0]:
             reserve = np.maximum(self.min_battery_level, self.nearest_charging_distance[zone_ids] * self.battery_consum + 0.01)
         else:
             reserve = np.array([self._post_action_battery_reserve(zone_id) for zone_id in zones], dtype=np.float32)
-        feasible = vehicle_battery[:, None] - zone_dists * self.battery_consum >= reserve[None, :]
+        reserve_matrix = reserve if reserve.ndim == 2 else reserve[None, :]
+        feasible = vehicle_battery[:, None] - zone_dists * self.battery_consum >= reserve_matrix
         if distance_threshold is not None and distance_threshold > 0:
             feasible &= zone_dists <= float(distance_threshold)
         zone_top_k = getattr(self, 'zone_top_k', None)
@@ -6394,26 +6607,59 @@ class NYCEnvironment:
         return mat
 
     def generate_vehicle_chargerange(self, vehicle_ids):
-        stations = sorted(self.charging_manager.stations.keys())
+        station_sets = [
+            set(self._charging_station_ids_for_vehicle(int(vehicle_id)))
+            for vehicle_id in vehicle_ids
+        ]
+        stations = sorted(set().union(*station_sets)) if station_sets else []
         mat = np.zeros((len(vehicle_ids), len(stations)), dtype=np.float32)
         if not vehicle_ids or not stations:
+            self._last_expected_charge_expansion = build_charge_action_epoch_expansion(
+                vehicle_ids=vehicle_ids,
+                station_ids=stations,
+                feasibility=mat,
+                station_schedules={},
+                candidate_windows={},
+            )
+            self._last_expected_charge_expansion['current_time'] = float(
+                getattr(self, 'current_time', 0.0)
+            )
             return mat
         vehicle_locations = np.array([self.vehicles[vid]['location'] for vid in vehicle_ids], dtype=np.int32)
         vehicle_battery = np.array([self.vehicles[vid]['battery'] for vid in vehicle_ids], dtype=np.float32)
-        station_zone_ids = self.station_zone_ids
+        station_zone_ids = np.asarray(
+            [self.charging_manager.stations[sid].location for sid in stations],
+            dtype=np.int32,
+        )
         charge_dists = self.distance_matrix[vehicle_locations[:, None], station_zone_ids[None, :]]
         feasible = charge_dists * self.battery_consum <= np.maximum(0.0, vehicle_battery[:, None] - 0.01)
+        for row_index, visible_station_ids in enumerate(station_sets):
+            feasible[row_index, :] &= np.asarray(
+                [station_id in visible_station_ids for station_id in stations],
+                dtype=bool,
+            )
         charge_range_km = getattr(self, 'charge_action_range_km', None)
         if charge_range_km is not None and charge_range_km > 0:
             feasible &= charge_dists <= float(charge_range_km)
         mat[feasible] = 1.0
+
+        expected_schedules = {
+            int(station_id): self._build_expected_charging_occupancy(int(station_id))
+            for station_id in stations
+        }
+        expected_windows = {}
         for col_idx, station_id in enumerate(stations):
-            station = self.charging_manager.stations[station_id]
-            total_reserved = len(station.current_vehicles) + len(station.charging_queue_notarrived)
-            if total_reserved >= station.max_capacity:
-                for row_idx, vehicle_id in enumerate(vehicle_ids):
-                    if not self._is_ev(vehicle_id):
-                        mat[row_idx, col_idx] = 0.0
+            for row_idx, vehicle_id in enumerate(vehicle_ids):
+                if mat[row_idx, col_idx] <= 0.0:
+                    continue
+                expected = self.update_expected_charging_occupancy(
+                    int(vehicle_id),
+                    int(station_id),
+                    base_schedule=expected_schedules[int(station_id)],
+                )
+                expected_windows[(int(vehicle_id), int(station_id))] = expected
+                if not expected["feasible"]:
+                    mat[row_idx, col_idx] = 0.0
         charge_top_k = getattr(self, 'charge_top_k', None)
         if charge_top_k is not None and charge_top_k > 0 and mat.shape[1] > charge_top_k:
             for row_idx in range(mat.shape[0]):
@@ -6422,58 +6668,72 @@ class NYCEnvironment:
                     keep_local = feasible_idx[np.argpartition(charge_dists[row_idx, feasible_idx], charge_top_k - 1)[:charge_top_k]]
                     mat[row_idx, :] = 0.0
                     mat[row_idx, keep_local] = 1.0
+        self._last_expected_charge_expansion = build_charge_action_epoch_expansion(
+            vehicle_ids=vehicle_ids,
+            station_ids=stations,
+            feasibility=mat,
+            station_schedules=expected_schedules,
+            candidate_windows=expected_windows,
+        )
+        self._last_expected_charge_expansion['current_time'] = float(
+            getattr(self, 'current_time', 0.0)
+        )
         return mat
 
-    def generate_vehicle_wait(self, vehicle_ids, rebalance_num=0):
-        """Build the binary wait-feasibility column for the MCMF rows.
+    def generate_vehicle_wait(
+        self,
+        vehicle_ids,
+        rebalance_num=0,
+        charge_feasibility=None,
+    ):
+        """Gate low-SOC AEV wait actions using expected charging windows.
 
-        Human EVs retain their outside action because their charging choice is
-        handled before MCMF.  With ``charge_wait_bool`` enabled, current
-        charging capacity is reserved virtually for the lowest-SOC reachable
-        AEVs; those rows receive wait=0.  Capacity is decremented during this
-        construction so the shared MCMF graph retains a feasible full flow.
-        Disabling the interface restores the legacy all-one wait column.
+        An AEV at or below ``min_battery_level`` cannot wait when at least one
+        reachable station has a complete free arrival-to-completion window.
+        EVs, higher-SOC AEVs, and low-SOC AEVs without such a window retain
+        the wait/outside action.  ``charge_wait_bool=False`` disables the gate.
         """
         del rebalance_num
-        wait = np.ones((len(vehicle_ids), 1), dtype=np.float32)
         self._last_wait_forced_charge_station = {}
-        if not bool(getattr(self, 'charge_wait_bool', True)):
+        wait = np.ones((len(vehicle_ids), 1), dtype=np.float32)
+        if not bool(getattr(self, 'charge_wait_bool', True)) or not vehicle_ids:
             return wait
-        remaining_capacity = {
-            int(station_id): max(
-                0,
-                int(station.max_capacity)
-                - len(station.current_vehicles)
-                - len(station.charging_queue_notarrived),
+
+        if charge_feasibility is None:
+            expansion = getattr(self, '_last_expected_charge_expansion', {})
+            if tuple(expansion.get('vehicle_ids', ())) == tuple(
+                int(vehicle_id) for vehicle_id in vehicle_ids
+            ):
+                epoch_mask = np.asarray(expansion.get('action_epoch_mask', ()))
+                if epoch_mask.ndim == 3:
+                    charge_feasibility = np.any(epoch_mask > 0, axis=2)
+        if charge_feasibility is None:
+            # Standalone callers still receive the established safe outside
+            # action.  generate_whole_matrix always supplies the expected-
+            # occupancy-aware charging matrix below.
+            return wait
+
+        charge_feasibility = np.asarray(charge_feasibility)
+        if charge_feasibility.ndim != 2 or charge_feasibility.shape[0] != len(vehicle_ids):
+            raise ValueError(
+                'charge_feasibility must have one row per vehicle_id'
             )
-            for station_id, station in self.charging_manager.stations.items()
-        }
-        aev_rows = sorted(
-            (
-                (row, int(vehicle_id))
-                for row, vehicle_id in enumerate(vehicle_ids)
-                if not self._is_ev(vehicle_id)
-            ),
-            key=lambda item: (
-                float(self.vehicles[item[1]].get('battery', 0.0)),
-                item[1],
-            ),
-        )
-        for row, vehicle_id in aev_rows:
-            reachable = [
-                (distance, station_id)
-                for distance, station_id, _vacancy
-                in self._reachable_current_charging_capacity(
-                    self.vehicles[vehicle_id]
-                )
-                if remaining_capacity.get(station_id, 0) > 0
-            ]
-            if not reachable:
+        station_ids = list(getattr(self, '_last_matrix_charge_station_ids', []))
+        threshold = float(getattr(self, 'min_battery_level', 0.2))
+        for row, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.vehicles[int(vehicle_id)]
+            if self._is_ev(int(vehicle_id)):
                 continue
-            _distance, station_id = min(reachable, key=lambda item: (item[0], item[1]))
+            if float(vehicle.get('battery', 1.0)) > threshold + 1e-12:
+                continue
+            feasible_columns = np.flatnonzero(charge_feasibility[row] > 0)
+            if feasible_columns.size == 0:
+                continue
             wait[row, 0] = 0.0
-            remaining_capacity[station_id] -= 1
-            self._last_wait_forced_charge_station[vehicle_id] = station_id
+            if station_ids and int(feasible_columns[0]) < len(station_ids):
+                self._last_wait_forced_charge_station[int(vehicle_id)] = int(
+                    station_ids[int(feasible_columns[0])]
+                )
         return wait
 
     def _active_gat_neighbour_number(self) -> int:
@@ -6619,7 +6879,11 @@ class NYCEnvironment:
             )
             if np.any(no_reloc_rows):
                 zone_mat[no_reloc_rows, :] = 0.0
-        charge_station_ids = sorted(self.charging_manager.stations.keys())
+        charge_station_ids = sorted({
+            station_id
+            for vehicle_id in vehicle_ids
+            for station_id in self._charging_station_ids_for_vehicle(int(vehicle_id))
+        })
         if charge_mat.size > 0:
             keep_charge_cols = np.any(charge_mat > 0, axis=0)
             charge_mat = charge_mat[:, keep_charge_cols]
@@ -6631,7 +6895,11 @@ class NYCEnvironment:
         self._last_matrix_num_stations = charge_mat.shape[1]
         self._last_matrix_num_zones = zone_mat.shape[1]
         self._last_matrix_layout_ready = True
-        wait_mat = self.generate_vehicle_wait(vehicle_ids, rebalance_num)
+        wait_mat = self.generate_vehicle_wait(
+            vehicle_ids,
+            rebalance_num,
+            charge_feasibility=charge_mat,
+        )
         total = np.hstack([req_mat, charge_mat, zone_mat, wait_mat])
         self._cache_vehicle_action_graph_neighbours(
             vehicle_ids,
@@ -7280,16 +7548,182 @@ class NYCEnvironment:
         for sid, station in self.charging_manager.stations.items():
             ret[sid] = []
             for vid, v in self.vehicles.items():
+                if sid not in self._charging_station_ids_for_vehicle(vid):
+                    continue
                 d = self.get_distance_km(v['location'], station.location)
                 if d <= 5.0:
                     ret[sid].append(vid)
         return ret
 
+
+
+    @staticmethod
+    def _coerce_charging_vehicle_id(raw_vehicle_id, vehicles):
+        if raw_vehicle_id in vehicles:
+            return raw_vehicle_id
+        try:
+            candidate = int(raw_vehicle_id)
+        except (TypeError, ValueError):
+            return None
+        return candidate if candidate in vehicles else None
+
+    def calculate_expected_entercharge_station_time_battery(self, vehicle_id, station_id):
+        """Return deterministic arrival SOC, start time, and completion time."""
+        vehicle = self.vehicles[vehicle_id]
+        station = self.charging_manager.stations[station_id]
+        distance_km = self.get_distance_km(vehicle['location'], station.location)
+        travel_time = self.get_travel_time(vehicle['location'], station.location)
+        expected_battery_after_travel = vehicle['battery'] - (distance_km * self.battery_consum)
+        if expected_battery_after_travel < 0:
+            return None  # Not enough battery to reach the station
+        arrival_offset = epoch_offset(travel_time)
+        charging_duration = self._charge_duration_for_battery(expected_battery_after_travel)
+        arrival_time = float(getattr(self, 'current_time', 0.0)) + arrival_offset
+        completion_time = arrival_time + charging_duration
+        return {
+            'expected_battery_after_travel': float(expected_battery_after_travel),
+            'travel_time': float(travel_time),
+            'travel_epochs': int(arrival_offset),
+            'distance_km': float(distance_km),
+            'expected_entercharge_station_time': arrival_time,
+            'expected_charge_completion_time': completion_time,
+            'charging_duration': int(charging_duration),
+        }
+
+    def _build_expected_charging_occupancy(self, station_id, exclude_vehicle_id=None):
+        """Build the committed plug schedule relative to ``current_time``."""
+
+        station = self.charging_manager.stations[station_id]
+        excluded = None if exclude_vehicle_id is None else int(exclude_vehicle_id)
+        current_jobs = []
+        waiting_jobs = []
+        current_keys = set()
+
+        for raw_vehicle_id in getattr(station, 'current_vehicles', []) or []:
+            current_keys.add(str(raw_vehicle_id))
+            vehicle_id = self._coerce_charging_vehicle_id(raw_vehicle_id, self.vehicles)
+            if vehicle_id is not None and vehicle_id == excluded:
+                continue
+            vehicle = self.vehicles.get(vehicle_id, {}) if vehicle_id is not None else {}
+            duration = max(
+                1,
+                epoch_offset(vehicle.get(
+                    'charging_time_left',
+                    getattr(self, 'charge_duration', 1),
+                )),
+            )
+            current_jobs.append({
+                'vehicle_id': vehicle_id if vehicle_id is not None else raw_vehicle_id,
+                'duration': duration,
+                'source': 'charging',
+            })
+
+        for queue_index, raw_vehicle_id in enumerate(
+            getattr(station, 'charging_queue', []) or []
+        ):
+            if str(raw_vehicle_id) in current_keys:
+                continue
+            vehicle_id = self._coerce_charging_vehicle_id(raw_vehicle_id, self.vehicles)
+            if vehicle_id is not None and vehicle_id == excluded:
+                continue
+            vehicle = self.vehicles.get(vehicle_id, {}) if vehicle_id is not None else {}
+            duration = self._charge_duration_for_battery(float(
+                vehicle.get('battery', self.min_battery_level)
+            ))
+            waiting_jobs.append({
+                'vehicle_id': vehicle_id if vehicle_id is not None else raw_vehicle_id,
+                'release_offset': 0,
+                'duration': duration,
+                'priority': 0,
+                'queue_index': queue_index,
+                'source': 'station_queue',
+            })
+
+        queued_keys = {str(job['vehicle_id']) for job in waiting_jobs}
+        for reservation_index, raw_vehicle_id in enumerate(
+            getattr(station, 'charging_queue_notarrived', []) or []
+        ):
+            if str(raw_vehicle_id) in current_keys or str(raw_vehicle_id) in queued_keys:
+                continue
+            vehicle_id = self._coerce_charging_vehicle_id(raw_vehicle_id, self.vehicles)
+            if vehicle_id == excluded:
+                continue
+            if vehicle_id is None:
+                waiting_jobs.append({
+                    'vehicle_id': raw_vehicle_id,
+                    'release_offset': 0,
+                    'duration': max(1, int(getattr(self, 'charge_duration', 1))),
+                    'priority': 1,
+                    'reservation_index': reservation_index,
+                    'source': 'unknown_inbound_reservation',
+                })
+                continue
+            expected = self.calculate_expected_entercharge_station_time_battery(
+                vehicle_id, station_id
+            )
+            if expected is None:
+                continue
+            waiting_jobs.append({
+                'vehicle_id': vehicle_id,
+                'release_offset': expected['travel_epochs'],
+                'duration': expected['charging_duration'],
+                'priority': 1,
+                'reservation_index': reservation_index,
+                'source': 'inbound_reservation',
+            })
+
+        return build_expected_station_schedule(
+            capacity=int(getattr(station, 'max_capacity', 0)),
+            current_jobs=current_jobs,
+            waiting_jobs=waiting_jobs,
+        )
+
+    def update_expected_charging_occupancy(
+        self,
+        vehicle_id,
+        station_id,
+        *,
+        base_schedule=None,
+    ):
+        """Update station diagnostics and test the candidate's full window."""
+
+        expected = self.calculate_expected_entercharge_station_time_battery(
+            vehicle_id, station_id
+        )
+        schedule = base_schedule or self._build_expected_charging_occupancy(
+            station_id, exclude_vehicle_id=vehicle_id
+        )
+        feasible = bool(expected is not None and has_complete_charging_window(
+            schedule,
+            arrival_offset=expected['travel_epochs'],
+            charging_duration=expected['charging_duration'],
+        ))
+
+        station = self.charging_manager.stations[station_id]
+        station.expected_charging_occupancy = list(schedule['occupancy'])
+        station.expected_charging_intervals = [dict(item) for item in schedule['intervals']]
+        station.expected_charging_occupancy_updated_at = float(
+            getattr(self, 'current_time', 0.0)
+        )
+        result = dict(expected or {})
+        result.update({
+            'vehicle_id': int(vehicle_id),
+            'station_id': int(station_id),
+            'feasible': feasible,
+            'capacity': int(schedule['capacity']),
+            'occupancy': tuple(schedule['occupancy']),
+            'intervals': tuple(schedule['intervals']),
+        })
+        return result
+
+
+
     def findchargerange_c(self, rebalance_num=0):
         ret = {}
         for vid, v in self.vehicles.items():
             cap = 0
-            for station in self.charging_manager.stations.values():
+            for station_id in self._charging_station_ids_for_vehicle(vid):
+                station = self.charging_manager.stations[station_id]
                 d = self.get_distance_km(v['location'], station.location)
                 if d * self.battery_consum <= v['battery'] - 0.01:
                     cap += station.max_capacity - len(station.current_vehicles) - len(station.charging_queue_notarrived)
@@ -7664,11 +8098,19 @@ class NYCEnvironment:
             'avg_battery': avg_bat,
             'charge_finished': self.charge_finished,
             'charging_station_count': int(len(self.charging_manager.stations)),
+            'public_charging_station_count': int(self.num_public_charging_stations),
+            'aev_charging_center_count': int(self.aev_charging_center_count),
+            'aev_charging_station_count': int(self.num_aev_charging_stations),
+            'aev_charging_total_capacity': int(sum(
+                self.charging_manager.stations[station_id].max_capacity
+                for station_id in self.aev_charging_station_ids
+            )),
             'charging_total_capacity': int(sum(
                 int(station.max_capacity)
                 for station in self.charging_manager.stations.values()
             )),
             'charging_station_csv': str(self.station_csv),
+            'aev_charging_center_csv': str(self.aev_charging_center_csv),
             'battery_consumption_ratio': self.battery_consumption_ratio,
             'charge_duration_scale': self.charge_duration_scale,
             'demand_scale': self.demand_scale,

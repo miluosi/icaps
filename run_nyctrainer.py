@@ -31,19 +31,33 @@ from src.value_function_registry import (
     validate_value_function_registry,
 )
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
-from src.recourse.config import VARIANT_CHOICES, add_method_arguments, resolve_method_arguments
+from src.recourse.config import (
+    ICAPS_METHODS,
+    METHODS,
+    add_method_list_arguments,
+    canonical_method,
+    method_checkpoint_suffix,
+    resolve_method_list_arguments,
+)
 from src.recourse.manifest import write_experiment_manifest
+
+
+# Public argparse index.  Keep this visible in the training entrypoint so a
+# reader does not need to infer Samitha or R0--R4 from internal execution modes.
+NYC_TRAIN_METHODS = ("r0", "r1", "r2", "r3", "r4", "macro", "samitha")
+if NYC_TRAIN_METHODS != ICAPS_METHODS:
+    raise RuntimeError("NYC training method index is out of sync with ICAPS_METHODS")
 
 
 def _get_value_function_class(distribution_mode: str):
     return get_value_function_class(distribution_mode)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run NYC zone-based ADP training")
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
-    add_method_arguments(parser)
+    add_method_list_arguments(parser, method_choices=NYC_TRAIN_METHODS)
     parser.add_argument("--paper-parameter-preset", action="store_true",
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
@@ -68,6 +82,22 @@ def parse_args():
                         help="End date for training data (YYYY-MM-DD); defaults to --start-date + episodes - 1 day")
     parser.add_argument("--station-capacity-scale", type=float, default=None,
                         help="Multiply NYC charging station capacity by this factor")
+    parser.add_argument(
+        "--aev-charging-center-count",
+        type=int,
+        choices=(0, 3, 4, 5),
+        default=0,
+        help=(
+            "AEV-only Manhattan charging-center scenario. 0 keeps legacy "
+            "public-station access; 3/4/5 selects the workbook-derived centers."
+        ),
+    )
+    parser.add_argument(
+        "--aev-charging-center-csv",
+        type=str,
+        default=None,
+        help="Optional override for manhattan_aev_charging_centers.csv",
+    )
     parser.add_argument("--only-manhattan-zones", action="store_true",
                         help="Restrict NYC demand, relocation zones, and charging stations to Manhattan zones")
     parser.add_argument("--full-nyc-zones", dest="only_manhattan_zones", action="store_false",
@@ -117,9 +147,6 @@ def parse_args():
             "decisions. SOC <= 0.20 bypasses the interval for safety."
         ),
     )
-    parser.add_argument("--transportation-mode", type=str, nargs="+", default=["integrated"],
-                        choices=["integrated", "integrated_repair", "evfirst", "aevfirst"],
-                        help="One or more transportation modes")
     parser.add_argument("--use-intense-requests", action="store_true",
                         help="Compatibility flag only; NYC always uses real parquet demand")
     parser.add_argument("--no-intense-requests", dest="use_intense_requests",
@@ -300,16 +327,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--recourse-variant",
-        choices=VARIANT_CHOICES,
-        default="legacy",
-        help=(
-            "EV-first rejection/recourse experiment: r0=no rejection; "
-            "r1=no same-epoch recovery; r2=myopic recovery; r3=learned "
-            "recovery with uncoupled EV target; r4=stage-coupled target"
-        ),
-    )
-    parser.add_argument(
         "--rejection-logit-shift",
         type=float,
         default=0.0,
@@ -360,7 +377,6 @@ def parse_args():
                         help=argparse.SUPPRESS)
     parser.add_argument("--zone-pretrain-top-k", type=int, default=8,
                         help=argparse.SUPPRESS)
-    parser.add_argument("--all-modes", action="store_true", help="Run all transportation modes instead of only the specified mode")
     parser.add_argument("--all-demand-patterns", action="store_true", help="Compatibility flag only; NYC real-demand runs ignore synthetic demand-pattern sweeps")
     parser.add_argument("--benchmark-solvers-only", action="store_true",
                         help="Skip training and compare Manhattan solver wall time for MCMF vs Gurobi on identical real-demand snapshots")
@@ -370,7 +386,7 @@ def parse_args():
                         help="How many consecutive benchmark snapshots to run")
     parser.add_argument("--benchmark-log-dir", type=str, default="logs",
                         help="Directory for benchmark log files")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def apply_paper_parameter_preset(args):
@@ -685,6 +701,8 @@ def _create_nyc_environment(
     initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
     charge_wait_bool: bool = True,
     human_ev_charge_decision_interval_minutes: float = 120.0,
+    aev_charging_center_count: int = 0,
+    aev_charging_center_csv: str | None = None,
 ):
     print(f"NYCEnvironment zone filter flag: ifonlymanhatten={only_manhattan_zones}")
     env = NYCEnvironment(
@@ -734,6 +752,8 @@ def _create_nyc_environment(
         initial_battery_mean=initial_battery_mean,
         charge_wait_bool=charge_wait_bool,
         human_ev_charge_decision_interval_minutes=human_ev_charge_decision_interval_minutes,
+        aev_charging_center_count=aev_charging_center_count,
+        aev_charging_center_csv=aev_charging_center_csv,
     )
     env.configure_recourse_experiment(
         recourse_variant,
@@ -787,6 +807,8 @@ def run_nyc_solver_benchmark(
     benchmark_steps: int,
     log_dir: str,
     only_manhattan_zones: bool = False,
+    aev_charging_center_count: int = 0,
+    aev_charging_center_csv: str | None = None,
 ):
     trainer = NYCTrainer(
         create_environment=_create_nyc_environment,
@@ -835,6 +857,8 @@ def run_nyc_solver_benchmark(
         benchmark_steps=benchmark_steps,
         log_dir=log_dir,
         only_manhattan_zones=only_manhattan_zones,
+        aev_charging_center_count=aev_charging_center_count,
+        aev_charging_center_csv=aev_charging_center_csv,
     )
 
 
@@ -925,6 +949,8 @@ def run_nyc_training(
     initial_battery_mean: float = DEFAULT_INITIAL_BATTERY_MEAN,
     charge_wait_bool: bool = True,
     human_ev_charge_decision_interval_minutes: float = 120.0,
+    aev_charging_center_count: int = 0,
+    aev_charging_center_csv: str | None = None,
 ):
     """Compatibility wrapper that delegates NYC training to src.NYCtrainer.NYCTrainer."""
 
@@ -1020,26 +1046,22 @@ def run_nyc_training(
         initial_battery_mean=initial_battery_mean,
         charge_wait_bool=charge_wait_bool,
         human_ev_charge_decision_interval_minutes=human_ev_charge_decision_interval_minutes,
+        aev_charging_center_count=aev_charging_center_count,
+        aev_charging_center_csv=aev_charging_center_csv,
     )
 
 
-def main():
-    args = apply_paper_parameter_preset(parse_args())
+def main(argv=None):
+    args = apply_paper_parameter_preset(parse_args(argv))
     args.learner_variant = resolve_value_function_mode(
         args.learner_variant, args.distribution_mode
     )
     args.distribution_mode = args.learner_variant
-    args = resolve_method_arguments(args)
+    try:
+        args.methods = resolve_method_list_arguments(args.methods)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     validate_value_function_registry()
-    if args.recourse_variant != "legacy":
-        invalid_modes = [
-            mode for mode in args.transportation_mode if mode != "evfirst"
-        ]
-        if invalid_modes or args.all_modes:
-            raise ValueError(
-                f"recourse variant {args.recourse_variant} is defined only for "
-                "--transportation-mode evfirst"
-            )
     if args.useauction:
         args.usemcmf = True
     if args.station_capacity_scale is None:
@@ -1057,19 +1079,22 @@ def main():
         )
     args.end_year_month = inferred_end_year_month
     zone_distribution_mode = args.learner_variant
-    experiment_namespace = (
-        f"rec-{args.recourse_variant}_state-{args.state_variant}_"
-        f"learner-{args.learner_variant}_shift-{args.rejection_logit_shift:g}"
-    )
-    args.checkpoint_suffix = "_".join(
-        part for part in (args.checkpoint_suffix, experiment_namespace) if part
-    )
+    base_checkpoint_suffix = args.checkpoint_suffix
+    if args.aev_charging_center_count:
+        base_checkpoint_suffix = "_".join(
+            part for part in (
+                base_checkpoint_suffix,
+                f"aev-centers-{args.aev_charging_center_count}",
+            )
+            if part
+        )
     parquet_desc = args.parquet_path or f"{args.start_year_month}..{args.end_year_month}"
     demand_desc = "yellow+hvfhv_nonshared" if args.full_demand else "yellow_only"
 
     print("NYC ADP Training")
     print(f"  ADP={args.adp}, episodes={args.episodes}, vehicles={args.num_vehicles}, ev={args.num_ev}")
-    print(f"  mode={args.transportation_mode}, gurobi={args.assignment_gurobi}, mcmf={args.usemcmf}, auction={args.useauction}")
+    print(f"  methods={args.methods}")
+    print(f"  gurobi={args.assignment_gurobi}, mcmf={args.usemcmf}, auction={args.useauction}")
     if args.useauction:
         print(f"  auction_solver={'GPU' if args.auction_use_gpu else 'CPU'}, epsilon={args.auction_epsilon}, max_rounds={args.auction_max_rounds}, top_k={args.auction_top_k}")
     print(f"  parquet={parquet_desc}, hours={args.start_hour}-{args.stop_hour}")
@@ -1077,6 +1102,11 @@ def main():
     if args.full_demand and args.hvfhv_parquet_path:
         print(f"  hvfhv_parquet={args.hvfhv_parquet_path}")
     print(f"  dates={args.start_date}..{args.end_date}")
+    print(
+        "  AEV charging centers="
+        f"{args.aev_charging_center_count} "
+        "(0=legacy public stations; selected centers have capacity 50 each)"
+    )
     print(f"  distribution_mode={zone_distribution_mode}")
     if zone_distribution_mode in VALUE_FUNCTION_CHOICES:
         print(f"  gat_neighbour_number={args.gat_neighbour_number}")
@@ -1097,8 +1127,7 @@ def main():
             f"predictor_variant={args.predictor_variant}"
         )
     print(
-        f"  recourse_variant={args.recourse_variant}, "
-        f"rejection_logit_shift={args.rejection_logit_shift:g}, "
+        f"  rejection_logit_shift={args.rejection_logit_shift:g}, "
         f"common_random_numbers={args.common_random_numbers}"
     )
     print(f"  iftransformer={args.iftransformer}")
@@ -1115,73 +1144,8 @@ def main():
         print("  paper_preset=enabled")
         print("  paper_params: ev_model=Tesla Model 3 standard range, battery=51.25kWh, consumption=230Wh/mi, charge=20kW, avg_speed=11.21mph, fleet=3000 EVs")
 
-    transportation_mode_list = ["evfirst", "integrated", "aevfirst"] if args.all_modes else list(dict.fromkeys(args.transportation_mode))
-
     if args.all_demand_patterns:
         print("  note: --all-demand-patterns ignored for NYC real-demand runs")
-
-    if zone_distribution_mode == "pretrain_zonepredictor":
-        requested_modes = list(dict.fromkeys(args.transportation_mode))
-        if args.all_modes:
-            pretrain_modes = ["evfirst", "aevfirst"]
-        else:
-            pretrain_modes = [mode for mode in requested_modes if mode in {"evfirst", "aevfirst"}]
-            if not pretrain_modes:
-                pretrain_modes = ["evfirst", "aevfirst"]
-        skipped_modes = [mode for mode in requested_modes if mode not in {"evfirst", "aevfirst"}]
-        if skipped_modes:
-            print(f"  pretrain_zonepredictor skips unsupported mode(s): {skipped_modes}")
-
-        auction_mode = "torch CUDA auction" if (
-            torch.cuda.is_available() if args.auction_use_gpu is None else bool(args.auction_use_gpu and torch.cuda.is_available())
-        ) else "CPU auction"
-        print("\nNYC Zone Predictor Pretraining")
-        print(f"  modes={pretrain_modes}")
-        print(f"  rollout_solver={auction_mode}")
-        print(f"  output_dir={args.zone_pretrain_output_dir or args.pretrained_zone_dir}")
-        print("  objective=minimize KL(target zone distribution || predictor zone distribution)")
-
-        from pretrain_zone import run_zone_predictor_pretraining
-
-        pretrain_result = run_zone_predictor_pretraining(
-            argparse.Namespace(
-                transportation_modes=pretrain_modes,
-                episodes=args.episodes,
-                num_vehicles=args.num_vehicles,
-                num_ev=args.num_ev,
-                start_year_month=args.start_year_month,
-                end_year_month=args.end_year_month,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                parquet_path=args.parquet_path,
-                full_demand=args.full_demand,
-                hvfhv_parquet_path=args.hvfhv_parquet_path,
-                coord_csv=args.coord_csv,
-                station_csv=args.station_csv,
-                station_capacity_scale=args.station_capacity_scale,
-                start_hour=args.start_hour,
-                stop_hour=args.stop_hour,
-                epoch_length=args.epoch_length,
-                max_steps=args.zone_pretrain_max_steps,
-                epochs=args.zone_pretrain_epochs,
-                batch_size=args.zone_pretrain_batch_size,
-                learning_rate=args.zone_pretrain_learning_rate,
-                validation_fraction=args.zone_pretrain_validation_fraction,
-                label_smoothing=args.zone_pretrain_label_smoothing,
-                top_k=args.zone_pretrain_top_k,
-                auction_use_gpu=args.auction_use_gpu,
-                auction_epsilon=args.auction_epsilon,
-                auction_max_rounds=args.auction_max_rounds,
-                auction_top_k=args.auction_top_k,
-                random_seed=args.random_seed,
-                known_reject=args.known_reject,
-                only_manhattan_zones=args.only_manhattan_zones,
-                output_dir=args.zone_pretrain_output_dir or args.pretrained_zone_dir,
-            )
-        )
-        print(f"Zone predictor pretraining complete: {pretrain_result['manifest_path']}")
-        print("Then train Q network with: --distribution-mode bayes_simple_pretrain --pretrained-zone-dir <same output dir>")
-        return
 
     if args.benchmark_solvers_only:
         benchmark_result = run_nyc_solver_benchmark(
@@ -1225,13 +1189,29 @@ def main():
             benchmark_steps=args.benchmark_steps,
             log_dir=args.benchmark_log_dir,
             only_manhattan_zones=args.only_manhattan_zones,
+            aev_charging_center_count=args.aev_charging_center_count,
+            aev_charging_center_csv=args.aev_charging_center_csv,
         )
         print(f"Benchmark complete. Log: {benchmark_result['log_path']}")
         return
 
 
-    for mode in transportation_mode_list:
-        print(f"\n--- real_demand_run, mode={mode} ---")
+    for method in args.methods:
+        canonical_name = canonical_method(method)
+        spec = METHODS[canonical_name]
+        mode = spec.operating_mode
+        recourse_variant = spec.variant
+        checkpoint_suffix = method_checkpoint_suffix(
+            base_checkpoint_suffix,
+            method,
+            state_variant=args.state_variant,
+            learner_variant=args.learner_variant,
+            rejection_logit_shift=args.rejection_logit_shift,
+        )
+        print(
+            f"\n--- ICAPS method={method}, repair={spec.repair_policy}, "
+            f"leader_credit={spec.leader_credit} ---"
+        )
         print(f"Zone scope: {'Manhattan only' if args.only_manhattan_zones else 'full NYC CSV zones'}")
         results, env = run_nyc_training(
             adpvalue=args.adp,
@@ -1290,7 +1270,7 @@ def main():
             load_checkpoint_end_date=args.load_checkpoint_end_date,
             checkpoint_trained_start_hour=args.checkpoint_trained_start_hour,
             checkpoint_trained_stop_hour=args.checkpoint_trained_stop_hour,
-            checkpoint_suffix=args.checkpoint_suffix,
+            checkpoint_suffix=checkpoint_suffix,
             pretrained_zone_dir=args.pretrained_zone_dir,
             iftransformer=args.iftransformer,
             gat_neighbour_number=args.gat_neighbour_number,
@@ -1301,7 +1281,7 @@ def main():
             masac_target_entropy_ratio=args.masac_target_entropy_ratio,
             residual_target_policy=args.residual_target_policy,
             predictor_variant=args.predictor_variant,
-            recourse_variant=args.recourse_variant,
+            recourse_variant=recourse_variant,
             rejection_logit_shift=args.rejection_logit_shift,
             common_random_numbers=args.common_random_numbers,
             integrated_repair_hold_enabled=args.integrated_repair_hold_enabled,
@@ -1317,6 +1297,8 @@ def main():
             human_ev_charge_decision_interval_minutes=(
                 args.human_ev_charge_decision_interval_minutes
             ),
+            aev_charging_center_count=args.aev_charging_center_count,
+            aev_charging_center_csv=args.aev_charging_center_csv,
         )
 
         print(f"\nFinished: {len(results.get('episode_rewards', []))} episodes")
@@ -1342,6 +1324,13 @@ def main():
         if results.get('excel_path'):
             print(f"Stats: {results['excel_path']}")
             manifest_arguments = dict(vars(args))
+            manifest_arguments.update(
+                method=method,
+                recourse_method=canonical_name,
+                transportation_mode=mode,
+                recourse_variant=recourse_variant,
+                checkpoint_suffix=checkpoint_suffix,
+            )
             manifest_arguments["resolved_distribution_mode"] = zone_distribution_mode
             manifest_path = Path(results["excel_path"]).with_suffix(
                 ".manifest.json"
