@@ -503,8 +503,9 @@ class NYCTrainer:
         epoch_length: float,
         knownreject: bool,
         mcmf_use_gpu: bool,
+        mip_backend: str = "docplex",
         mcmf_solver: str = "exact",
-        mcmf_backend: str = "gurobi_network",
+        mcmf_backend: str = "docplex_network",
         mcmf_strict: bool = True,
         mcmf_cost_scale: int = 10_000,
         mcmf_graph_reduction: bool = True,
@@ -547,6 +548,7 @@ class NYCTrainer:
             heuristic_battery_threshold=heuristic_battery_threshold,
             use_intense_requests=use_intense_requests,
             assignmentgurobi=True,
+            mip_backend=mip_backend,
             usemcmf=True,
             mcmf_solver=mcmf_solver,
             mcmf_backend=mcmf_backend,
@@ -675,7 +677,7 @@ class NYCTrainer:
                 env.useauction = original_useauction
 
             configured_exact = str(original_solver or "legacy").lower() in {
-                "exact", "auto", "ortools", "gurobi_network", "primal_dual"
+                "exact", "auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"
             }
             mcmf_assignments = (
                 exact_mcmf_assignments if configured_exact
@@ -726,6 +728,8 @@ class NYCTrainer:
                 "qvalue_rounded_entries": exact_stats.get("qvalue_rounded_entries", 0),
                 "qvalue_rounding_max_abs": exact_stats.get("qvalue_rounding_max_abs", 0.0),
                 "exact_optimal": exact_stats.get("optimal", False),
+                "mip_backend": mip_backend,
+                "milp_time_sec": float(gurobi_time),
                 "gurobi_time_sec": float(gurobi_time),
                 "mcmf_assignments": int(len(mcmf_assignments)),
                 "legacy_mcmf_assignments": int(len(legacy_mcmf_assignments)),
@@ -741,7 +745,7 @@ class NYCTrainer:
                 f"legacy_mcmf={row['legacy_mcmf_time_sec']:.3f}s "
                 f"exact_mcmf={row['exact_mcmf_time_sec']:.3f}s "
                 f"exact_edges={row['exact_original_edges']}->{row['exact_reduced_edges']} "
-                f"gurobi={row['gurobi_time_sec']:.3f}s"
+                f"milp[{mip_backend}]={row['milp_time_sec']:.3f}s"
             )
 
         summary = {
@@ -754,6 +758,8 @@ class NYCTrainer:
             "avg_mcmf_time_sec": float(np.mean([row["mcmf_time_sec"] for row in benchmark_rows])) if benchmark_rows else 0.0,
             "avg_legacy_mcmf_time_sec": float(np.mean([row["legacy_mcmf_time_sec"] for row in benchmark_rows])) if benchmark_rows else 0.0,
             "avg_exact_mcmf_time_sec": float(np.mean([row["exact_mcmf_time_sec"] for row in benchmark_rows])) if benchmark_rows else 0.0,
+            "mip_backend": mip_backend,
+            "avg_milp_time_sec": float(np.mean([row["milp_time_sec"] for row in benchmark_rows])) if benchmark_rows else 0.0,
             "avg_gurobi_time_sec": float(np.mean([row["gurobi_time_sec"] for row in benchmark_rows])) if benchmark_rows else 0.0,
         }
         if summary["avg_exact_mcmf_time_sec"] > 0:
@@ -778,6 +784,7 @@ class NYCTrainer:
         num_episodes: int,
         use_intense_requests: bool,
         assignmentgurobi: bool,
+        mip_backend: str = "docplex",
         batch_size: int,
         checkpoint_replay: str = "recent",
         checkpoint_replay_recent: int = 5_000,
@@ -790,7 +797,7 @@ class NYCTrainer:
         knownreject: bool,
         mcmf_use_gpu: bool,
         mcmf_solver: str = "exact",
-        mcmf_backend: str = "gurobi_network",
+        mcmf_backend: str = "docplex_network",
         mcmf_strict: bool = True,
         mcmf_cost_scale: int = 10_000,
         mcmf_graph_reduction: bool = True,
@@ -890,6 +897,7 @@ class NYCTrainer:
             heuristic_battery_threshold=heuristic_battery_threshold,
             use_intense_requests=use_intense_requests,
             assignmentgurobi=assignmentgurobi,
+            mip_backend=mip_backend,
             usemcmf=usemcmf,
             mcmf_solver=mcmf_solver,
             mcmf_backend=mcmf_backend,

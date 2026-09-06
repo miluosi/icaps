@@ -144,7 +144,8 @@ def parse_args():
     parser.add_argument("--auction-max-rounds", type=int, default=None, help="Maximum auction iterations/rounds before falling back to MCMF")
     parser.add_argument("--auction-top-k", type=int, default=None, help="Keep only each vehicle's top-K feasible auction actions before solving")
     parser.add_argument("--mcmf-solver", choices=["exact", "legacy"], default="exact")
-    parser.add_argument("--mcmf-backend", choices=["auto", "ortools", "gurobi_network", "primal_dual"], default="gurobi_network")
+    parser.add_argument("--mip-backend", choices=["docplex", "gurobi"], default="docplex")
+    parser.add_argument("--mcmf-backend", choices=["auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"], default="docplex_network")
     parser.add_argument(
         "--mcmf-cost-scale",
         type=int,
@@ -722,6 +723,7 @@ def main():
                     num_episodes=args.episodes,
                     use_intense_requests=intense,
                     assignmentgurobi=strat["gurobi"],
+                    mip_backend=args.mip_backend,
                     batch_size=args.batch_size,
                     num_vehicles=args.num_vehicles,
                     num_ev=args.num_ev,

@@ -126,10 +126,13 @@ def parse_args():
                         action="store_false")
     parser.set_defaults(use_intense_requests=True)
     parser.add_argument("--assignment-gurobi", action="store_true",
-                        help="Use Gurobi assignment")
+                        help="Use optimized MILP assignment")
+    parser.add_argument("--assignment-milp", dest="assignment_gurobi", action="store_true",
+                        help="Alias for optimized MILP assignment")
     parser.add_argument("--assignment-heuristic", dest="assignment_gurobi",
                         action="store_false")
     parser.set_defaults(assignment_gurobi=True)
+    parser.add_argument("--mip-backend", choices=["docplex", "gurobi"], default="docplex")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--checkpoint-replay",
@@ -157,7 +160,7 @@ def parse_args():
                         help="Force the CPU MCMF solver even if GPU kernels are available")
     parser.set_defaults(mcmf_use_gpu=False)
     parser.add_argument("--mcmf-solver", choices=["exact", "legacy", "auction"], default="exact")
-    parser.add_argument("--mcmf-backend", choices=["auto", "ortools", "gurobi_network", "primal_dual"], default="gurobi_network")
+    parser.add_argument("--mcmf-backend", choices=["auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"], default="docplex_network")
     parser.add_argument(
         "--mcmf-cost-scale",
         type=int,
@@ -650,9 +653,10 @@ def _create_nyc_environment(
     heuristic_battery_threshold: float,
     use_intense_requests: bool,
     assignmentgurobi: bool,
+    mip_backend: str = "docplex",
     usemcmf: bool,
     mcmf_solver: str = "exact",
-    mcmf_backend: str = "gurobi_network",
+    mcmf_backend: str = "docplex_network",
     mcmf_strict: bool = True,
     mcmf_cost_scale: int = 10_000,
     mcmf_graph_reduction: bool = True,
@@ -701,6 +705,7 @@ def _create_nyc_environment(
         heuristic_battery_threshold=heuristic_battery_threshold,
         use_intense_requests=use_intense_requests,
         assignmentgurobi=assignmentgurobi,
+        mip_backend=mip_backend,
         usemcmf=usemcmf,
         mcmf_solver=mcmf_solver,
         mcmf_backend=mcmf_backend,
@@ -763,8 +768,9 @@ def run_nyc_solver_benchmark(
     epoch_length: float,
     knownreject: bool,
     mcmf_use_gpu: bool,
+    mip_backend: str = "docplex",
     mcmf_solver: str = "exact",
-    mcmf_backend: str = "gurobi_network",
+    mcmf_backend: str = "docplex_network",
     mcmf_strict: bool = True,
     mcmf_cost_scale: int = 10_000,
     mcmf_graph_reduction: bool = True,
@@ -810,6 +816,7 @@ def run_nyc_solver_benchmark(
         epoch_length=epoch_length,
         knownreject=knownreject,
         mcmf_use_gpu=mcmf_use_gpu,
+        mip_backend=mip_backend,
         mcmf_solver=mcmf_solver,
         mcmf_backend=mcmf_backend,
         mcmf_strict=mcmf_strict,
@@ -837,6 +844,7 @@ def run_nyc_training(
     num_episodes: int,
     use_intense_requests: bool,
     assignmentgurobi: bool,
+    mip_backend: str = "docplex",
     batch_size: int,
     num_vehicles: int,
     num_ev: int,
@@ -847,7 +855,7 @@ def run_nyc_training(
     knownreject: bool,
     mcmf_use_gpu: bool,
     mcmf_solver: str = "exact",
-    mcmf_backend: str = "gurobi_network",
+    mcmf_backend: str = "docplex_network",
     mcmf_strict: bool = True,
     mcmf_cost_scale: int = 10_000,
     mcmf_graph_reduction: bool = True,
@@ -931,6 +939,7 @@ def run_nyc_training(
         num_episodes=num_episodes,
         use_intense_requests=use_intense_requests,
         assignmentgurobi=assignmentgurobi,
+        mip_backend=mip_backend,
         batch_size=batch_size,
         num_vehicles=num_vehicles,
         num_ev=num_ev,
@@ -1197,6 +1206,7 @@ def main():
             epoch_length=args.epoch_length,
             knownreject=args.known_reject,
             mcmf_use_gpu=args.mcmf_use_gpu,
+            mip_backend=args.mip_backend,
             mcmf_solver=args.mcmf_solver,
             mcmf_backend=args.mcmf_backend,
             mcmf_strict=args.mcmf_strict,
@@ -1228,6 +1238,7 @@ def main():
             num_episodes=args.episodes,
             use_intense_requests=args.use_intense_requests,
             assignmentgurobi=args.assignment_gurobi,
+            mip_backend=args.mip_backend,
             batch_size=args.batch_size,
             num_vehicles=args.num_vehicles,
             num_ev=args.num_ev,

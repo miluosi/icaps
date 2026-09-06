@@ -927,6 +927,7 @@ class ADPTrainer:
         num_episodes: int,
         use_intense_requests: bool,
         assignmentgurobi: bool,
+        mip_backend: str = "docplex",
         batch_size: int = 256,
         checkpoint_replay: str = "recent",
         checkpoint_replay_recent: int = 5_000,
@@ -938,7 +939,7 @@ class ADPTrainer:
         usemcmf: bool = True,
         mcmf_use_gpu: bool = False,
         mcmf_solver: str = None,
-        mcmf_backend: str = "auto",
+        mcmf_backend: str = "docplex_network",
         mcmf_strict: bool = True,
         mcmf_cost_scale: int = 10_000,
         mcmf_graph_reduction: bool = True,
@@ -1032,7 +1033,7 @@ class ADPTrainer:
         if useauction:
             usemcmf = True
 
-        assignment_label = "AUCTION" if usemcmf and useauction else ("MCMF" if usemcmf else ("GUROBI" if assignmentgurobi else "HEURISTIC"))
+        assignment_label = "AUCTION" if usemcmf and useauction else ("MCMF" if usemcmf else (mip_backend.upper() if assignmentgurobi else "HEURISTIC"))
         self.logger.info(f"   Assignment: {assignment_label}")
         if usemcmf:
             solver_label = "auction" if useauction else (mcmf_solver or "legacy")
@@ -1133,6 +1134,7 @@ class ADPTrainer:
             heuristic_battery_threshold=heuristic_battery_threshold,
             use_intense_requests=use_intense_requests,
             assignmentgurobi=assignmentgurobi,
+            mip_backend=mip_backend,
             usemcmf=usemcmf,
             useauction=useauction,
             mcmf_solver=mcmf_solver,

@@ -35,7 +35,7 @@ def parse_args(argv=None):
     parser.add_argument("--test-seeds", nargs="+", type=int, default=list(range(300, 310)))
     parser.add_argument("--num-vehicles", type=int, default=60)
     parser.add_argument("--num-ev", type=int, default=30)
-    parser.add_argument("--mcmf-backend", choices=["primal_dual", "ortools", "gurobi_network"], default="primal_dual")
+    parser.add_argument("--mcmf-backend", choices=["docplex_network", "primal_dual", "ortools", "gurobi_network"], default="primal_dual")
     parser.add_argument("--grid-size", type=int, default=scenario.DEFAULT_GRID_SIZE)
     parser.add_argument("--simulation-period", type=int, default=scenario.DEFAULT_SIMULATION_PERIOD)
     parser.add_argument("--episode-days", type=int, default=scenario.DEFAULT_EPISODE_DAYS)

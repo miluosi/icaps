@@ -9,8 +9,7 @@ from abc import ABCMeta, abstractmethod
 from random import choice, randint
 from pandas import read_csv
 from collections import deque
-import gurobipy as gp  # type: ignore
-from gurobipy import GRB  # type: ignore
+from src.mip_backend import get_mip_api, normalize_mip_backend
 import re
 import random
 import hashlib
@@ -196,6 +195,7 @@ class Environment(metaclass=ABCMeta):
             possible_targets.append(target)
 
         # Solve an LP to assign each agent to closest possible target
+        gp, GRB, _ = get_mip_api(getattr(self, "mip_backend", "docplex"))
         model = gp.Model()
         model.setParam('OutputFlag', 0)  # Suppress output
 
@@ -455,7 +455,8 @@ class ChargingIntegratedEnvironment(Environment):
     def __init__(self, num_vehicles=5, num_stations=3, ev_num_vehicles=None, grid_size=20,heuristic_battery_threshold=0.5, 
                  use_intense_requests=True, assignmentgurobi=True, usemcmf = True, useauction=False,
                  auction_use_gpu=False, auction_epsilon=1e-3, auction_max_rounds=None,
-                 auction_top_k=None, mcmf_solver=None, mcmf_backend="auto",
+                 auction_top_k=None, mcmf_solver=None, mcmf_backend="docplex_network",
+                 mip_backend="docplex",
                  mcmf_strict=True, mcmf_cost_scale=10_000,
                  mcmf_graph_reduction=True, mcmf_verify=False,
                  mcmf_fallback_value=None, knownreject = False,
@@ -489,7 +490,8 @@ class ChargingIntegratedEnvironment(Environment):
             self.set_random_seed(random_seed)
         
         super().__init__(NUM_LOCATIONS, MAX_CAPACITY, EPOCH_LENGTH, NUM_AGENTS, START_EPOCH, STOP_EPOCH, DATA_DIR)
-        self.assignmentgurobi = assignmentgurobi  # Whether to use Gurobi for assignment
+        self.assignmentgurobi = assignmentgurobi
+        self.mip_backend = normalize_mip_backend(mip_backend)
         self.num_vehicles = num_vehicles
         self.ev_num_vehicles = ev_num_vehicles if ev_num_vehicles is not None else int(num_vehicles // 2)
         self.num_stations = num_stations

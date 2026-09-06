@@ -517,8 +517,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--station-capacity-scale", type=float, default=1.0)
     parser.add_argument(
         "--mcmf-backend",
-        choices=["gurobi_network", "primal_dual", "ortools", "auto"],
-        default="gurobi_network",
+        choices=["docplex_network", "gurobi_network", "primal_dual", "ortools", "auto"],
+        default="docplex_network",
     )
     parser.add_argument(
         "--charge-wait-bool",

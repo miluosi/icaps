@@ -54,7 +54,7 @@ def parse_args(argv=None):
     parser.add_argument('--samitha-hold-rule', choices=['learned', 'fixed'], default='learned')
     parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
     parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--mcmf-backend', choices=['primal_dual', 'ortools', 'gurobi_network'],
+    parser.add_argument('--mcmf-backend', choices=['docplex_network', 'primal_dual', 'ortools', 'gurobi_network'],
                         default='primal_dual')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--output-dir', type=Path)

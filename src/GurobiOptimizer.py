@@ -2,7 +2,6 @@ from typing import List, Dict
 from .Request import Request
 import random
 import numpy as np
-import gurobipy as gp
 import networkx as nx
 from src.ValueFunction_pytorch_bayes import PyTorchChargingValueFunction
 import time
@@ -96,31 +95,42 @@ def _get_gpu_mcmf_kernels():
 
 
 class GurobiOptimizer:
-    """Gurobi-based optimization for vehicle assignment and rebalancing"""
+    """Backend-neutral MILP optimizer; DOcplex is the default.
+
+    The historical class name is retained so existing imports and checkpoints
+    continue to work. Pass ``mip_backend='gurobi'`` to use Gurobi explicitly.
+    """
     
-    def __init__(self, env, num_threads=16):
+    def __init__(self, env, num_threads=16, mip_backend=None):
         self.env = env
         self.num_threads = num_threads  # Global thread configuration
         self.network_time_limit = float(getattr(env, 'gurobi_network_time_limit', 10.0))
         self._auction_solver_cache = {}
         self._gurobi_runtime_failed = False
-        self.mcmf_backend = getattr(env, 'mcmf_backend', 'auto')
+        self.mcmf_backend = getattr(env, 'mcmf_backend', 'docplex_network')
         self.mcmf_strict = bool(getattr(env, 'mcmf_strict', True))
         self.mcmf_cost_scale = int(getattr(env, 'mcmf_cost_scale', 10_000))
         self.mcmf_graph_reduction = bool(
             getattr(env, 'mcmf_graph_reduction', True)
         )
         self.mcmf_verify = bool(getattr(env, 'mcmf_verify', False))
-        # Only import Gurobi if it's available
+        from src.mip_backend import get_mip_api, normalize_mip_backend
+
+        self.mip_backend = normalize_mip_backend(
+            mip_backend or getattr(env, "mip_backend", "docplex")
+        )
         try:
-            import gurobipy as gp
-            from gurobipy import GRB
-            self.gp = gp
-            self.GRB = GRB
+            self.gp, self.GRB, self.mip_backend = get_mip_api(self.mip_backend)
             self.available = True
-            print(f"✓ Gurobi optimizer available (Threads: {self.num_threads})")
-        except ImportError:
-            print("⚠ Gurobi not available, using heuristic methods")
+            print(
+                f"✓ MILP optimizer available: {self.mip_backend} "
+                f"(Threads: {self.num_threads})"
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            print(
+                f"⚠ MILP backend {self.mip_backend} unavailable ({exc}); "
+                "using heuristic methods"
+            )
             self.available = False
 
     def _movement_cost(self, distance: float) -> float:
@@ -148,7 +158,7 @@ class GurobiOptimizer:
         self._gurobi_runtime_failed = True
         if first_failure:
             print(
-                f"⚠ Gurobi runtime unavailable ({error}); "
+                f"⚠ MILP backend {self.mip_backend} unavailable ({error}); "
                 "switching this environment to CPU MCMF",
                 flush=True,
             )
@@ -308,9 +318,14 @@ class GurobiOptimizer:
             return str(getattr(self.env, 'mcmf_backend', self.mcmf_backend))
         if normalized in {
             'auto', 'ortools', 'primal_dual', 'primaldual', 'python',
+            'docplex_network', 'docplex', 'cplex',
             'gurobi_network', 'exact_gurobi',
         }:
-            return 'gurobi_network' if normalized == 'exact_gurobi' else normalized
+            if normalized == 'exact_gurobi':
+                return 'gurobi_network'
+            if normalized in {'docplex', 'cplex'}:
+                return 'docplex_network'
+            return normalized
         return None
 
     @staticmethod
@@ -577,8 +592,10 @@ class GurobiOptimizer:
             problem,
             backend=requested_backend,
             verify=bool(getattr(self.env, 'mcmf_verify', self.mcmf_verify)),
-            gp=self.gp if self.available and not self._gurobi_runtime_failed else None,
-            grb=self.GRB if self.available and not self._gurobi_runtime_failed else None,
+            gp=(self.gp if self.mip_backend == 'gurobi' and self.available
+                and not self._gurobi_runtime_failed else None),
+            grb=(self.GRB if self.mip_backend == 'gurobi' and self.available
+                 and not self._gurobi_runtime_failed else None),
             num_threads=self.num_threads,
         )
         solve_time = time.perf_counter() - solve_start

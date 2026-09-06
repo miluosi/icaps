@@ -5,8 +5,7 @@ from .Environment import Environment
 
 from typing import List, Dict, Tuple, Set, Any, Optional, Callable
 
-import gurobipy as gp  # type: ignore
-from gurobipy import GRB  # type: ignore
+from .mip_backend import get_mip_api
 from random import gauss, shuffle, randint, random
 
 
@@ -25,6 +24,9 @@ class CentralAgent(object):
     def __init__(self, envt: Environment, is_epsilon_greedy: bool=False):
         super(CentralAgent, self).__init__()
         self.envt = envt
+        self.gp, self.GRB, self.mip_backend = get_mip_api(
+            getattr(envt, "mip_backend", "docplex")
+        )
         self._choose = self._epsilon_greedy if is_epsilon_greedy else self._additive_noise
 
     def choose_actions(self, agent_action_choices: List[List[Tuple[Action, float]]], is_training: bool=True, epoch_num: int=1) -> List[Tuple[Action, float]]:
@@ -54,7 +56,7 @@ class CentralAgent(object):
 
     def _choose_actions_ILP(self, agent_action_choices: List[List[Tuple[Action, float]]], get_noise: Callable[[str], float]=lambda x: 0) -> List[Tuple[Action, float]]:
         # Model as ILP
-        model = gp.Model()
+        model = self.gp.Model()
         model.setParam('OutputFlag', 0)  # Suppress output
 
         # For converting Action -> action_id and back
@@ -88,7 +90,7 @@ class CentralAgent(object):
                         requests.add(request)
 
                 # Create variable for (action_id, agent_id)
-                variable = model.addVar(vtype=GRB.BINARY, name='x{},{}'.format(action_id, agent_idx))
+                variable = model.addVar(vtype=self.GRB.BINARY, name='x{},{}'.format(action_id, agent_idx))
 
                 # Save to decision_variable data structure
                 decision_variables[action_id][agent_idx] = (variable, value)
@@ -99,7 +101,7 @@ class CentralAgent(object):
             for action_dict in decision_variables.values():
                 if agent_idx in action_dict:
                     agent_specific_variables.append(action_dict[agent_idx])
-            model.addConstr(gp.quicksum(variable for variable, _ in agent_specific_variables) == 1)
+            model.addConstr(self.gp.quicksum(variable for variable, _ in agent_specific_variables) == 1)
 
         # Create Constraint 2: Only one action per Request
         for request in requests:
@@ -107,15 +109,15 @@ class CentralAgent(object):
             for action_id in decision_variables:
                 if (request in id_to_action[action_id].requests):
                     relevent_action_dicts.append(decision_variables[action_id])
-            model.addConstr(gp.quicksum(variable for action_dict in relevent_action_dicts for variable, _ in action_dict.values()) <= 1)
+            model.addConstr(self.gp.quicksum(variable for action_dict in relevent_action_dicts for variable, _ in action_dict.values()) <= 1)
 
         # Create Objective
-        score = gp.quicksum((value + get_noise(variable.VarName)) * variable for action_dict in decision_variables.values() for (variable, value) in action_dict.values())
-        model.setObjective(score, GRB.MAXIMIZE)
+        score = self.gp.quicksum((value + get_noise(variable.VarName)) * variable for action_dict in decision_variables.values() for (variable, value) in action_dict.values())
+        model.setObjective(score, self.GRB.MAXIMIZE)
 
         # Solve ILP
         model.optimize()
-        assert model.status == GRB.OPTIMAL  # making sure that the model doesn't fail
+        assert model.status == self.GRB.OPTIMAL  # making sure that the model doesn't fail
 
         # Get vehicle specific actions from ILP solution
         assigned_actions: Dict[int, int] = {}

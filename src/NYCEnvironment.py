@@ -36,6 +36,7 @@ from src.charging_metrics import charging_session_metrics
 from src.charging_wait_metrics import positive_wait_metrics
 from src.qvalue_precision import qvalue_rounding_diagnostics, round_qvalue_matrix
 from src.Request import Request
+from src.mip_backend import normalize_mip_backend
 from src.recourse.coordinator import RecourseCoordinator
 from src.recourse.lifecycle import RequestLifecycleTracker
 from src.recourse.state_snapshot import StateSnapshotBuilder
@@ -154,6 +155,7 @@ class NYCEnvironment:
         heuristic_battery_threshold: float = 0.5,
         use_intense_requests: bool = True,
         assignmentgurobi: bool = True,
+        mip_backend: str = "docplex",
         usemcmf: bool = True,
         useauction: bool = False,
         auction_use_gpu: bool = False,
@@ -161,7 +163,7 @@ class NYCEnvironment:
         auction_max_rounds: int | None = None,
         auction_top_k: int | None = None,
         mcmf_solver: str | None = "exact",
-        mcmf_backend: str = "gurobi_network",
+        mcmf_backend: str = "docplex_network",
         mcmf_strict: bool = True,
         mcmf_cost_scale: int = 10_000,
         mcmf_graph_reduction: bool = True,
@@ -301,6 +303,7 @@ class NYCEnvironment:
         self.use_intense_requests = use_intense_requests
         self.multi_gpu_devices = multi_gpu_devices
         self.assignmentgurobi = assignmentgurobi
+        self.mip_backend = normalize_mip_backend(mip_backend)
         self.usemcmf = usemcmf
         self.useauction = bool(useauction or self.ifsolveauctioncuda)
         self.mcmf_solver = "auction" if self.useauction else mcmf_solver

@@ -55,9 +55,11 @@ def parse_args():
     parser.add_argument("--use-intense-requests", action="store_true", help="Use intense request pattern")
     parser.add_argument("--no-intense-requests", dest="use_intense_requests", action="store_false", help="Disable intense request pattern")
     parser.set_defaults(use_intense_requests=True)
-    parser.add_argument("--assignment-gurobi", action="store_true", help="Use Gurobi assignment")
+    parser.add_argument("--assignment-gurobi", action="store_true", help="Use optimized MILP assignment")
+    parser.add_argument("--assignment-milp", dest="assignment_gurobi", action="store_true", help="Alias for optimized MILP assignment")
     parser.add_argument("--assignment-heuristic", dest="assignment_gurobi", action="store_false", help="Use heuristic assignment")
     parser.set_defaults(assignment_gurobi=True)
+    parser.add_argument("--mip-backend", choices=["docplex", "gurobi"], default="docplex")
     parser.add_argument("--batch-size", type=int, default=256, help="Training batch size")
     parser.add_argument(
         "--checkpoint-replay",
@@ -94,8 +96,8 @@ def parse_args():
         help="MCMF implementation; exact is globally optimal on the configured Q-value grid",
     )
     parser.add_argument(
-        "--mcmf-backend", choices=["auto", "ortools", "gurobi_network", "primal_dual"],
-        default="gurobi_network", help="Exact MCMF backend (auto tries only exact backends)",
+        "--mcmf-backend", choices=["auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"],
+        default="docplex_network", help="Exact MCMF backend (auto tries only exact backends)",
     )
     parser.add_argument(
         "--mcmf-cost-scale",
@@ -279,6 +281,7 @@ def main():
                 num_episodes=args.episodes,
                 use_intense_requests=demand_pattern,
                 assignmentgurobi=args.assignment_gurobi,
+                mip_backend=args.mip_backend,
                 batch_size=args.batch_size,
                 checkpoint_replay=args.checkpoint_replay,
                 checkpoint_replay_recent=args.checkpoint_replay_recent,

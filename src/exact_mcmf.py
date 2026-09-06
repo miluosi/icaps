@@ -929,6 +929,67 @@ def solve_gurobi_network(
     )
 
 
+def solve_docplex_network(
+    problem: ReducedMCMFProblem,
+    *,
+    num_threads: int = 1,
+) -> ExactMCMFResult:
+    """Solve the reduced network LP with IBM DOcplex/CPLEX."""
+
+    from docplex.mp.model import Model
+
+    model = Model(name="exact_reduced_mcmf_docplex")
+    model.context.solver.log_output = False
+    try:
+        model.parameters.threads = max(1, int(num_threads))
+        model.parameters.simplex.tolerances.feasibility = 1e-9
+        model.parameters.simplex.tolerances.optimality = 1e-9
+    except Exception:
+        pass
+    variables = [
+        model.continuous_var(lb=0.0, ub=float(capacity), name=f"arc_{index}")
+        for index, capacity in enumerate(problem.capacities)
+    ]
+    model.minimize(model.sum(
+        float(cost) * variables[index]
+        for index, cost in enumerate(problem.costs)
+    ))
+    outgoing: list[list[int]] = [[] for _ in range(problem.num_nodes)]
+    incoming: list[list[int]] = [[] for _ in range(problem.num_nodes)]
+    for index, (tail, head) in enumerate(zip(problem.tails, problem.heads)):
+        outgoing[int(tail)].append(index)
+        incoming[int(head)].append(index)
+    for node in range(problem.num_nodes):
+        supply = problem.target_flow if node == problem.source else (-problem.target_flow if node == problem.sink else 0)
+        model.add_constraint(
+            model.sum(variables[index] for index in outgoing[node])
+            - model.sum(variables[index] for index in incoming[node]) == supply,
+            ctname=f"flow_{node}",
+        )
+    solution = model.solve(log_output=False)
+    status = str(model.solve_details.status).lower()
+    if solution is None or "optimal" not in status:
+        raise RuntimeError(
+            "DOcplex exact network did not return a proven optimum: "
+            f"status={model.solve_details.status}"
+        )
+    arc_flows = [int(round(solution.get_value(variable))) for variable in variables]
+    action_by_vehicle, integer_min_cost = _decode_arc_flows(problem, arc_flows)
+    objective_int = problem.baseline_sum - integer_min_cost
+    _verify_assignment(problem, action_by_vehicle, objective_int)
+    decoded_q = _assignment_objective_raw(problem, action_by_vehicle)
+    objective_q = objective_int / float(problem.cost_scale)
+    tolerance = 1e-12 * max(1.0, abs(decoded_q), abs(objective_q))
+    if not math.isclose(decoded_q, objective_q, rel_tol=0.0, abs_tol=tolerance):
+        raise AssertionError(
+            f"rounded Q objective mismatch: decoded={decoded_q}, scaled={objective_q}"
+        )
+    return _make_result(
+        problem, action_by_vehicle, objective_int, problem.target_flow,
+        "docplex_network", objective_mode="rounded_q",
+    )
+
+
 def _make_result(
     problem: ReducedMCMFProblem,
     action_by_vehicle: dict[int, int],
@@ -976,6 +1037,9 @@ def solve_exact(
         "exact": "auto",
         "primaldual": "primal_dual",
         "python": "primal_dual",
+        "docplex": "docplex_network",
+        "cplex": "docplex_network",
+        "ibm_cplex": "docplex_network",
         "gurobi": "gurobi_network",
     }
     normalized = aliases.get(normalized, normalized)
@@ -983,9 +1047,15 @@ def solve_exact(
         return solve_primal_dual(problem, verify=verify)
     if normalized == "ortools":
         return solve_ortools(problem)
+    if normalized == "docplex_network":
+        return solve_docplex_network(problem, num_threads=num_threads)
     if normalized == "gurobi_network":
         if gp is None or grb is None:
-            raise RuntimeError("Gurobi exact backend requested but Gurobi is unavailable")
+            try:
+                import gurobipy as gp
+                from gurobipy import GRB as grb
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise RuntimeError("Gurobi exact backend requested but Gurobi is unavailable") from exc
         return solve_gurobi_network(
             problem, gp=gp, grb=grb, num_threads=num_threads
         )
@@ -993,8 +1063,13 @@ def solve_exact(
         raise ValueError(f"unknown exact MCMF backend: {backend}")
 
     errors: list[str] = []
-    # Prefer Gurobi when it is available.  Every backend optimizes the same
+    # DOcplex/CPLEX is the project default.  Every backend optimizes the same
     # precision-controlled integer Q grid.
+    try:
+        result = solve_docplex_network(problem, num_threads=num_threads)
+        return replace(result, solver_fallback_used=bool(errors))
+    except Exception as exc:
+        errors.append(f"docplex_network={exc}")
     if gp is not None and grb is not None:
         try:
             result = solve_gurobi_network(
