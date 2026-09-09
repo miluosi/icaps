@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-hour", type=float, default=0.0)
     parser.add_argument("--stop-hour", type=float, default=24.0)
     parser.add_argument("--epoch-length", type=float, default=120.0)
-    parser.add_argument("--mcmf-backend", default="primal_dual")
+    parser.add_argument("--mcmf-backend", default="ortools")
     parser.add_argument(
         "--human-ev-charge-decision-interval-minutes",
         type=float,

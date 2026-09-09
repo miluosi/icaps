@@ -135,7 +135,7 @@ def build_stage_graph(
     graph = StateSnapshotBuilder.feasible_graph_from_matrix(
         env, vehicle_ids, np.asarray(matrix), np.asarray(structured), np.asarray(structured),
         num_requests=nr, num_stations=ns, num_zones=nz, stage_id=stage,
-        solver_backend=str(getattr(env, 'mcmf_backend', 'primal_dual')), state=state)
+        solver_backend=str(getattr(env, 'mcmf_backend', "ortools")), state=state)
     counters = getattr(env, '_integrated_repair_metrics', {})
     if stage == 0:
         counters['integrated_stage0_graph_count'] = (
@@ -167,7 +167,7 @@ def build_stage_graph(
     else:
         graph = replace(graph, edges=tuple(replace(e, collection_score=e.structured_score) for e in graph.edges))
     if (
-        str(getattr(env, 'mcmf_backend', 'primal_dual')) == 'gurobi_network'
+        str(getattr(env, 'mcmf_backend', "ortools")) == 'gurobi_network'
         and not hasattr(env, 'gurobi_optimizer')
     ):
         from src.GurobiOptimizer import GurobiOptimizer

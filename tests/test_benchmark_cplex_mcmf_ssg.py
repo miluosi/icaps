@@ -16,6 +16,8 @@ from benchmark_cplex_mcmf_ssg import (
     resolve_case_specs,
     save_case_input,
     load_case_input,
+    OutputDirectoryError,
+    prepare_output_directory,
 )
 
 
@@ -241,3 +243,42 @@ def test_failure_keeps_completed_cases_and_can_resume(tmp_path, monkeypatch):
 def test_invalid_experiment_settings_fail_before_running(argv):
     with pytest.raises(SystemExit):
         parse_args(argv)
+
+
+def test_precreated_empty_directory_runs_and_existing_results_are_preserved(tmp_path):
+    output = tmp_path / "server_run"
+    output.mkdir()
+    argv = ["--scales", "8:24:4:3", "--seeds", "91", "--methods", "mcmf", "ssg_mcmf",
+            "--output-dir", str(output)]
+    _, rows = run_benchmark(parse_args(argv))
+    assert len(rows) == 2 and all(row["objective_match"] for row in rows)
+    before = {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    with pytest.raises(OutputDirectoryError, match="--resume"):
+        run_benchmark(parse_args(argv))
+    after = {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    assert after == before
+
+
+@pytest.mark.parametrize("kind", ["unrelated_directory", "regular_file"])
+def test_output_path_conflict_preserves_unrelated_files(tmp_path, kind):
+    output = tmp_path / "server_run"
+    if kind == "unrelated_directory":
+        output.mkdir()
+        sentinel = output / "notes.txt"
+    else:
+        sentinel = output
+    sentinel.write_text("keep this data")
+    with pytest.raises(OutputDirectoryError, match="new timestamped directory"):
+        prepare_output_directory(output, resume=False)
+    assert sentinel.read_text() == "keep this data"
+
+
+@pytest.mark.parametrize("precreate", [False, True])
+def test_resume_without_metadata_explains_problem_and_writes_nothing(tmp_path, precreate):
+    output = tmp_path / "missing_run"
+    if precreate:
+        output.mkdir()
+    with pytest.raises(OutputDirectoryError, match="metadata.json is missing"):
+        prepare_output_directory(output, resume=True)
+    assert output.exists() == precreate
+    assert not output.exists() or list(output.iterdir()) == []

@@ -101,13 +101,13 @@ class GurobiOptimizer:
     continue to work. Pass ``mip_backend='gurobi'`` to use Gurobi explicitly.
     """
     
-    def __init__(self, env, num_threads=16, mip_backend=None):
+    def __init__(self, env, num_threads=1, mip_backend=None):
         self.env = env
         self.num_threads = num_threads  # Global thread configuration
         self.network_time_limit = float(getattr(env, 'gurobi_network_time_limit', 10.0))
         self._auction_solver_cache = {}
         self._gurobi_runtime_failed = False
-        self.mcmf_backend = getattr(env, 'mcmf_backend', 'docplex_network')
+        self.mcmf_backend = getattr(env, 'mcmf_backend', "ortools")
         self.mcmf_strict = bool(getattr(env, 'mcmf_strict', True))
         self.mcmf_cost_scale = int(getattr(env, 'mcmf_cost_scale', 10_000))
         self.mcmf_graph_reduction = bool(

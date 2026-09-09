@@ -38,6 +38,24 @@ python benchmark_cplex_mcmf_ssg.py \
 
 脚本在导入 NumPy 前设置单线程环境变量，并通过 threadpoolctl 限制已加载的 BLAS 线程池。CPLEX 固定为一个线程；各方法串行运行。不要同时启动多个计时进程。
 
+### Anaconda 的 NumPy 二进制兼容错误
+
+若日志出现 `A module that was compiled using NumPy 1.x cannot be run in NumPy 2...` 或 `_ARRAY_API not found`，并指向 `pyarrow`、`numexpr`、`bottleneck`，这是 NumPy 与旧扩展的二进制接口不兼容。DOcplex 导入 pandas 时会间接尝试加载这些可选扩展；异常可能被捕获，因此出现 traceback 后程序仍可能继续求解，不能仅凭这段提示断言进程已终止或最优目标错误。参见 [NumPy 官方说明](https://numpy.org/doc/stable/user/troubleshooting-importerror.html#downstream-importerror-attributeerror-or-c-api-abi-incompatibility)。
+
+依赖文件对 Python 3.11/3.12 使用 NumPy 1.26 系列。若服务器现有环境已经有可运行的 CPLEX 和 OR-Tools，可以新建共享现有求解库、仅覆盖 NumPy 的环境，保留训练环境和 CPLEX 安装：
+
+```bash
+# 在项目目录，用服务器当前运行该脚本的 Python 创建环境。
+python -m venv --system-site-packages .venv-benchmark-np1
+.venv-benchmark-np1/bin/python -m pip install "numpy==1.26.4"
+
+# 先验证一档小规模，确认依赖加载和四个求解入口正常。
+.venv-benchmark-np1/bin/python benchmark_cplex_mcmf_ssg.py \
+  --scenarios adp_control --vehicle-counts 100 --repeats 1
+```
+
+此恢复命令适用于日志中的 Python 3.11，不用于 Python 3.13。在旧计时进程结束后，用新环境启动正式测试，省略 `--output-dir` 会生成新目录。换过 NumPy 的结果不要用 `--resume` 拼接到旧实验；运行环境版本检查也会拒绝该操作。旧记录保留不动，求解算法与 scale 无需因此修改。
+
 只运行两种有利结构，仍保留从小到大的规模：
 
 ```bash
@@ -79,6 +97,8 @@ python benchmark_cplex_mcmf_ssg.py \
 `load_case_input(path)` 可还原完整 `AssignmentCase`；默认保存全部输入。可显式用 `--no-save-inputs` 节省存储，但此时只有配置、种子与结果，没有矩阵档案。
 
 中断后使用同一命令附加 `--resume`。它核对实验设置、求解相关源代码、运行环境与已完成输入的哈希，跳过完成的输入，对不完整输入整组重跑。设置或代码不同应使用新输出目录。未完成结果不会进入正式汇总；失败原因保存在 metadata，默认遇到最优目标不一致就停止并保留诊断。
+
+不指定 `--output-dir` 时自动生成带时间戳的新目录。显式指定的目录可以是尚不存在的目录或预先创建的空目录；已有文件的目录不会覆盖。若遇到输出路径已存在的提示：续跑中断实验需保留原脚本与参数并加 `--resume`；重新开始则省略 `--output-dir` 或换一个新路径。没有 `metadata.json` 的目录无法续跑。此目录处理修正会改变脚本 SHA256，旧实验应继续使用原版本续跑，新版用于新的实验目录。
 
 若将来启用 `--allow-objective-mismatch`，不一致的诊断仍会保存，notebook 默认拒绝将其作成有效比较图。
 

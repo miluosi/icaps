@@ -40,17 +40,18 @@ def test_hold_boolean_flag_can_be_disabled_and_target_policy_is_explicit():
     assert args.target_solver_policy == 'same_as_rollout_exact'
 
 
-def test_target_projection_consumes_serialized_solver_configuration():
+@pytest.mark.parametrize("backend", ["ortools", "primal_dual"])
+def test_target_projection_consumes_serialized_solver_configuration(backend):
     graph = replace(
         _graph('solver-config', stage=1, vehicle_id=0, vehicle_type=1),
-        solver_backend='primal_dual',
+        solver_backend=backend,
         graph_reduction=False, solver_verify=False,
         target_solver_policy='same_as_rollout_exact', objective_cost_scale=1234,
     )
     builder = RecourseTargetBuilder()
     builder.project(graph)
     diagnostics = builder.last_solver_diagnostics
-    assert diagnostics['backend'] == diagnostics['rollout_backend'] == 'primal_dual'
+    assert diagnostics['backend'] == diagnostics['rollout_backend'] == backend
     assert diagnostics['graph_reduction'] is False
     assert diagnostics['verify'] is False
     assert diagnostics['cost_scale'] == 1234

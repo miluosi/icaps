@@ -59,7 +59,7 @@ def parse_args(argv=None):
     parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
     parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--mcmf-backend', choices=['docplex_network', 'primal_dual', 'ortools', 'gurobi_network'],
-                        default='primal_dual')
+                        default="ortools")
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--smoke-steps', type=int)
     parser.add_argument('--event-contract-mode', choices=['required', 'record', 'off'], default='record')
@@ -274,7 +274,7 @@ def aggregate(args, clusters):
             samitha_hold_rule=getattr(args, 'samitha_hold_rule', 'learned'),
             samitha_fixed_hold_fraction=getattr(args, 'samitha_fixed_hold_fraction', 0.0),
             graph_reduction=getattr(args, 'graph_reduction', True),
-            mcmf_backend=getattr(args, 'mcmf_backend', 'primal_dual'),
+            mcmf_backend=getattr(args, 'mcmf_backend', "ortools"),
         ),
         paired_differences=paired_differences,
         repeated_training_hashes={

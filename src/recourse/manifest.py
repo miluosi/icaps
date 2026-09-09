@@ -89,7 +89,7 @@ def write_experiment_manifest(
         "objective_policy": OBJECTIVE_POLICY,
         "solver_config": _json_safe({
             "rollout_solver": arguments.get("mcmf_solver", "exact"),
-            "backend": arguments.get("mcmf_backend", "primal_dual"),
+            "backend": arguments.get("mcmf_backend", "ortools"),
             "graph_reduction": arguments.get("mcmf_graph_reduction", True),
             "verify": arguments.get("mcmf_verify", True),
             "cost_scale": arguments.get("mcmf_cost_scale", 10_000),

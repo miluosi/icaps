@@ -243,7 +243,7 @@ def run_episode(args, seed, split, directory, model_states=None):
     settings = environment_args(['--environment', 'nyc', '--num-vehicles', str(args.num_vehicles),
         '--num-ev', str(args.num_ev), '--parquet-path', str(args.parquet_path), '--station-csv', str(args.station_csv),
         '--date', args.date, '--start-hour', str(args.start_hour), '--stop-hour', str(args.stop_hour),
-        '--epoch-length', str(args.epoch_length), '--mcmf-backend', 'primal_dual'])
+        '--epoch-length', str(args.epoch_length), '--mcmf-backend', 'ortools'])
     trace_hash = hashlib.sha256()
     calls, reward = 0, 0.0
     with (directory / 'run.log').open('w') as log, redirect_stdout(log), redirect_stderr(log):

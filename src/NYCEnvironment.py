@@ -172,7 +172,7 @@ class NYCEnvironment:
         auction_max_rounds: int | None = None,
         auction_top_k: int | None = None,
         mcmf_solver: str | None = "exact",
-        mcmf_backend: str = "docplex_network",
+        mcmf_backend: str = "ortools",
         mcmf_strict: bool = True,
         mcmf_cost_scale: int = 10_000,
         mcmf_graph_reduction: bool = True,
@@ -5360,7 +5360,7 @@ class NYCEnvironment:
                 num_zones=int(nz),
                 stage_id=int(getattr(self, "_active_recourse_stage", 0) or 0),
                 solver_backend=(
-                    str(getattr(self, 'mcmf_backend', 'primal_dual'))
+                    str(getattr(self, 'mcmf_backend', "ortools"))
                     if solver_name == 'mcmf' else solver_name
                 ),
                 state=stage_state,
@@ -5857,7 +5857,7 @@ class NYCEnvironment:
             return None
         solver_backend = (
             "auction" if getattr(self, "useauction", False)
-            else str(getattr(self, "mcmf_backend", "primal_dual"))
+            else str(getattr(self, "mcmf_backend", "ortools"))
             if getattr(self, "usemcmf", False)
             else ("gurobi_network" if self.assignmentgurobi else "heuristic")
         )

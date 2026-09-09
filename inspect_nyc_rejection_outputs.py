@@ -132,7 +132,7 @@ def main():
     settings = environment_args(['--environment', 'nyc', '--num-vehicles', str(cfg['num_vehicles']),
         '--num-ev', str(cfg['num_ev']), '--parquet-path', cfg['parquet_path'], '--station-csv', cfg['station_csv'],
         '--date', cfg['date'], '--start-hour', str(cfg['start_hour']), '--stop-hour', str(cfg['stop_hour']),
-        '--epoch-length', str(cfg['epoch_length']), '--mcmf-backend', 'primal_dual'])
+        '--epoch-length', str(cfg['epoch_length']), '--mcmf-backend', 'ortools'])
     with (run / 'parameter_environment.log').open('w') as stream, redirect_stdout(stream), redirect_stderr(stream):
         env = make_environment(settings, cfg['train_seeds'][0])
     names = ['ride_acceptance_asc', 'ride_acceptance_beta_idle_min', 'ride_acceptance_beta_pickup_min',

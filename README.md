@@ -146,10 +146,13 @@ python -m pip install -r requirements.txt
 
 The current modules import `gurobipy` even when heuristic assignment is selected. A valid Gurobi licence is required only for ILP or the Gurobi network-flow backend. Without a licence, use heuristic assignment with `--no-mcmf`, or select the `primal_dual` MCMF backend.
 
-For the optional single-threaded OR-Tools MCMF backend, install
-`python -m pip install -r requirements-mcmf.txt`. Use
-`--mcmf-solver exact --mcmf-backend ortools --mcmf-use-cpu` for training;
-exact SSG graph reduction stays enabled. The runtime comparison script
+Training, evaluation and recourse assignment default to single-threaded OR-Tools
+MCMF with exact SSG and Q-value scale 10000. Install
+`python -m pip install -r requirements-mcmf.txt` in an existing environment.
+The paper parameter preset preserves an explicit `--mcmf-backend` choice;
+its default is also `ortools`. Training targets follow the rollout backend by
+default. Explicit CPLEX, primal-dual and other comparison backends remain available.
+The runtime comparison script
 `python benchmark_cplex_mcmf_ssg.py` defaults to OR-Tools, warm solvers,
 one CPLEX thread, and **ten paired seeds per scale and scenario**. It runs
 an ADP control, a relocation-rich scenario, and a high-AEV joint-growth

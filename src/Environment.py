@@ -461,7 +461,7 @@ class ChargingIntegratedEnvironment(Environment):
     def __init__(self, num_vehicles=5, num_stations=3, ev_num_vehicles=None, grid_size=20,heuristic_battery_threshold=0.5, 
                  use_intense_requests=True, assignmentgurobi=True, usemcmf = True, useauction=False,
                  auction_use_gpu=False, auction_epsilon=1e-3, auction_max_rounds=None,
-                 auction_top_k=None, mcmf_solver=None, mcmf_backend="docplex_network",
+                 auction_top_k=None, mcmf_solver="exact", mcmf_backend="ortools",
                  mip_backend="docplex",
                  mcmf_strict=True, mcmf_cost_scale=10_000,
                  mcmf_graph_reduction=True, mcmf_verify=False,
@@ -2479,7 +2479,7 @@ class ChargingIntegratedEnvironment(Environment):
             return self.recourse_coordinator.pending
         solver_backend = (
             "auction" if getattr(self, "useauction", False)
-            else str(getattr(self, "mcmf_backend", "primal_dual"))
+            else str(getattr(self, "mcmf_backend", "ortools"))
             if getattr(self, "usemcmf", False)
             else ("gurobi_network" if self.assignmentgurobi else "heuristic")
         )

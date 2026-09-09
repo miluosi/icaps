@@ -87,7 +87,7 @@ def parse_args(argv=None):
     parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
     parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--mcmf-backend', choices=['docplex_network', 'primal_dual', 'ortools', 'gurobi_network'],
-                        default='primal_dual')
+                        default="ortools")
     parser.add_argument('--checkpoint-replay', choices=['none', 'recent', 'full'], default='none')
     parser.add_argument('--checkpoint-replay-recent', type=int, default=5000)
     parser.add_argument('--date', default='2025-12-18')
@@ -167,7 +167,7 @@ def build_env(args, seed, method, *, training):
     # assignment oracle. Solver audits vary these axes in a separate runner.
     env.mcmf_solver = 'exact'
     env.useauction = False
-    env.mcmf_backend = str(getattr(args, 'mcmf_backend', 'primal_dual'))
+    env.mcmf_backend = str(getattr(args, 'mcmf_backend', "ortools"))
     env.mcmf_graph_reduction = bool(getattr(args, 'graph_reduction', True))
     env.mcmf_verify = True
     env.mcmf_cost_scale = 10_000
@@ -461,7 +461,7 @@ def main():
                         learner_variant=env.learner_variant,
                         solver_config=dict(
                             rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
-                            backend=getattr(env, 'mcmf_backend', 'primal_dual'),
+                            backend=getattr(env, 'mcmf_backend', "ortools"),
                             graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
                             verify=getattr(env, 'mcmf_verify', True),
                             strict=getattr(env, 'mcmf_strict', True),

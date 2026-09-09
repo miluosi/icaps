@@ -1133,7 +1133,7 @@ def _make_result(
 def solve_exact(
     problem: ReducedMCMFProblem,
     *,
-    backend: str = "auto",
+    backend: str = "ortools",
     verify: bool = False,
     gp=None,
     grb=None,
@@ -1172,8 +1172,13 @@ def solve_exact(
         raise ValueError(f"unknown exact MCMF backend: {backend}")
 
     errors: list[str] = []
-    # DOcplex/CPLEX is the project default.  Every backend optimizes the same
-    # precision-controlled integer Q grid.
+    # Explicit auto mode prefers the same OR-Tools backend as the default.
+    # Every backend optimizes the same precision-controlled integer Q grid.
+    try:
+        result = solve_ortools(problem)
+        return replace(result, solver_fallback_used=bool(errors))
+    except Exception as exc:
+        errors.append(f"ortools={exc}")
     try:
         result = solve_docplex_network(problem, num_threads=num_threads)
         return replace(result, solver_fallback_used=bool(errors))
@@ -1187,10 +1192,5 @@ def solve_exact(
             return replace(result, solver_fallback_used=bool(errors))
         except Exception as exc:  # license/runtime errors still permit exact Python
             errors.append(f"gurobi_network={exc}")
-    try:
-        result = solve_ortools(problem)
-        return replace(result, solver_fallback_used=bool(errors))
-    except Exception as exc:
-        errors.append(f"ortools={exc}")
     result = solve_primal_dual(problem, verify=verify)
     return replace(result, solver_fallback_used=bool(errors))

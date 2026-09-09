@@ -187,7 +187,7 @@ def parse_args(argv=None):
                         help="Force the CPU MCMF solver even if GPU kernels are available")
     parser.set_defaults(mcmf_use_gpu=False)
     parser.add_argument("--mcmf-solver", choices=["exact", "legacy", "auction"], default="exact")
-    parser.add_argument("--mcmf-backend", choices=["auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"], default="docplex_network")
+    parser.add_argument("--mcmf-backend", choices=["auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"], default="ortools")
     parser.add_argument(
         "--mcmf-cost-scale",
         type=int,
@@ -405,7 +405,7 @@ def apply_paper_parameter_preset(args):
     args.stop_hour = 24.0
     args.epoch_length = 30.0
     args.mcmf_solver = "exact"
-    args.mcmf_backend = "primal_dual"
+    # Preserve the CLI backend; the paper preset controls model parameters.
     args.mcmf_strict = True
     args.mcmf_graph_reduction = True
     args.mcmf_verify = True
@@ -672,7 +672,7 @@ def _create_nyc_environment(
     mip_backend: str = "docplex",
     usemcmf: bool,
     mcmf_solver: str = "exact",
-    mcmf_backend: str = "docplex_network",
+    mcmf_backend: str = "ortools",
     mcmf_strict: bool = True,
     mcmf_cost_scale: int = 10_000,
     mcmf_graph_reduction: bool = True,
@@ -790,7 +790,7 @@ def run_nyc_solver_benchmark(
     mcmf_use_gpu: bool,
     mip_backend: str = "docplex",
     mcmf_solver: str = "exact",
-    mcmf_backend: str = "docplex_network",
+    mcmf_backend: str = "ortools",
     mcmf_strict: bool = True,
     mcmf_cost_scale: int = 10_000,
     mcmf_graph_reduction: bool = True,
@@ -879,7 +879,7 @@ def run_nyc_training(
     knownreject: bool,
     mcmf_use_gpu: bool,
     mcmf_solver: str = "exact",
-    mcmf_backend: str = "docplex_network",
+    mcmf_backend: str = "ortools",
     mcmf_strict: bool = True,
     mcmf_cost_scale: int = 10_000,
     mcmf_graph_reduction: bool = True,

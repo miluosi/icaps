@@ -112,7 +112,7 @@ class AssignmentOracleConfig:
     """Serialized relationship between rollout and target assignment solvers."""
 
     solver_family: str = "exact"
-    backend: str = "primal_dual"
+    backend: str = "ortools"
     graph_reduction: bool = True
     verify: bool = True
     cost_scale: int = 10_000
@@ -127,14 +127,14 @@ class AssignmentOracleConfig:
 
     @classmethod
     def from_environment(cls, env, *, target_policy: str | None = None):
-        rollout_backend = str(getattr(env, "mcmf_backend", "primal_dual"))
+        rollout_backend = str(getattr(env, "mcmf_backend", "ortools"))
         policy = str(
             target_policy
             or getattr(env, "target_solver_policy", "same_as_rollout_exact")
         )
         backend = "primal_dual" if policy == "fixed_primal_dual_exact" else rollout_backend
         if policy == "exact_oracle_for_approximate_rollout":
-            backend = str(getattr(env, "target_oracle_backend", "primal_dual"))
+            backend = str(getattr(env, "target_oracle_backend", "ortools"))
         return cls(
             solver_family=str(getattr(env, "mcmf_solver", "exact") or "exact"),
             backend=backend,

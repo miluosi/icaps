@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mcmf-backend",
         choices=["docplex_network", "gurobi_network", "primal_dual", "ortools", "auto"],
-        default="docplex_network",
+        default="ortools",
     )
     parser.add_argument(
         "--charge-wait-bool",

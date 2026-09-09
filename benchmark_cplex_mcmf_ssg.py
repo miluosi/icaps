@@ -853,6 +853,40 @@ def run_benchmark(args: argparse.Namespace) -> tuple[Path, list[dict[str, Any]]]
         return _run_benchmark_serial(args)
 
 
+class OutputDirectoryError(ValueError):
+    """An output path needs a different new-run/resume choice."""
+
+
+def prepare_output_directory(output_dir: Path, *, resume: bool) -> None:
+    """Accept a new or pre-created empty directory, preserving existing data."""
+    if resume:
+        if not (output_dir / "metadata.json").is_file():
+            raise OutputDirectoryError(
+                f"Cannot resume {output_dir}: metadata.json is missing. "
+                "Use an interrupted experiment directory, or omit --output-dir "
+                "and --resume to start in a new timestamped directory."
+            )
+        return
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        return
+    except FileExistsError:
+        if output_dir.is_dir() and not any(output_dir.iterdir()):
+            return
+    if (output_dir / "metadata.json").is_file():
+        advice = (
+            "To continue an interrupted experiment, repeat its original command "
+            "with --resume. To start a separate experiment, omit --output-dir "
+            "for a new timestamped directory or choose a new path."
+        )
+    else:
+        advice = (
+            "This path is not an empty directory and has no experiment metadata.json. "
+            "Omit --output-dir for a new timestamped directory or choose a new path."
+        )
+    raise OutputDirectoryError(f"Output path already exists: {output_dir}. {advice} Existing files were not changed.")
+
+
 def _run_benchmark_serial(args: argparse.Namespace) -> tuple[Path, list[dict[str, Any]]]:
     specs = resolve_case_specs(args)
     settings = {
@@ -873,6 +907,7 @@ def _run_benchmark_serial(args: argparse.Namespace) -> tuple[Path, list[dict[str
     if args.mcmf_backend == "legacy":
         labels.update(mcmf="MCMF (Python SPFA)", ssg_mcmf="MCMF (Python SPFA) + SSG")
 
+    prepare_output_directory(output_dir, resume=args.resume)
     if args.resume:
         metadata = json.loads((output_dir / "metadata.json").read_text())
         if metadata["experiment_settings"] != settings or metadata["source_sha256"] != source_hashes:
@@ -896,7 +931,6 @@ def _run_benchmark_serial(args: argparse.Namespace) -> tuple[Path, list[dict[str
                     rows.extend(group)
                     completed_cases.add(case_id)
     else:
-        output_dir.mkdir(parents=True, exist_ok=False)
         metadata = {
             "schema_version": 2, "created_at": datetime.now().isoformat(),
             "experiment_settings": settings, "source_sha256": source_hashes,
@@ -1082,7 +1116,10 @@ def _run_benchmark_serial(args: argparse.Namespace) -> tuple[Path, list[dict[str
 
 def main(argv: Iterable[str] | None = None) -> None:
     args = parse_args(argv)
-    run_benchmark(args)
+    try:
+        run_benchmark(args)
+    except OutputDirectoryError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 if __name__ == "__main__":

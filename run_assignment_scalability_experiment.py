@@ -34,7 +34,7 @@ def parse_args(argv=None):
     parser.add_argument('--aev-share', type=float, default=0.5)
     parser.add_argument('--backends', nargs='+',
                         choices=['primal_dual', 'ortools', 'gurobi_network'],
-                        default=['primal_dual'])
+                        default=['ortools'])
     parser.add_argument('--reductions', nargs='+', choices=['on', 'off'],
                         default=['on', 'off'])
     parser.add_argument('--learner-variant',

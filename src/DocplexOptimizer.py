@@ -21,5 +21,5 @@ class DocplexOptimizer(GurobiOptimizer):
     _docplex_vehicle_rebalancing_knownreject_state = GurobiOptimizer._gurobi_vehicle_rebalancing_knownreject_state
     _docplex_vehicle_rebalancing_knownreject_state_enhanced = GurobiOptimizer._gurobi_vehicle_rebalancing_knownreject_state_enhanced
 
-    def __init__(self, env, num_threads=16):
+    def __init__(self, env, num_threads=1):
         super().__init__(env, num_threads=num_threads, mip_backend="docplex")

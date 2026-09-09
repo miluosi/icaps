@@ -7,6 +7,7 @@ import pytest
 
 from src.exact_mcmf import (
     build_reduced_problem,
+    solve_exact,
     solve_gurobi_network,
     solve_primal_dual,
 )
@@ -15,6 +16,23 @@ from src.qvalue_precision import (
     qvalue_rounding_diagnostics,
     round_qvalue_matrix,
 )
+
+
+@pytest.mark.parametrize("backend", [None, "auto"])
+def test_default_assignment_uses_ortools_and_matches_exact_oracle(backend):
+    problem = build_reduced_problem(
+        np.ones((2, 3), dtype=bool),
+        np.asarray([[10.0, 9.0, 0.0], [8.0, 1.0, 0.0]]),
+        np.asarray([1, 1, 2]),
+        cost_scale=10_000,
+        graph_reduction=True,
+    )
+    result = solve_exact(problem, **({} if backend is None else {"backend": backend}))
+    oracle = solve_primal_dual(problem, verify=True)
+    assert result.backend == "ortools"
+    assert not result.solver_fallback_used
+    assert result.objective_q == oracle.objective_q == pytest.approx(17.0)
+    assert result.action_by_vehicle == {0: 1, 1: 0}
 
 
 def test_shared_qvalue_precision_uses_four_decimal_grid():

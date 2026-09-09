@@ -64,7 +64,8 @@ def test_train_and_test_share_checkpoint_namespace():
     assert "method-macro_rec-recourse_macro" in suffixes["macro"]
 
 
-def test_run_nyctrainer_all_dispatches_the_seven_registered_methods(monkeypatch):
+@pytest.mark.parametrize("paper_preset", [False, True])
+def test_run_nyctrainer_all_dispatches_the_seven_registered_methods(monkeypatch, paper_preset):
     calls = []
 
     def fake_training(**kwargs):
@@ -72,7 +73,7 @@ def test_run_nyctrainer_all_dispatches_the_seven_registered_methods(monkeypatch)
         return {"episode_rewards": []}, SimpleNamespace(parquet_path=())
 
     monkeypatch.setattr(run_nyctrainer, "run_nyc_training", fake_training)
-    run_nyctrainer.main([
+    run_nyctrainer.main((["--paper-parameter-preset"] if paper_preset else []) + [
         "--methods", "all",
         "--episodes", "1",
         "--start-date", "2025-12-18",
@@ -89,3 +90,17 @@ def test_run_nyctrainer_all_dispatches_the_seven_registered_methods(monkeypatch)
     )
     assert all(call["aev_charging_center_count"] == 3 for call in calls)
     assert all("aev-centers-3" in call["checkpoint_suffix"] for call in calls)
+    assert all(call["mcmf_backend"] == "ortools" for call in calls)
+    assert all(call["mcmf_solver"] == "exact" for call in calls)
+    assert all(call["mcmf_cost_scale"] == 10_000 for call in calls)
+    assert all(call["mcmf_graph_reduction"] for call in calls)
+
+
+@pytest.mark.parametrize("backend", ["ortools", "primal_dual", "docplex_network"])
+def test_paper_preset_preserves_explicit_assignment_backend(backend):
+    args = run_nyctrainer.apply_paper_parameter_preset(run_nyctrainer.parse_args([
+        "--paper-parameter-preset", "--mcmf-backend", backend,
+    ]))
+    assert args.mcmf_backend == backend
+    assert args.target_solver_policy == "same_as_rollout_exact"
+    assert args.mcmf_cost_scale == 10_000

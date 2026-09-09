@@ -81,7 +81,7 @@ def experiment_args(
         parquet_path=str(Path(args.parquet_path).expanduser().resolve()),
         station_csv=str(args.station_csv.expanduser().resolve()),
         station_capacity_scale=1.0,
-        mcmf_backend="primal_dual",
+        mcmf_backend="ortools",
         charge_wait_bool=True,
         human_ev_charge_decision_interval_minutes=float(interval_minutes),
         heuristic_battery_threshold=0.5,

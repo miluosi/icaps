@@ -415,7 +415,7 @@ def run_training_worker(settings):
                         learner_variant=getattr(env, 'learner_variant', 'optimization_anchored_residual'),
                         solver_config=dict(
                             rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
-                            backend=getattr(env, 'mcmf_backend', 'primal_dual'),
+                            backend=getattr(env, 'mcmf_backend', "ortools"),
                             graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
                             verify=getattr(env, 'mcmf_verify', True),
                             strict=getattr(env, 'mcmf_strict', True),

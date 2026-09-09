@@ -55,7 +55,7 @@ def parse_args(argv=None):
     parser.add_argument('--samitha-fixed-hold-fraction', type=float, default=0.0)
     parser.add_argument('--graph-reduction', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--mcmf-backend', choices=['docplex_network', 'primal_dual', 'ortools', 'gurobi_network'],
-                        default='primal_dual')
+                        default="ortools")
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--resume', action='store_true', help='Resume completed train/test phase boundaries, not partial epochs')
@@ -172,7 +172,7 @@ def validate_checkpoint_payload(payload, method, env):
             )
     expected_solver = {
         'rollout_solver': getattr(env, 'mcmf_solver', 'exact'),
-        'backend': getattr(env, 'mcmf_backend', 'primal_dual'),
+        'backend': getattr(env, 'mcmf_backend', "ortools"),
         'graph_reduction': getattr(env, 'mcmf_graph_reduction', True),
         'verify': getattr(env, 'mcmf_verify', True),
         'strict': getattr(env, 'mcmf_strict', True),
@@ -215,7 +215,7 @@ def run_worker(args):
                 samitha_fixed_hold_fraction=env.samitha_fixed_hold_fraction,
                 solver_config=dict(
                     rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
-                    backend=getattr(env, 'mcmf_backend', 'primal_dual'),
+                    backend=getattr(env, 'mcmf_backend', "ortools"),
                     graph_reduction=getattr(env, 'mcmf_graph_reduction', True),
                     verify=getattr(env, 'mcmf_verify', True),
                     strict=getattr(env, 'mcmf_strict', True),

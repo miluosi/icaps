@@ -354,7 +354,7 @@ class RecourseTargetBuilder:
         elif policy == "exact_oracle_for_approximate_rollout" and self.backend is None:
             # This policy is the one explicit exception allowed to decouple
             # targets from an approximate rollout backend.
-            backend = "primal_dual"
+            backend = "ortools"
         return {
             "backend": backend,
             "graph_reduction": bool(

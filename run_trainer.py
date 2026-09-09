@@ -97,7 +97,7 @@ def parse_args():
     )
     parser.add_argument(
         "--mcmf-backend", choices=["auto", "docplex_network", "ortools", "gurobi_network", "primal_dual"],
-        default="docplex_network", help="Exact MCMF backend (auto tries only exact backends)",
+        default="ortools", help="Exact MCMF backend (auto tries only exact backends)",
     )
     parser.add_argument(
         "--mcmf-cost-scale",

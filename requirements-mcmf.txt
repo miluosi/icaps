@@ -1,3 +1,9 @@
-# Optional exact CPU min-cost-flow backend, tested on Python 3.13 / macOS ARM.
+# Default exact CPU min-cost-flow backend, tested on Python 3.13 / macOS ARM.
 # 9.14 supports the project's NumPy 1.x constraint as well as NumPy 2.x.
+# Do not replace this with unversioned `pip install ortools`: 9.15 requires
+# NumPy >=2.0.2 and can break the older Anaconda training stack.
 ortools==9.14.6206
+threadpoolctl>=3.6
+numpy>=1.26,<2; python_version < "3.13"
+numpy>=2.1,<3; python_version >= "3.13"
+pandas>=2.1,<3
