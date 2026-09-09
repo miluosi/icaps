@@ -1,0 +1,3 @@
+# Optional exact CPU min-cost-flow backend, tested on Python 3.13 / macOS ARM.
+# 9.14 supports the project's NumPy 1.x constraint as well as NumPy 2.x.
+ortools==9.14.6206

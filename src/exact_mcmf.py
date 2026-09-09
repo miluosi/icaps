@@ -22,13 +22,15 @@ primal-dual solver is always available.
 from __future__ import annotations
 
 import math
+import operator
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from heapq import heappop, heappush
 from typing import Optional
 
 import numpy as np
 
-from src.qvalue_precision import quantize_qvalues
+from src.qvalue_precision import quantize_qvalues, validate_qvalue_scale
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,31 @@ class ArcMeta:
     vehicle_index: Optional[int] = None
     action_index: Optional[int] = None
     kind: str = "internal"
+
+
+class ArcMetadata(Sequence[ArcMeta]):
+    """Array-backed metadata; materialize Python records only when requested."""
+
+    _KINDS = ("source", "baseline", "shared", "sink")
+
+    def __init__(self, vehicles: np.ndarray, actions: np.ndarray, kinds: np.ndarray):
+        self.vehicles = vehicles
+        self.actions = actions
+        self.kinds = kinds
+
+    def __len__(self) -> int:
+        return len(self.kinds)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        index = operator.index(index)
+        kind = int(self.kinds[index])
+        return ArcMeta(
+            None if kind == 3 else int(self.vehicles[index]),
+            None if kind == 0 else int(self.actions[index]),
+            self._KINDS[kind],
+        )
 
 
 @dataclass
@@ -49,7 +76,7 @@ class ReducedMCMFProblem:
     capacities: np.ndarray
     costs: np.ndarray
     raw_costs: np.ndarray
-    arc_meta: list[ArcMeta]
+    arc_meta: Sequence[ArcMeta]
     baseline_action: np.ndarray
     baseline_available: np.ndarray
     baseline_value: np.ndarray
@@ -115,6 +142,212 @@ def quantize_values(values: np.ndarray, scale: int) -> np.ndarray:
     return scaled
 
 
+def _reduce_eagr_incremental(feasible, q, capacities, initial_baseline):
+    """Monotone-pointer EAGR for deep cascades; each edge is deleted at most once."""
+    n_vehicles, n_actions = feasible.shape
+    active_actions = capacities > 0
+    baseline_action = np.full(n_vehicles, -1, dtype=np.int64)
+    baseline_value_raw = initial_baseline.copy()
+    reduction_rounds = 0
+    # Exact action-graph reduction (EAGR).  Baselines and their witness
+    # actions are monotone: a witness changes only under a strict
+    # precision-controlled Q
+    # improvement.  This is the strict fixed-point algorithm stated in
+    # the manuscript, not a top-K or proximity approximation.
+    shared = active_actions.copy()
+    incident_vehicles: list[list[int]] = [[] for _ in range(n_actions)]
+    row_actions: list[np.ndarray] = []
+    row_values: list[np.ndarray] = []
+    row_threshold = np.zeros(n_vehicles, dtype=np.int64)
+    positive_degree = np.zeros(n_actions, dtype=np.int64)
+
+    for vehicle in range(n_vehicles):
+        actions = np.flatnonzero(feasible[vehicle] & shared)
+        if actions.size:
+            # Values are primary and action ids are the deterministic
+            # tie-break.  The monotone pointer then deletes every
+            # dominated edge at most once as the baseline rises.
+            order = np.lexsort((actions, q[vehicle, actions]))
+            actions = actions[order].astype(np.int64, copy=False)
+            values = q[vehicle, actions]
+            pointer = int(np.searchsorted(
+                values,
+                baseline_value_raw[vehicle],
+                side="right",
+            ))
+            row_threshold[vehicle] = pointer
+            for action in actions:
+                incident_vehicles[int(action)].append(vehicle)
+            for action in actions[pointer:]:
+                positive_degree[int(action)] += 1
+        else:
+            values = np.empty(0, dtype=np.float64)
+        row_actions.append(actions)
+        row_values.append(values)
+
+    foldable = np.flatnonzero(
+        shared & (positive_degree <= capacities)
+    ).astype(np.int64)
+    while foldable.size:
+        reduction_rounds += 1
+        # All actions in the current EAGR batch are folded together.
+        # Marking them first reproduces K <- K \ F exactly.
+        shared[foldable] = False
+        updated_vehicles: set[int] = set()
+        for action_raw in foldable:
+            action = int(action_raw)
+            for vehicle in incident_vehicles[action]:
+                value = float(q[vehicle, action])
+                if value > float(baseline_value_raw[vehicle]):
+                    baseline_value_raw[vehicle] = value
+                    baseline_action[vehicle] = action
+                    updated_vehicles.add(vehicle)
+
+        next_foldable: set[int] = set()
+        for vehicle in updated_vehicles:
+            actions = row_actions[vehicle]
+            values = row_values[vehicle]
+            pointer = int(row_threshold[vehicle])
+            baseline = float(baseline_value_raw[vehicle])
+            while pointer < len(actions) and float(values[pointer]) <= baseline:
+                action = int(actions[pointer])
+                if shared[action]:
+                    positive_degree[action] -= 1
+                    if positive_degree[action] <= capacities[action]:
+                        next_foldable.add(action)
+                pointer += 1
+            row_threshold[vehicle] = pointer
+        foldable = np.asarray(sorted(next_foldable), dtype=np.int64)
+
+    return shared, baseline_action, baseline_value_raw, reduction_rounds
+
+
+def _quantize_problem_values(q_input, cost_scale):
+    """Keep owned dense results, but bound validation/rounding temporaries."""
+    cost_scale = validate_qvalue_scale(cost_scale)
+    q = np.empty(q_input.shape, dtype=np.float64)
+    q_int = np.empty(q_input.shape, dtype=np.int64)
+    rounded_entries = 0
+    max_delta = 0.0
+    block_rows = max(1, 262_144 // max(1, q_input.shape[1]))
+    for start in range(0, q_input.shape[0], block_rows):
+        stop = start + block_rows
+        values, integers = quantize_qvalues(q_input[start:stop], cost_scale)
+        q[start:stop] = values
+        q_int[start:stop] = integers
+        delta = np.abs(q_input[start:stop] - values)
+        rounded_entries += int(np.count_nonzero(delta))
+        max_delta = max(max_delta, float(np.max(delta, initial=0.0)))
+    return q, q_int, rounded_entries, max_delta
+
+
+def _reduce_eagr(feasible, q, capacities, initial_baseline, rows, actions, values):
+    """Exact batched certificates with a bounded-work cascade fallback.
+
+    Preserve simultaneous folds, smallest-id witnesses, and strict improvement.
+    Count positive edges once and decrement only newly dominated shared edges.
+    A global baseline bound skips row lookups for edges that cannot be deleted.
+    At most four batches precede the original incremental algorithm, retaining
+    its asymptotic bound even when the fixed point requires many rounds.
+    """
+    n_vehicles, n_actions = feasible.shape
+    shared = capacities > 0
+    baseline = initial_baseline.copy()
+    witnesses = np.full(n_vehicles, -1, dtype=np.int64)
+    if np.all(np.isneginf(baseline)):
+        dominated = np.zeros(len(actions), dtype=bool)
+        degree = np.bincount(actions, minlength=n_actions)
+    else:
+        dominated = values <= baseline[rows]
+        degree = np.bincount(actions[~dominated], minlength=n_actions)
+    for round_index in range(5):
+        foldable = shared & (degree <= capacities)
+        if not np.any(foldable):
+            return shared, witnesses, baseline, round_index
+        if round_index == 4:
+            return _reduce_eagr_incremental(feasible, q, capacities, initial_baseline)
+        shared[foldable] = False
+        folded = np.flatnonzero(foldable[actions])
+        folded_rows, folded_values = rows[folded], values[folded]
+        best = np.full(n_vehicles, -np.inf, dtype=np.float64)
+        np.maximum.at(best, folded_rows, folded_values)
+        improved = best > baseline
+        tied_best = improved[folded_rows] & (folded_values == best[folded_rows])
+        best_action = np.full(n_vehicles, n_actions, dtype=np.int64)
+        np.minimum.at(best_action, folded_rows[tied_best], actions[folded[tied_best]])
+        baseline[improved] = best[improved]
+        witnesses[improved] = best_action[improved]
+        # Any edge above the largest baseline is necessarily still positive.
+        # This is a value bound, not an approximation or a candidate limit.
+        candidates = np.flatnonzero(values <= np.max(baseline, initial=-np.inf))
+        remove = (
+            shared[actions[candidates]] & ~dominated[candidates]
+            & (values[candidates] <= baseline[rows[candidates]])
+        )
+        removed = candidates[remove]
+        dominated[removed] = True
+        degree -= np.bincount(actions[removed], minlength=n_actions)
+    raise AssertionError("unreachable EAGR state")
+
+
+def _build_assignment_arcs(
+    n_vehicles, n_actions, rows, actions, values, integers, shared,
+    baseline_available, baseline_action, baseline_value, baseline_raw,
+    action_capacities, preserve_zero_gain_ties,
+):
+    """Build the canonical graph in arrays without per-edge Python allocation."""
+    shared_actions = np.flatnonzero(shared).astype(np.int64)
+    action_offset = 1 + n_vehicles
+    sink = action_offset + len(shared_actions)
+    action_nodes = np.full(n_actions, -1, dtype=np.int32)
+    action_nodes[shared_actions] = action_offset + np.arange(len(shared_actions))
+    raw_gains = values - baseline_raw[rows]
+    improving = raw_gains >= 0 if preserve_zero_gain_ties else raw_gains > 0
+    keep = shared[actions] & (~baseline_available[rows] | improving)
+    kept_rows, kept_actions = rows[keep], actions[keep]
+    counts = np.bincount(kept_rows, minlength=n_vehicles)
+    row_widths = 1 + baseline_available + counts
+    row_starts = np.cumsum(row_widths) - row_widths
+    shared_starts = np.cumsum(counts) - counts
+    row_arc_count = int(row_widths.sum())
+    total = row_arc_count + len(shared_actions)
+    tails = np.empty(total, dtype=np.int32)
+    heads = np.empty(total, dtype=np.int32)
+    arc_caps = np.ones(total, dtype=np.int64)
+    costs = np.zeros(total, dtype=np.int64)
+    raw_costs = np.zeros(total, dtype=np.float64)
+    meta_vehicles = np.full(total, -1, dtype=np.int64)
+    meta_actions = np.full(total, -1, dtype=np.int64)
+    meta_kinds = np.zeros(total, dtype=np.int8)
+    vehicles = np.arange(n_vehicles)
+    tails[row_starts], heads[row_starts] = 0, 1 + vehicles
+    meta_vehicles[row_starts] = vehicles
+    baseline_rows = np.flatnonzero(baseline_available)
+    baseline_arcs = row_starts[baseline_rows] + 1
+    tails[baseline_arcs], heads[baseline_arcs] = 1 + baseline_rows, sink
+    meta_vehicles[baseline_arcs] = baseline_rows
+    meta_actions[baseline_arcs] = baseline_action[baseline_rows]
+    meta_kinds[baseline_arcs] = 1
+    offsets = row_starts + 1 + baseline_available - shared_starts
+    shared_arcs = np.arange(len(kept_rows)) + offsets[kept_rows]
+    tails[shared_arcs] = 1 + kept_rows
+    heads[shared_arcs] = action_nodes[kept_actions]
+    costs[shared_arcs] = -(integers[keep] - baseline_value[kept_rows])
+    raw_costs[shared_arcs] = -raw_gains[keep]
+    meta_vehicles[shared_arcs] = kept_rows
+    meta_actions[shared_arcs] = kept_actions
+    meta_kinds[shared_arcs] = 2
+    tails[row_arc_count:] = action_nodes[shared_actions]
+    heads[row_arc_count:] = sink
+    arc_caps[row_arc_count:] = action_capacities[shared_actions]
+    meta_actions[row_arc_count:] = shared_actions
+    meta_kinds[row_arc_count:] = 3
+    return (
+        sink, shared_actions, tails, heads, arc_caps, costs, raw_costs,
+        ArcMetadata(meta_vehicles, meta_actions, meta_kinds),
+    )
+
+
 def build_reduced_problem(
     feasibility: np.ndarray,
     q_values: np.ndarray,
@@ -148,12 +381,14 @@ def build_reduced_problem(
 
     # A zero-capacity action is never a private/unlimited option.
     feasible = feasible & (capacities[np.newaxis, :] > 0)
-    feasible_degree = feasible.sum(axis=0, dtype=np.int64)
+    edge_rows, edge_actions = np.nonzero(feasible)
+    feasible_degree = np.bincount(edge_actions, minlength=n_actions)
     capacities = np.minimum(capacities, feasible_degree)
-    q, q_int = quantize_qvalues(q_input, cost_scale)
-    q_rounding_delta = np.abs(q_input - q)
-    qvalue_rounded_entries = int(np.count_nonzero(q_rounding_delta))
-    qvalue_rounding_max_abs = float(np.max(q_rounding_delta, initial=0.0))
+    q, q_int, qvalue_rounded_entries, qvalue_rounding_max_abs = (
+        _quantize_problem_values(q_input, cost_scale)
+    )
+    edge_values = q[edge_rows, edge_actions]
+    edge_integers = q_int[edge_rows, edge_actions]
 
     fallback_int = None
     if fallback_values is not None:
@@ -171,10 +406,15 @@ def build_reduced_problem(
             float(np.max(fallback_delta, initial=0.0)),
         )
 
-    candidate_abs = [abs(int(value)) for value in q_int[feasible]]
+    max_abs_value = max(
+        abs(int(edge_integers.min(initial=0))),
+        abs(int(edge_integers.max(initial=0))),
+    )
     if fallback_int is not None:
-        candidate_abs.extend(abs(int(value)) for value in fallback_int)
-    max_abs_value = max(candidate_abs, default=0)
+        max_abs_value = max(
+            max_abs_value, abs(int(fallback_int.min(initial=0))),
+            abs(int(fallback_int.max(initial=0))),
+        )
     # Keep both accumulated int64 objectives and Gurobi's double-precision
     # integer coefficients exact.  A gain is the difference of two Q values,
     # hence the conservative 2**51 per-value limit.
@@ -193,7 +433,7 @@ def build_reduced_problem(
     # additional arc per vehicle only when it is actually configured.
     original_edges = int(
         n_vehicles
-        + feasible.sum(dtype=np.int64)
+        + len(edge_rows)
         + active_actions.sum()
         + (n_vehicles if fallback_values is not None else 0)
     )
@@ -207,88 +447,12 @@ def build_reduced_problem(
     reduction_rounds = 0
 
     if graph_reduction:
-        # Exact action-graph reduction (EAGR).  Baselines and their witness
-        # actions are monotone: a witness changes only under a strict
-        # precision-controlled Q
-        # improvement.  This is the strict fixed-point algorithm stated in
-        # the manuscript, not a top-K or proximity approximation.
-        shared = active_actions.copy()
-        incident_vehicles: list[list[int]] = [[] for _ in range(n_actions)]
-        row_actions: list[np.ndarray] = []
-        row_values: list[np.ndarray] = []
-        row_threshold = np.zeros(n_vehicles, dtype=np.int64)
-        positive_degree = np.zeros(n_actions, dtype=np.int64)
-
-        for vehicle in range(n_vehicles):
-            actions = np.flatnonzero(feasible[vehicle] & shared)
-            if actions.size:
-                # Values are primary and action ids are the deterministic
-                # tie-break.  The monotone pointer then deletes every
-                # dominated edge at most once as the baseline rises.
-                order = np.lexsort((actions, q[vehicle, actions]))
-                actions = actions[order].astype(np.int64, copy=False)
-                values = q[vehicle, actions]
-                pointer = int(np.searchsorted(
-                    values,
-                    baseline_value_raw[vehicle],
-                    side="right",
-                ))
-                row_threshold[vehicle] = pointer
-                for action in actions:
-                    incident_vehicles[int(action)].append(vehicle)
-                for action in actions[pointer:]:
-                    positive_degree[int(action)] += 1
-            else:
-                values = np.empty(0, dtype=np.float64)
-            row_actions.append(actions)
-            row_values.append(values)
-
-        foldable = np.flatnonzero(
-            shared & (positive_degree <= capacities)
-        ).astype(np.int64)
-        while foldable.size:
-            reduction_rounds += 1
-            # All actions in the current EAGR batch are folded together.
-            # Marking them first reproduces K <- K \ F exactly.
-            shared[foldable] = False
-            updated_vehicles: set[int] = set()
-            for action_raw in foldable:
-                action = int(action_raw)
-                for vehicle in incident_vehicles[action]:
-                    value = float(q[vehicle, action])
-                    if value > float(baseline_value_raw[vehicle]):
-                        baseline_value_raw[vehicle] = value
-                        baseline_action[vehicle] = action
-                        updated_vehicles.add(vehicle)
-
-            next_foldable: set[int] = set()
-            for vehicle in updated_vehicles:
-                actions = row_actions[vehicle]
-                values = row_values[vehicle]
-                pointer = int(row_threshold[vehicle])
-                baseline = float(baseline_value_raw[vehicle])
-                while pointer < len(actions) and float(values[pointer]) <= baseline:
-                    action = int(actions[pointer])
-                    if shared[action]:
-                        positive_degree[action] -= 1
-                        if positive_degree[action] <= capacities[action]:
-                            next_foldable.add(action)
-                    pointer += 1
-                row_threshold[vehicle] = pointer
-            foldable = np.asarray(sorted(next_foldable), dtype=np.int64)
-
+        shared, baseline_action, baseline_value_raw, reduction_rounds = _reduce_eagr(
+            feasible, q, capacities, baseline_value_raw, edge_rows, edge_actions,
+            edge_values,
+        )
     else:
         shared = active_actions.copy()
-        baseline_action.fill(-1)
-        if fallback_values is not None:
-            baseline_value_raw[:] = np.asarray(fallback_values, dtype=np.float64)
-        row_actions = [
-            np.flatnonzero(feasible[vehicle] & shared).astype(
-                np.int64,
-                copy=False,
-            )
-            for vehicle in range(n_vehicles)
-        ]
 
     # The TeX EAGR assumption gives every row a real capacity-nonbinding
     # baseline.  In NYC, an AEV row can lack one when charger availability
@@ -309,78 +473,14 @@ def build_reduced_problem(
         else:
             raise AssertionError("real EAGR witness is missing after reduction")
 
-    shared_actions = np.flatnonzero(shared).astype(np.int64)
-    action_to_local = {int(action): j for j, action in enumerate(shared_actions)}
-
     source = 0
-    vehicle_offset = 1
-    action_offset = vehicle_offset + n_vehicles
-    sink = action_offset + len(shared_actions)
-
-    tails: list[int] = []
-    heads: list[int] = []
-    arc_caps: list[int] = []
-    costs: list[int] = []
-    raw_costs: list[float] = []
-    metadata: list[ArcMeta] = []
-
-    def add_arc(
-        u: int,
-        v: int,
-        cap: int,
-        cost: int,
-        raw_cost: float,
-        meta: ArcMeta,
-    ) -> None:
-        tails.append(u)
-        heads.append(v)
-        arc_caps.append(cap)
-        costs.append(cost)
-        raw_costs.append(raw_cost)
-        metadata.append(meta)
-
-    for i in range(n_vehicles):
-        vehicle_node = vehicle_offset + i
-        add_arc(source, vehicle_node, 1, 0, 0.0, ArcMeta(i, None, "source"))
-        if baseline_available[i]:
-            add_arc(
-                vehicle_node,
-                sink,
-                1,
-                0,
-                0.0,
-                ArcMeta(i, int(baseline_action[i]), "baseline"),
-            )
-        for action_raw in row_actions[i]:
-            action = int(action_raw)
-            if not shared[action]:
-                continue
-            raw_gain = float(q[i, action] - baseline_value_raw[i])
-            if baseline_available[i] and (
-                raw_gain < 0
-                or (raw_gain == 0.0 and not preserve_zero_gain_ties)
-            ):
-                continue
-            gain = int(q_int[i, action] - baseline_value[i])
-            add_arc(
-                vehicle_node,
-                action_offset + action_to_local[action],
-                1,
-                -gain,
-                -raw_gain,
-                ArcMeta(i, action, "shared"),
-            )
-
-    for local, action in enumerate(shared_actions):
-        action = int(action)
-        add_arc(
-            action_offset + local,
-            sink,
-            int(capacities[action]),
-            0,
-            0.0,
-            ArcMeta(None, action, "sink"),
+    sink, shared_actions, tails, heads, arc_caps, costs, raw_costs, metadata = (
+        _build_assignment_arcs(
+            n_vehicles, n_actions, edge_rows, edge_actions, edge_values,
+            edge_integers, shared, baseline_available, baseline_action,
+            baseline_value, baseline_value_raw, capacities, preserve_zero_gain_ties,
         )
+    )
 
     return ReducedMCMFProblem(
         num_nodes=sink + 1,
@@ -625,13 +725,19 @@ class PrimalDualMinCostFlow:
 
 def _decode_arc_flows(
     problem: ReducedMCMFProblem,
-    arc_flows: list[int],
+    arc_flows: Sequence[int],
 ) -> tuple[dict[int, int], int]:
     action_by_vehicle: dict[int, int] = {}
     min_cost = 0
-    for flow, cost, meta in zip(arc_flows, problem.costs, problem.arc_meta):
-        flow = int(flow)
-        min_cost += flow * int(cost)
+    # Most candidate arcs carry zero flow. Decode only used arcs so compact
+    # metadata stays compact, and accumulate with Python ints as before.
+    flows = np.asarray(arc_flows, dtype=np.int64)
+    if flows.shape != problem.costs.shape:
+        raise AssertionError("arc flow count does not match the graph")
+    for index in np.flatnonzero(flows):
+        flow = int(flows[index])
+        min_cost += flow * int(problem.costs[index])
+        meta = problem.arc_meta[index]
         if flow <= 0 or meta.kind not in {"baseline", "shared"}:
             continue
         if meta.vehicle_index is None or meta.action_index is None:
@@ -839,7 +945,10 @@ def solve_ortools(problem: ReducedMCMFProblem) -> ExactMCMFResult:
     status = solver.solve()
     if status != solver.OPTIMAL:
         raise RuntimeError(f"OR-Tools exact MCMF status is {status}, not OPTIMAL")
-    arc_flows = [int(solver.flow(index)) for index in range(solver.num_arcs())]
+    # Fetch in one native call instead of crossing the Python boundary per arc.
+    arc_flows = solver.flows(
+        np.arange(solver.num_arcs(), dtype=np.int32)
+    )
     action_by_vehicle, min_cost = _decode_arc_flows(problem, arc_flows)
     objective_int = problem.baseline_sum - min_cost
     _verify_assignment(problem, action_by_vehicle, objective_int)

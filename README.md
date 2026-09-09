@@ -146,6 +146,37 @@ python -m pip install -r requirements.txt
 
 The current modules import `gurobipy` even when heuristic assignment is selected. A valid Gurobi licence is required only for ILP or the Gurobi network-flow backend. Without a licence, use heuristic assignment with `--no-mcmf`, or select the `primal_dual` MCMF backend.
 
+For the optional single-threaded OR-Tools MCMF backend, install
+`python -m pip install -r requirements-mcmf.txt`. Use
+`--mcmf-solver exact --mcmf-backend ortools --mcmf-use-cpu` for training;
+exact SSG graph reduction stays enabled. The runtime comparison script
+`python benchmark_cplex_mcmf_ssg.py` defaults to OR-Tools, warm solvers,
+one CPLEX thread, and **ten paired seeds per scale and scenario**. It runs
+an ADP control, a relocation-rich scenario, and a high-AEV joint-growth
+scenario from 100 to 6000 vehicles. The reward generator is retained from
+`adp_trainer/test_alg_time.py`; scenario dimensions, AEV ratios and matched
+station capacities are explicit in saved metadata. See the
+[performance audit and measured results](docs/MCMF_RUNTIME_AUDIT_2026-09-09.md)
+for timing scope, local environment setup, and the retained legacy benchmark.
+The shared graph builder also uses the
+[accelerated exact SSG preprocessing](docs/SSG_PREPROCESSING_ACCELERATION_2026-09-09.md),
+with unchanged precision, capacity certificates, and optimal objective.
+
+For standalone server timing and local plotting (no simulation dependencies):
+
+```bash
+python -m pip install -r requirements-benchmark.txt
+python benchmark_cplex_mcmf_ssg.py --output-dir results/cplex_mcmf_ssg/server_run
+```
+
+Each input is saved as a lossless sparse NPZ, alongside incremental raw
+CSV/JSON, summary, paired speedups and metadata. Repeat the same command
+with `--resume` after interruption. Copy the result directory locally and
+open [plot_cplex_mcmf_ssg.ipynb](plot_cplex_mcmf_ssg.ipynb) to render the
+reference-style grouped bars and scaling curves as PNG/PDF/SVG. See the
+[server experiment guide](docs/SSG_SERVER_BENCHMARK.md) for scenario controls,
+larger scales, timing definitions and reproducibility details.
+
 ## Quick verification
 
 ```bash
