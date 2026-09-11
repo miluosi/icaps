@@ -162,6 +162,38 @@ def _vf(*, state_variant="joint_state_shared_critic", recourse="r3"):
     return value_function
 
 
+@pytest.mark.parametrize('target_context', [False, True])
+def test_graph_inference_chunks_preserve_online_and_bellman_scores(target_context):
+    value_function = _vf()
+    value_function.training_step = 1000
+    graph = _graph('chunked', stage='aev', vehicle_id=1, vehicle_type=2)
+    graph = replace(graph, edges=tuple(
+        replace(graph.edges[0], edge_id=f'edge:{i}', structured_score=float(i * i))
+        for i in range(17)
+    ))
+    for critic in (value_function.network, value_function.critic2,
+                   value_function.target_network, value_function.target_critic2):
+        critic.net[-1].bias.data.fill_(1000.)
+    value_function.qvalue_inference_batch_size = 100
+    reference = value_function._graph_edge_scores(graph, target_context=target_context)
+    value_function.qvalue_inference_batch_size = 4
+    observed = []
+    critic = value_function.target_network if target_context else value_function.network
+    handle = critic.register_forward_pre_hook(
+        lambda _module, args: observed.append((len(args[0]), torch.is_grad_enabled()))
+    )
+    try:
+        actual = value_function._graph_edge_scores(graph, target_context=target_context)
+    finally:
+        handle.remove()
+    for expected_dict, actual_dict in zip(reference, actual):
+        assert expected_dict.keys() == actual_dict.keys()
+        np.testing.assert_allclose(list(expected_dict.values()), list(actual_dict.values()),
+                                   rtol=2e-6, atol=2e-5)
+    assert max(size for size, _ in observed) == 4
+    assert all(not grad_enabled for _, grad_enabled in observed)
+
+
 def test_production_wiring_routes_fleets_and_shares_transition_payload():
     aev = _vf(state_variant="joint_state_separate_critics", recourse="r4")
     ev = _vf(state_variant="joint_state_separate_critics", recourse="r4")

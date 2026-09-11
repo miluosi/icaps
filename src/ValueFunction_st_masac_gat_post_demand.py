@@ -379,7 +379,7 @@ class PyTorchChargingValueFunction(_BaseMASAC):
         self._last_post_demand_features = np.asarray(post_demand_features, dtype=np.float32)
 
         rows = []
-        type_weights = []
+        row_vehicle_types = []
         for index in range(len(vehicle_ids)):
             if vehicle_types is not None:
                 vehicle_type = int(vehicle_types[index])
@@ -412,17 +412,12 @@ class PyTorchChargingValueFunction(_BaseMASAC):
                 human_response_mask=(0.0 if human_response_masks is None else human_response_masks[index]),
             )
             local.append(float(post_demand_features[index]))
-            source_h = source_embeddings[int(vehicle_ids[index])]
-            target_h = self._graph_embedding_for_location(
-                graph,
-                int(post_action_locations[index]),
-            )
-            local_t = torch.tensor(local, dtype=torch.float32, device=self.device)
-            rows.append(torch.cat([local_t, source_h, target_h], dim=0))
-            type_weights.append(
-                graph["w_ev"] if vehicle_type == 1 else graph["w_aev"]
-            )
-        return torch.stack(rows), torch.stack(type_weights).unsqueeze(1), graph["baseline"]
+            rows.append(local)
+            row_vehicle_types.append(vehicle_type)
+        return self._assemble_edge_rows(
+            rows, row_vehicle_types, graph, source_embeddings,
+            vehicle_ids, post_action_locations,
+        )
 
     def _cap_relocation_scores_below_requests(
         self,

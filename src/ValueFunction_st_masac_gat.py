@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from src.qvalue_inference import bounded_edge_inference, inference_batch_size
 from src.recourse.config import CAUSAL_PREDICTOR_VARIANTS
 from src.recourse.replay import PrioritizedJointReplayBuffer
 from src.recourse.target_builder import RecourseTargetBuilder
@@ -242,6 +243,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         checkpoint_replay_recent: int = 5_000,
         iftransformer: bool = False,
         neighbour_number: int = 5,
+        qvalue_inference_batch_size: int | None = None,
     ):
         del log_dir, encoder, iftransformer
         self.grid_size = int(grid_size)
@@ -250,6 +252,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         self.max_requests = max(1.0, float(max_requests))
         self.env = env
         self._init_acceptance_feature()
+        self.qvalue_inference_batch_size = inference_batch_size(qvalue_inference_batch_size)
         self.device = torch.device(device)
         self.zone_distribution_mode = zone_distribution_mode or "st_masac_gat"
         self.neighbour_number = max(0, int(neighbour_number))
@@ -770,10 +773,15 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                     travel_duration=float(_at(travel_durations, idx, 0.0) or 0.0),
                 )
             )
-        with torch.no_grad():
-            waits = self.queue_predictor(torch.tensor(rows, dtype=torch.float32, device=self.device)).squeeze(1)
-            waits = torch.relu(waits)
-        return waits.cpu().numpy().astype(np.float32)
+        rows = np.asarray(rows, dtype=np.float32)
+        def evaluate(part):
+            with torch.no_grad():
+                inputs = torch.as_tensor(rows[part], device=self.device)
+                return torch.relu(self.queue_predictor(inputs)).squeeze(1).cpu().numpy()
+        waits, self._last_queue_inference_stats = bounded_edge_inference(
+            size, self.qvalue_inference_batch_size, evaluate, device=self.device,
+        )
+        return waits
 
     def _normalize_queue_wait(self, wait_steps: float | np.ndarray) -> float | np.ndarray:
         denom = max(1.0, float(getattr(self.env, "charge_duration", 1.0) if self.env is not None else 1.0))
@@ -1263,6 +1271,29 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             for index, vehicle_id in enumerate(vehicle_order)
         }
 
+    def _assemble_edge_rows(
+        self, rows, vehicle_types, graph, source_embeddings,
+        vehicle_ids, post_action_locations,
+    ):
+        """Transfer local features once and gather embeddings with gradients intact."""
+        vehicle_order = list(source_embeddings)
+        source_row = {vehicle_id: row for row, vehicle_id in enumerate(vehicle_order)}
+        source_indices = torch.as_tensor(
+            [source_row[int(vehicle_id)] for vehicle_id in vehicle_ids],
+            dtype=torch.long, device=self.device,
+        )
+        target_indices = torch.as_tensor(
+            [self._graph_row_for_location(graph, location) for location in post_action_locations],
+            dtype=torch.long, device=self.device,
+        )
+        local = torch.as_tensor(np.asarray(rows, dtype=np.float32), device=self.device)
+        sources = torch.stack([source_embeddings[vid] for vid in vehicle_order])
+        edges = torch.cat((local, sources.index_select(0, source_indices),
+                           graph['embeddings'].index_select(0, target_indices)), dim=1)
+        ev_mask = torch.as_tensor(np.asarray(vehicle_types) == 1, device=self.device)
+        weights = torch.where(ev_mask, graph['w_ev'], graph['w_aev']).unsqueeze(1)
+        return edges, weights, graph['baseline']
+
     def _edge_tensor_from_arrays(
         self,
         *,
@@ -1311,7 +1342,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         else:
             queue_wait_features = np.asarray(queue_wait_features, dtype=np.float32)
         rows = []
-        type_weights = []
+        row_vehicle_types = []
         for i in range(len(vehicle_ids)):
             if vehicle_types is not None:
                 vehicle_type = int(vehicle_types[i])
@@ -1343,12 +1374,12 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 rejection_probability=(0.0 if rejection_probabilities is None else rejection_probabilities[i]),
                 human_response_mask=(0.0 if human_response_masks is None else human_response_masks[i]),
             )
-            source_h = source_embeddings[int(vehicle_ids[i])]
-            target_h = self._graph_embedding_for_location(graph, int(post_action_locations[i]))
-            local_t = torch.tensor(local, dtype=torch.float32, device=self.device)
-            rows.append(torch.cat([local_t, source_h, target_h], dim=0))
-            type_weights.append(graph["w_ev"] if vehicle_type == 1 else graph["w_aev"])
-        return torch.stack(rows), torch.stack(type_weights).unsqueeze(1), graph["baseline"]
+            rows.append(local)
+            row_vehicle_types.append(vehicle_type)
+        return self._assemble_edge_rows(
+            rows, row_vehicle_types, graph, source_embeddings,
+            vehicle_ids, post_action_locations,
+        )
 
     # ------------------------------------------------------------------
     # Inference for MCMF edge scores
@@ -1476,74 +1507,100 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 "score_mean": float(np.mean(g)),
             }
             return g.astype(np.float32).tolist()
-        with torch.no_grad():
-            edge_t, type_w, _ = self._edge_tensor_from_arrays(
-                vehicle_ids=vehicle_ids,
-                vehicle_locations=vehicle_locations,
-                target_locations=target_locations,
-                current_times=current_times,
-                other_vehicles=other_vehicles,
-                num_requests=num_requests,
-                battery_levels=battery_levels,
-                target_distances=target_distances,
-                vehicle_idle_times=vehicle_idle_times,
-                action_type_ids=action_type_ids,
-                post_action_distances=post_action_distances,
-                post_action_durations=post_action_durations,
-                post_action_locations=post_action_locations,
-                target_station_ids=target_station_ids,
-                queue_wait_features=queue_wait_features,
-                vehicle_neighbour_candidates=vehicle_neighbour_candidates,
-                rejection_probabilities=rejection_probabilities,
-                human_response_masks=human_response_masks,
-            )
-            q1 = self.network(edge_t)
-            q2 = self.critic2(edge_t)
-            residual = self._selection_residual(q1, q2, type_w)
-            g_t = torch.tensor(g, dtype=torch.float32, device=self.device).unsqueeze(1)
-            sigma_g = torch.std(g_t, unbiased=False).clamp_min(1.0)
-            base_bound = float(self.residual_clip_rho) * sigma_g
-            bounds = torch.full_like(residual, float(base_bound.item()))
-            charge_mask = torch.tensor(
-                action_type_ids == 3,
-                dtype=torch.bool,
-                device=self.device,
-            ).unsqueeze(1)
-            if torch.any(charge_mask):
-                charge_duration = max(
-                    1.0,
-                    float(getattr(self.env, "charge_duration", 1.0) if self.env is not None else 1.0),
+        # Compute the clipping scale once across ALL edges in this fleet call.
+        # Splitting the public call would change both this scale and subclass
+        # relocation/request comparisons.
+        base_bound = float(self.residual_clip_rho) * float(
+            torch.as_tensor(g).std(unbiased=False).clamp_min(1.0).item()
+        )
+        edge_arrays = dict(
+            vehicle_ids=vehicle_ids,
+            vehicle_locations=vehicle_locations,
+            target_locations=target_locations,
+            current_times=current_times,
+            other_vehicles=other_vehicles,
+            num_requests=num_requests,
+            battery_levels=battery_levels,
+            target_distances=target_distances,
+            vehicle_idle_times=vehicle_idle_times,
+            action_type_ids=action_type_ids,
+            post_action_distances=post_action_distances,
+            post_action_durations=post_action_durations,
+            post_action_locations=post_action_locations,
+            target_station_ids=target_station_ids,
+            queue_wait_features=queue_wait_features,
+            rejection_probabilities=rejection_probabilities,
+            human_response_masks=human_response_masks,
+        )
+
+        post_demand_values = (
+            np.empty(size, dtype=np.float32)
+            if hasattr(self, '_last_post_demand_features') else None
+        )
+
+        def evaluate(part):
+            with torch.no_grad():
+                edge_t, type_w, _ = self._edge_tensor_from_arrays(
+                    **{key: value[part] for key, value in edge_arrays.items()},
+                    vehicle_neighbour_candidates=vehicle_neighbour_candidates,
                 )
-                charging_cost_per_step = float(
-                    getattr(
-                        self.env,
-                        "charging_penalty_per_step",
-                        getattr(self.env, "charging_penalty", 0.0),
-                    ) if self.env is not None else 0.0
-                )
-                wait_cost_per_step = float(self._queue_penalty_per_step())
-                predicted_wait_steps = torch.tensor(
-                    queue_wait_features,
-                    dtype=torch.float32,
+                q1 = self.network(edge_t)
+                q2 = self.critic2(edge_t)
+                residual = self._selection_residual(q1, q2, type_w)
+                g_t = torch.as_tensor(g[part], dtype=torch.float32, device=self.device).unsqueeze(1)
+                bounds = torch.full_like(residual, base_bound)
+                charge_mask = torch.tensor(
+                    action_type_ids[part] == 3,
+                    dtype=torch.bool,
                     device=self.device,
-                ).unsqueeze(1) * charge_duration
-                charge_cost_bound = (
-                    charging_cost_per_step * charge_duration
-                    + wait_cost_per_step * predicted_wait_steps
-                )
-                bounds = torch.where(
-                    charge_mask,
-                    torch.maximum(bounds, charge_cost_bound),
+                ).unsqueeze(1)
+                if np.any(action_type_ids[part] == 3):
+                    charge_duration = max(
+                        1.0,
+                        float(getattr(self.env, "charge_duration", 1.0) if self.env is not None else 1.0),
+                    )
+                    charging_cost_per_step = float(
+                        getattr(
+                            self.env,
+                            "charging_penalty_per_step",
+                            getattr(self.env, "charging_penalty", 0.0),
+                        ) if self.env is not None else 0.0
+                    )
+                    wait_cost_per_step = float(self._queue_penalty_per_step())
+                    predicted_wait_steps = torch.tensor(
+                        queue_wait_features[part],
+                        dtype=torch.float32,
+                        device=self.device,
+                    ).unsqueeze(1) * charge_duration
+                    charge_cost_bound = (
+                        charging_cost_per_step * charge_duration
+                        + wait_cost_per_step * predicted_wait_steps
+                    )
+                    bounds = torch.where(
+                        charge_mask,
+                        torch.maximum(bounds, charge_cost_bound),
+                        bounds,
+                    )
+                scores = self._execution_scores_from_residual(
+                    g_t,
+                    residual,
                     bounds,
                 )
-            scores = self._execution_scores_from_residual(
-                g_t,
-                residual,
-                bounds,
-            )
-            if self.eta_pi != 0.0:
-                scores = scores + float(self.eta_pi) * F.logsigmoid(self.actor(self._actor_features(edge_t)))
-        values = scores.squeeze(1).cpu().numpy()
+                if self.eta_pi != 0.0:
+                    scores = scores + float(self.eta_pi) * F.logsigmoid(self.actor(self._actor_features(edge_t)))
+                if post_demand_values is not None:
+                    post_demand_values[part] = self._last_post_demand_features
+                return scores.squeeze(1).cpu().numpy()
+
+        values, self._last_qvalue_inference_stats = bounded_edge_inference(
+            size, min(self.qvalue_inference_batch_size,
+                      getattr(self, '_qvalue_safe_batch_size', self.qvalue_inference_batch_size)),
+            evaluate, device=self.device,
+        )
+        if self._last_qvalue_inference_stats['oom_retries']:
+            self._qvalue_safe_batch_size = self._last_qvalue_inference_stats['effective_batch_size']
+        if post_demand_values is not None:
+            self._last_post_demand_features = post_demand_values
         self._last_adp_score_stats = {
             "mode": self.zone_distribution_mode,
             "g_mean": float(np.mean(g)),
@@ -2345,14 +2402,16 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         edges: tuple[FeasibleEdgeSnapshot, ...] | list[FeasibleEdgeSnapshot],
         *,
         target_context: bool,
+        sigma_g: float | None = None,
     ) -> torch.Tensor:
         """Build all deployment bounds with at most one queue forward pass."""
 
-        structured = np.asarray(
-            [float(item.structured_score) for item in graph.edges],
-            dtype=np.float32,
-        )
-        sigma_g = max(1.0, float(np.std(structured)))
+        if sigma_g is None:
+            structured = np.asarray(
+                [float(item.structured_score) for item in graph.edges],
+                dtype=np.float32,
+            )
+            sigma_g = max(1.0, float(np.std(structured)))
         bounds = torch.full(
             (len(edges),),
             float(self.residual_clip_rho) * sigma_g,
@@ -2499,50 +2558,71 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 raise ValueError('Replay rejection predictor hash mismatch')
             grouped.setdefault(id(provider), (provider, []))[1].append(edge)
 
+        sigma_g = max(1.0, float(np.std(np.asarray(
+            [float(edge.structured_score) for edge in graph.edges], dtype=np.float32,
+        )))) if graph.edges else 1.0
         for provider, provider_edges in grouped.values():
-            edge_rows = []
-            type_rows = []
-            for edge in provider_edges:
-                exp = provider._edge_experience(
-                    graph, edge, state_variant=provider.state_variant
-                )
-                edge_tensor, type_weight, _ = provider._edge_tensor_from_experience(
-                    exp,
-                    target_context=target_context,
-                    state_snapshot=exp["state_snapshot"],
-                )
-                edge_rows.append(edge_tensor.squeeze(0))
-                type_rows.append(type_weight.reshape(()))
-            edges_tensor = torch.stack(edge_rows)
-            type_weights = torch.stack(type_rows).reshape(-1, 1)
-            critic1 = provider.target_network if target_context else provider.network
-            critic2 = provider.target_critic2 if target_context else provider.critic2
-            raw1 = critic1(edges_tensor) * type_weights
-            raw2 = critic2(edges_tensor) * type_weights
-            if target_context:
-                # Target evaluation is deliberately not beta-scaled or
-                # clamped: raw critics fit the unbounded Bellman residual.
-                corrections = torch.minimum(raw1, raw2).reshape(-1)
-            else:
-                selected_raw = provider._selection_residual(
-                    raw1,
-                    raw2,
-                    torch.ones_like(type_weights),
-                ).reshape(-1)
-                if getattr(provider, "direct_q", False):
-                    corrections = selected_raw
-                else:
-                    bounds = provider._correction_bounds_for_edges(
-                        graph, provider_edges, target_context=False
-                    )
-                    if provider.planning_objective_mode != "structured_only":
-                        provider.deployment_edges_scored = getattr(provider, "deployment_edges_scored", 0) + len(provider_edges)
-                        provider.deployment_edges_clipped = getattr(provider, "deployment_edges_clipped", 0) + int(
-                            (selected_raw.detach().abs() > bounds).sum().item())
-                    corrections = float(provider._beta()) * torch.clamp(
-                        selected_raw, min=-bounds, max=bounds
-                    )
-            correction_values = corrections.detach().cpu().numpy()
+            clipping = [0, 0]
+            def evaluate(part):
+                # These scores are returned as Python floats, including Bellman
+                # target evaluation; no autograd graph is required here.
+                with torch.no_grad():
+                    chunk_edges = provider_edges[part]
+                    edge_rows = []
+                    type_rows = []
+                    for edge in chunk_edges:
+                        exp = provider._edge_experience(
+                            graph, edge, state_variant=provider.state_variant
+                        )
+                        edge_tensor, type_weight, _ = provider._edge_tensor_from_experience(
+                            exp,
+                            target_context=target_context,
+                            state_snapshot=exp["state_snapshot"],
+                        )
+                        edge_rows.append(edge_tensor.squeeze(0))
+                        type_rows.append(type_weight.reshape(()))
+                    edges_tensor = torch.stack(edge_rows)
+                    type_weights = torch.stack(type_rows).reshape(-1, 1)
+                    critic1 = provider.target_network if target_context else provider.network
+                    critic2 = provider.target_critic2 if target_context else provider.critic2
+                    raw1 = critic1(edges_tensor) * type_weights
+                    raw2 = critic2(edges_tensor) * type_weights
+                    if target_context:
+                        # Target evaluation is deliberately not beta-scaled or
+                        # clamped: raw critics fit the unbounded Bellman residual.
+                        corrections = torch.minimum(raw1, raw2).reshape(-1)
+                    else:
+                        selected_raw = provider._selection_residual(
+                            raw1,
+                            raw2,
+                            torch.ones_like(type_weights),
+                        ).reshape(-1)
+                        if getattr(provider, "direct_q", False):
+                            corrections = selected_raw
+                        else:
+                            bounds = provider._correction_bounds_for_edges(
+                                graph, chunk_edges, target_context=False, sigma_g=sigma_g
+                            )
+                            corrections = float(provider._beta()) * torch.clamp(
+                                selected_raw, min=-bounds, max=bounds
+                            )
+                    values = corrections.detach().cpu().numpy()
+                    if (not target_context and not getattr(provider, "direct_q", False)
+                            and provider.planning_objective_mode != "structured_only"):
+                        clipping[0] += len(chunk_edges)
+                        clipping[1] += int((selected_raw.abs() > bounds).sum().item())
+                    return values
+
+            correction_values, provider._last_graph_qvalue_inference_stats = bounded_edge_inference(
+                len(provider_edges),
+                min(provider.qvalue_inference_batch_size,
+                    getattr(provider, '_qvalue_safe_batch_size', provider.qvalue_inference_batch_size)),
+                evaluate, device=provider.device,
+            )
+            if provider._last_graph_qvalue_inference_stats['oom_retries']:
+                provider._qvalue_safe_batch_size = provider._last_graph_qvalue_inference_stats['effective_batch_size']
+            provider.deployment_edges_scored = getattr(provider, 'deployment_edges_scored', 0) + clipping[0]
+            provider.deployment_edges_clipped = getattr(provider, 'deployment_edges_clipped', 0) + clipping[1]
             for edge, correction_value in zip(
                 provider_edges, correction_values
             ):
