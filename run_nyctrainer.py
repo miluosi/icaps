@@ -88,7 +88,7 @@ def parse_args(argv=None):
         "--aev-charging-center-count",
         type=int,
         choices=(0, 3, 4, 5),
-        default=0,
+        default=3,
         help=(
             "AEV-only Manhattan charging-center scenario. 0 keeps legacy "
             "public-station access; 3/4/5 selects the workbook-derived centers."
