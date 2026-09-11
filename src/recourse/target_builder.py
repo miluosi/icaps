@@ -461,6 +461,13 @@ class RecourseTargetBuilder:
             )
         for key, count in resource_counts.items():
             if count > resource_capacities[key]:
+                if getattr(graph, 'allow_charging_queue', False) and (
+                    key[0] in {'station', 'station_session'}
+                    or key[0].startswith('station_arrival:')
+                ):
+                    # Forecast/admission quotas are not a physical queue ban.
+                    # NYC start_charging enqueues arrivals when all plugs are busy.
+                    continue
                 vehicles = [
                     edge.vehicle_id
                     for edge in selected

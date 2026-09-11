@@ -37,7 +37,7 @@ def test_eight_arrivals_at_two_epochs_are_not_four_slot_static_overflow():
     assert sum(edge.edge_id in projected and edge.action_type == ActionType.CHARGE
                for edge in graph.edges) == 8
     # Reproduce the old failure without suppressing the verifier.
-    old_graph = replace(graph, edges=tuple(
+    old_graph = replace(graph, allow_charging_queue=False, edges=tuple(
         replace(edge, resource_type='station') if edge.action_type == ActionType.CHARGE else edge
         for edge in graph.edges))
     with pytest.raises(AssertionError, match='count=8, capacity=4'):
@@ -51,8 +51,10 @@ def test_same_arrival_still_enforces_four_slot_limit():
     selected = StateSnapshotBuilder.selected_edge_ids(graph, assignments)
     RecourseTargetBuilder.verify_feasible(graph, selected)
     all_charge = tuple(edge.edge_id for edge in graph.edges if edge.action_type == ActionType.CHARGE)
+    assert graph.allow_charging_queue
+    RecourseTargetBuilder.verify_feasible(graph, all_charge)
     with pytest.raises(AssertionError, match='count=8, capacity=4'):
-        RecourseTargetBuilder.verify_feasible(graph, all_charge)
+        RecourseTargetBuilder.verify_feasible(replace(graph, allow_charging_queue=False), all_charge)
     projected = RecourseTargetBuilder().project(graph)
     assert sum(edge.edge_id in projected and edge.action_type == ActionType.CHARGE
                for edge in graph.edges) == 4
@@ -69,3 +71,50 @@ def test_arrival_capacity_is_frozen_for_replay_and_includes_completed_background
     env._last_expected_charge_expansion['station_schedules'].clear()
     assert RecourseTargetBuilder().project(graph) == projected
     RecourseTargetBuilder.verify_feasible(graph, projected)
+
+
+def test_queue_permission_does_not_relax_requests_or_one_action_per_vehicle():
+    _, _, _, _, graph = snapshot_case(same_arrival=True)
+    selected = tuple(edge.edge_id for edge in graph.edges if edge.action_type == ActionType.CHARGE)
+    request_graph = replace(graph, edges=tuple(
+        replace(edge, resource_type='request', resource_id=42, resource_capacity=1)
+        if edge.action_type == ActionType.CHARGE else edge for edge in graph.edges))
+    with pytest.raises(AssertionError, match='capacity'):
+        RecourseTargetBuilder.verify_feasible(request_graph, selected)
+    wait = next(edge.edge_id for edge in graph.edges if edge.action_type == ActionType.WAIT)
+    with pytest.raises(AssertionError, match='exactly one'):
+        RecourseTargetBuilder.verify_feasible(graph, (*selected, wait))
+
+
+def test_conservative_snapshot_retains_strict_capacity_check():
+    env, ids, mask, scores, _ = snapshot_case(same_arrival=True)
+    env.conservative_charging = True
+    graph = StateSnapshotBuilder.feasible_graph_from_matrix(
+        env, ids, mask, scores, scores, num_requests=0, num_stations=1,
+        num_zones=0, stage_id=2, solver_backend='ortools',
+    )
+    assert not graph.allow_charging_queue
+    selected = tuple(edge.edge_id for edge in graph.edges if edge.action_type == ActionType.CHARGE)
+    with pytest.raises(AssertionError, match='capacity'):
+        RecourseTargetBuilder.verify_feasible(graph, selected)
+
+
+def test_nyc_full_station_arrival_queues_and_records_wait_penalty():
+    env, ids, _, _, graph = snapshot_case(same_arrival=True)
+    selected = tuple(edge.edge_id for edge in graph.edges if edge.action_type == ActionType.CHARGE)
+    RecourseTargetBuilder.verify_feasible(graph, selected)
+    station = env.charging_manager.stations[100]
+    for vid in ids[:4]:
+        assert station.start_charging(str(vid))
+    env._charging_queue_arrivals = {}
+    env.charging_wait_steps = 0
+    env.charging_wait_penalty_total = 0.
+    for vid in ids[4:]:
+        env.vehicles[vid]['location'] = station.location
+        penalty = env._execute_movement_towards_charging_station(vid, 100)
+        assert penalty == -.5
+    assert station.available_slots == 0
+    assert len(station.current_vehicles) == 4
+    assert station.charging_queue == [str(vid) for vid in ids[4:]]
+    assert env.charging_wait_steps == 4
+    assert env.charging_wait_penalty_total == 2.

@@ -481,6 +481,7 @@ class StateSnapshotBuilder:
             ),
             solver_family=str(getattr(env, "mcmf_solver", "exact") or "exact"),
             solver_strict=bool(getattr(env, "mcmf_strict", True)),
+            allow_charging_queue=(getattr(env, 'conservative_charging', None) is False),
         )
 
     @staticmethod

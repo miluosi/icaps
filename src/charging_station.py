@@ -11,6 +11,7 @@ class ChargingStation:
         self.charging_queue: List[str] = []
         self.charging_queue_notarrived: List[str] = []
         self.available_slots = max_capacity
+        self.log_queue_arrivals = True
         # Relative-epoch schedule populated by the environment when it builds
         # the charge-action matrix.  These diagnostics do not alter the legacy
         # station admission API.
@@ -42,7 +43,7 @@ class ChargingStation:
                 return True
         else:
             # Add to queue if not available
-            if self.add_to_queue(vehicle_id):
+            if self.add_to_queue(vehicle_id) and self.log_queue_arrivals:
                 print(f"Station {self.id} is full. Vehicle {vehicle_id} added to queue.")
         return False
 

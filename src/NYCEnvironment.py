@@ -1317,6 +1317,8 @@ class NYCEnvironment:
         # are exposed only to AEV actions.  A count of zero retains the legacy
         # behaviour in which AEVs use the public stations.
         self.aev_charging_station_ids = self._setup_aev_exclusive_charging_centers()
+        for station in self.charging_manager.stations.values():
+            station.log_queue_arrivals = bool(getattr(self, 'conservative_charging', False))
         self.num_public_charging_stations = len(self.public_charging_station_ids)
         self.num_aev_charging_stations = len(self.aev_charging_station_ids)
         self.station_zone_ids = np.array(

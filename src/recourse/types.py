@@ -426,6 +426,9 @@ class FeasibleGraphSnapshot:
     target_solver_policy: str = "same_as_rollout_exact"
     solver_family: str = "exact"
     solver_strict: bool = True
+    # Execution may queue excess charging arrivals under the non-conservative
+    # NYC policy.  Freeze this with replay; other resources remain strict.
+    allow_charging_queue: bool = False
 
     def with_selected(
         self,
