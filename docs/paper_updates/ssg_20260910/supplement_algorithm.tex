@@ -1,0 +1,56 @@
+\subsection{Certified Reduction Procedure}
+\begin{algorithm}[t]
+\caption{Exact capacity-slack graph reduction (SSG)}
+\label{alg:exact_scaling_appendix}
+\begin{algorithmic}[1]
+\REQUIRE Fixed feasible edges $\mathcal E_K$, scores $\Psi$, capacities $u$;
+real private fallbacks $b^0$ where supplied
+\ENSURE Retained edges, witness identities and scores, forced rows
+\STATE Remove zero-capacity edges; set $\mathcal U\gets\mathcal A$
+\FORALL{vehicles $k$}
+\IF{a real private fallback $b_k^0$ is supplied}
+\STATE $b_k\gets b_k^0$; $\ell_k\gets\Psi_{k,b_k^0}$
+\ELSE
+\STATE $b_k\gets\bot$; $\ell_k\gets-\infty$
+\ENDIF
+\ENDFOR
+\LOOP
+\STATE $\mathcal D\gets\{a\in\mathcal U:|B_a(\ell)|\le u_a\}$
+\IF{$\mathcal D=\varnothing$}
+\STATE \textbf{break}
+\ENDIF
+\STATE Store $\ell^{\mathrm{old}}\gets\ell$
+\FORALL{vehicles $k$ with an incident action in $\mathcal D$}
+\STATE Choose a highest-score incident $a^*\in\mathcal D$,
+breaking ties by the smallest action index
+\IF{$\Psi_{k,a^*}>\ell_k^{\mathrm{old}}$}
+\STATE $b_k\gets a^*$; $\ell_k\gets\Psi_{k,a^*}$
+\ENDIF
+\ENDFOR
+\STATE $\mathcal U\gets\mathcal U\setminus\mathcal D$
+\ENDLOOP
+\STATE $\mathcal K_B\gets\{k:b_k\ne\bot\}$;
+$\mathcal K_F\gets\mathcal K\setminus\mathcal K_B$
+\STATE Retain $E^{\mathrm{red}}$ using \eqref{eq:general_retained_edges}
+\STATE \textbf{return} $(E^{\mathrm{red}},b,\ell,\mathcal K_B,\mathcal K_F)$
+\end{algorithmic}
+\end{algorithm}
+Algorithm~\ref{alg:exact_scaling_appendix} states the logical fixed-point
+rule. Old-baseline ties leave the witness unchanged. The returned
+partition determines the at-most-one versus exactly-one constraints
+in \eqref{eq:full_reduced_vehicle}--\eqref{eq:forced_reduced_vehicle}.
+The zero objective reference for forced rows is not a fallback action.
+
+\paragraph{Accelerated execution and unfolding.}
+Quantize the fixed input once on the common grid. Initialize improving
+degrees, then execute up to four vectorized batches using
+\eqref{eq:incremental_degree_identity}. Test again for a foldable
+batch. If one remains, discard this partial reduction and run the
+monotone-pointer implementation from the original initial witnesses
+and scores to its full fixed point. Otherwise return the batch result.
+Build the reduced flow graph in arrays and solve with total supply
+$n$, adding baseline arcs only for $\mathcal K_B$. Decode selected
+shared actions and use the stored witness for each unmatched baseline
+row; verify individual feasibility, resource loads, and the objective
+offset. Report infeasibility if no complete flow exists.
+

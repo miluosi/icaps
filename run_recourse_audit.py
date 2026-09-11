@@ -143,6 +143,8 @@ def build_env(args, seed, method, *, training):
         if getattr(args, name, None) is not None:
             setattr(settings, name, getattr(args, name))
     env = make_environment(settings, seed)
+    from src.charging_config import phase_charging_model
+    env.conservative_charging = phase_charging_model(args, training=training)
     spec = METHODS[method]
     env.configure_recourse_experiment(
         spec.variant,
@@ -278,6 +280,7 @@ def rollout(
         if done:
             break
     stats = env.get_episode_stats()
+    stats['conservative_charging'] = bool(getattr(env, 'conservative_charging', False))
     stats.update(env.request_lifecycle.metrics())
     stats.update(reward=float(reward), steps=step + 1, elapsed_seconds=time.perf_counter()-started)
     stats['ordinary_aev_service_displacement_fixed_graph'] = episode_ordinary_displacement

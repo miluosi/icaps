@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from src.GurobiOptimizer import GurobiOptimizer
 from src.NYCEnvironment import NYCEnvironment
@@ -67,7 +68,7 @@ def test_expected_arrival_and_completion_use_vehicle_specific_future_epoch():
     assert expected["charging_duration"] == 4
 
 
-def test_legacy_charge_matrix_is_preserved_and_future_epoch_mask_is_added():
+def test_default_charge_matrix_checks_only_arrival_and_retains_physical_duration():
     env = _nyc_expected_environment(current_remaining=2)
 
     charge_matrix = env.generate_vehicle_chargerange([0])
@@ -77,17 +78,52 @@ def test_legacy_charge_matrix_is_preserved_and_future_epoch_mask_is_added():
     assert charge_matrix.tolist() == [[1.0]]
     assert expansion["action_epoch_mask"].shape == (1, 1, 7)
     assert expansion["action_epoch_mask"][0, 0].tolist() == [
-        0, 0, 0, 1, 1, 1, 1
+        0, 0, 0, 1, 0, 0, 0
     ]
+    assert expansion["capacity_scope"] == "arrival"
+    assert expansion["candidate_windows"][(0, 7)]["charging_duration"] == 4
     assert expansion["base_occupancy"][0, :2].tolist() == [1, 1]
 
 
-def test_charge_edge_is_zero_when_background_occupies_any_epoch_in_window():
+def test_default_rejects_current_or_booked_occupancy_at_arrival():
     env = _nyc_expected_environment(current_remaining=5)
 
     assert env.generate_vehicle_chargerange([0]).tolist() == [[0.0]]
 
     env = _nyc_expected_environment(current_remaining=2, inbound=True)
+    env.get_travel_time = lambda origin, destination: 3.0
+    assert env.generate_vehicle_chargerange([0]).tolist() == [[0.0]]
+
+
+def test_later_booking_does_not_block_default_but_blocks_conservative():
+    env = _nyc_expected_environment(current_remaining=2, inbound=True)
+    # Candidate arrives at 3; the committed inbound vehicle starts at 4.
+    assert env.generate_vehicle_chargerange([0]).tolist() == [[1.0]]
+    env.conservative_charging = True
+    assert env.generate_vehicle_chargerange([0]).tolist() == [[0.0]]
+    assert env._last_expected_charge_expansion["capacity_scope"] == "full_window"
+
+
+def test_default_releases_completed_charging_and_bookings_at_arrival():
+    env = _nyc_expected_environment(current_remaining=3)
+    assert env.generate_vehicle_chargerange([0]).tolist() == [[1.0]]
+    env = _nyc_expected_environment(current_remaining=1, inbound=True)
+    env.get_travel_time = lambda origin, destination: {0: 6.0, 2: 2.0}[origin]
+    assert env.generate_vehicle_chargerange([0]).tolist() == [[1.0]]
+
+
+def test_default_does_not_reserve_other_potential_candidates():
+    env = _nyc_expected_environment(current_remaining=2)
+    station = env.charging_manager.stations[7]
+    assert env.generate_vehicle_chargerange([0, 2]).tolist() == [[1.0], [1.0]]
+    intervals = env._last_expected_charge_expansion["station_schedules"][7]["intervals"]
+    assert [item["vehicle_id"] for item in intervals] == [1]
+    assert station.charging_queue_notarrived == []
+
+
+def test_default_includes_committed_already_arrived_queue():
+    env = _nyc_expected_environment(current_remaining=2)
+    env.charging_manager.stations[7].charging_queue = ["2"]
     assert env.generate_vehicle_chargerange([0]).tolist() == [[0.0]]
 
 
@@ -151,7 +187,14 @@ def test_mcmf_capacity_cut_distinguishes_overlapping_candidate_windows():
     assert disabled == [(1, 0)]
 
 
-def test_exact_mcmf_keeps_legacy_2d_input_but_enforces_future_epoch_capacity():
+@pytest.mark.parametrize("scope,second_arrival,second_action,cuts", [
+    ("full_window", 4, "waiting", 1),
+    ("arrival", 4, "charge_7", 0),
+    ("arrival", 3, "waiting", 1),
+])
+def test_exact_mcmf_enforces_active_capacity_scope(
+    scope, second_arrival, second_action, cuts,
+):
     station = SimpleNamespace(
         id=7,
         max_capacity=1,
@@ -166,8 +209,8 @@ def test_exact_mcmf_keeps_legacy_2d_input_but_enforces_future_epoch_capacity():
         charging_manager=SimpleNamespace(stations={7: station}),
         station_queue_capacity=0,
         reserve_inbound_charging_capacity=False,
-        mcmf_solver="primal_dual",
-        mcmf_backend="primal_dual",
+        mcmf_solver="ortools",
+        mcmf_backend="ortools",
         mcmf_strict=True,
         mcmf_cost_scale=10_000,
         mcmf_graph_reduction=True,
@@ -180,11 +223,12 @@ def test_exact_mcmf_keeps_legacy_2d_input_but_enforces_future_epoch_capacity():
         _last_matrix_zone_indices=[],
         _last_matrix_zone_target_ids=[],
         _last_expected_charge_expansion={
+            "capacity_scope": scope,
             "current_time": 0.0,
             "vehicle_ids": (0, 1),
             "candidate_windows": {
                 (0, 7): {"travel_epochs": 3, "charging_duration": 4},
-                (1, 7): {"travel_epochs": 4, "charging_duration": 2},
+                (1, 7): {"travel_epochs": second_arrival, "charging_duration": 2},
             },
             "station_schedules": {
                 7: {"capacity": 1, "occupancy": (0, 0, 0, 0, 0, 0, 0)},
@@ -199,5 +243,5 @@ def test_exact_mcmf_keeps_legacy_2d_input_but_enforces_future_epoch_capacity():
         [0, 1], [], legacy_matrix, q_values
     )
 
-    assert assignments == {0: "charge_7", 1: "waiting"}
-    assert env.expected_charge_capacity_cut_iterations == 1
+    assert assignments == {0: "charge_7", 1: second_action}
+    assert env.expected_charge_capacity_cut_iterations == cuts

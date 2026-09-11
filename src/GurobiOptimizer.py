@@ -9,6 +9,7 @@ import os
 import math
 
 from src.exact_mcmf import build_reduced_problem, solve_exact
+from src.expected_charging import charging_capacity_epochs
 
 
 _GPU_MCMF_KERNELS = None
@@ -405,6 +406,7 @@ class GurobiOptimizer:
         station_ids = tuple(int(item) for item in layout['charge_station_ids'])
         windows = expansion['candidate_windows']
         schedules = expansion['station_schedules']
+        capacity_scope = expansion.get('capacity_scope', 'full_window')
         selected_by_station = {}
 
         for row in range(len(vehicle_ids)):
@@ -443,8 +445,8 @@ class GurobiOptimizer:
                 candidates,
                 key=lambda item: (-item[0], item[1], item[3]),
             ):
-                start = max(0, int(window.get('travel_epochs', 0)))
-                end = start + max(1, int(window.get('charging_duration', 1)))
+                epochs = charging_capacity_epochs(window, capacity_scope)
+                start, end = epochs.start, epochs.stop
                 if len(occupancy) < end:
                     occupancy.extend([0] * (end - len(occupancy)))
                 if capacity <= 0 or any(
@@ -2205,6 +2207,7 @@ class GurobiOptimizer:
         else:
             windows = charge_expansion['candidate_windows']
             schedules = charge_expansion['station_schedules']
+            capacity_scope = charge_expansion.get('capacity_scope', 'full_window')
             for k, station_id in enumerate(scale_charge_station_ids[:num_charging]):
                 station_idx = k + num_requests
                 schedule = schedules.get(int(station_id), {})
@@ -2215,11 +2218,7 @@ class GurobiOptimizer:
                     for vehicle_id in vehicle_ids
                     for window in [windows.get((int(vehicle_id), int(station_id)))]
                     if window
-                    for offset in range(
-                        max(0, int(window.get('travel_epochs', 0))),
-                        max(0, int(window.get('travel_epochs', 0)))
-                        + max(1, int(window.get('charging_duration', 1))),
-                    )
+                    for offset in charging_capacity_epochs(window, capacity_scope)
                 })
                 for offset in covered_epochs:
                     eligible_rows = []
@@ -2227,9 +2226,7 @@ class GurobiOptimizer:
                         window = windows.get((int(vehicle_id), int(station_id)))
                         if not window:
                             continue
-                        start = max(0, int(window.get('travel_epochs', 0)))
-                        end = start + max(1, int(window.get('charging_duration', 1)))
-                        if start <= offset < end:
+                        if offset in charging_capacity_epochs(window, capacity_scope):
                             eligible_rows.append(row)
                     residual_capacity = max(
                         0,

@@ -279,6 +279,7 @@ class ADPTrainer:
             identity["pair_id"] = payload.get("checkpoint_pair_id")
             identity["combined_reward"] = payload.get("combined_reward")
             identity["training_run_id"] = payload.get("training_run_id")
+            identity["conservative_charging"] = bool(payload.get("conservative_charging", False))
         return identity
 
     @classmethod
@@ -410,6 +411,7 @@ class ADPTrainer:
             # 保存完整状态
             save_dict = {
                     'episode': episode,
+                    'conservative_charging': bool(getattr(getattr(value_function, 'env', None), 'conservative_charging', False)),
                     'checkpoint_tag': checkpoint_tag,
                     'training_step': getattr(value_function, 'training_step', 0),
                     'network_state_dict': getattr(value_function.network, 'state_dict', lambda: {})(),

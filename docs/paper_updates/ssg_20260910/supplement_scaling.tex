@@ -1,0 +1,301 @@
+\subsection{Exact Assignment--Flow Equivalence}
+\label{app:proof_flow}
+Let $\mathcal K$ be the current decision vehicles and $\mathcal A$ the
+encoded action resources other than separately supplied private
+fallbacks. Every feasible edge $(k,a)$ has a fixed,
+finite score $\Psi_{k,a}$ and each resource has integer capacity $u_a$.
+An explicitly supplied private outside action $b_k^0$, if present, is
+available only to vehicle $k$ and is distinct from $\mathcal A$.
+Let $\mathcal P$ collect these private resources. Include their edges
+and the feasible edges to $\mathcal A$ in $\mathcal E_K$;
+do not insert an edge when no such physical action is admissible.
+The complete assignment problem is
+\begin{align}
+J_F^\star=\max_z\quad&\sum_{(k,a)\in\mathcal E_K}\Psi_{k,a}z_{k,a}
+\label{eq:appendix_assignment_obj}\\
+\text{s.t.}\quad&\sum_{a:(k,a)\in\mathcal E_K}z_{k,a}=1
+&&\forall k,\label{eq:appendix_assignment_vehicle}\\
+&\sum_{k:(k,a)\in\mathcal E_K}z_{k,a}\le u_a
+&&\forall a\in\mathcal A\cup\mathcal P,\label{eq:appendix_assignment_capacity}\\
+&z_{k,a}\in\{0,1\}&&\forall(k,a)\in\mathcal E_K.
+\label{eq:appendix_assignment_binary}
+\end{align}
+Private resources have capacity one. Energy and pickup restrictions
+are edgewise, and a station edge consumes exactly one resource quota
+under Assumption~\ref{ass:reservation}. There is no additional
+cross-resource selector constraint. Remove zero-capacity edges before
+reduction; clipping a resource capacity to its feasible incidence
+degree also preserves this model.
+
+\begin{proof}[Proof of Theorem~\ref{thm:ilp-mcf}]
+Given a feasible assignment, send one unit from $o$ through each
+vehicle to its chosen action, and then to $d$. Conservation follows
+from the exactly-one constraints and action--sink capacities enforce
+the resource constraints. The flow has value $n=|\mathcal K|$ and
+cost equal to the negative assignment score.
+
+Conversely, a flow of value $n$ saturates all $n$ unit-capacity
+source--vehicle arcs. Conservation and integrality force exactly one
+outgoing action per vehicle; generated edges encode feasibility and
+action--sink capacities enforce the shared limits. Remaining arc flows
+are uniquely determined by these choices, giving a bijection.
+
+The conservation matrix is a directed node--arc incidence matrix and
+is totally unimodular. Unit rows for bounds preserve this property.
+Integer supplies and bounds therefore make every vertex of the
+bounded feasible flow polytope integral. If the LP is feasible, its
+linear objective attains an integral optimum and hence a feasible
+binary assignment. If either model is infeasible, so is the other.
+Private outside actions can ensure feasibility, but their absence does
+not invalidate equivalence or integrality.
+\end{proof}
+
+\subsection{Exact Capacity-Slack Graph Scaling}
+\label{app:proof_additional}
+The following batch rule permits vehicles without a certified outside
+action. It reduces to the all-outside-action formulation when each
+vehicle has an admissible private alternative.
+
+\paragraph{Initialization and deterministic folding.}
+Set $\mathcal U^0=\mathcal A$ and initialize
+$(b_k^0,\ell_k^0)$ from an explicitly supplied real private action.
+Otherwise set $b_k^0=\bot$ and $\ell_k^0=-\infty$. Ordinary encoded
+wait, relocation, and station actions remain in $\mathcal U^0$ until
+certified; a feasible action is not automatically a private fallback.
+The default NYC adapter and ADP-layout benchmark supply no separate
+private fallback: admissible wait and relocation enter $\mathcal A$
+and become witnesses only through certification. The sparse benchmark
+can instead supply explicit private fallback values.
+No arithmetic objective coefficient is formed from $-\infty$.
+At round $r$, compute
+\begin{equation}
+\begin{aligned}
+B_a^r&=\{k:(k,a)\in\mathcal E_K,\ \Psi_{k,a}>\ell_k^r\},\\
+\mathcal D^r&=\{a\in\mathcal U^r:|B_a^r|\le u_a\}.
+\end{aligned}
+\label{eq:batch_fold_sets}
+\end{equation}
+If $\mathcal D^r$ is empty, stop. Otherwise each vehicle considers
+its incident actions in $\mathcal D^r$ and its old witness. Change the
+witness only for a strict score improvement; among equally scoring
+improving actions choose the smallest action index. All capacity tests
+use $\ell^r$, and all actions in $\mathcal D^r$ are removed together.
+This specifies deterministic simultaneous folding, not sequential
+recomputation of the certificate within a batch.
+
+\paragraph{Reduced model with forced rows.}
+At the fixed point define
+\begin{equation}
+\begin{aligned}
+\mathcal K_B&=\{k:b_k\ne\bot\},\qquad
+\mathcal K_F=\mathcal K\setminus\mathcal K_B,\\
+c_k&=\begin{cases}\ell_k,&k\in\mathcal K_B,\\0,&k\in\mathcal K_F.\end{cases}
+\end{aligned}
+\label{eq:baseline_forced_partition}
+\end{equation}
+Retain
+\begin{equation}
+\begin{split}
+E^{\mathrm{red}}=\{(k,a)\in\mathcal E_K:\;&a\in\mathcal U,\\
+&k\in\mathcal K_F\ \text{or}\ \Psi_{k,a}>\ell_k\}.
+\end{split}
+\label{eq:general_retained_edges}
+\end{equation}
+The reduced assignment is
+\begin{align}
+J_{\mathrm{red}}^\star=\max_z\quad&
+\sum_{(k,a)\in E^{\mathrm{red}}}(\Psi_{k,a}-c_k)z_{k,a}
+\label{eq:full_reduced_obj}\\
+\text{s.t.}\quad&\sum_{a:(k,a)\in E^{\mathrm{red}}}z_{k,a}\le1
+&&k\in\mathcal K_B,\label{eq:full_reduced_vehicle}\\
+&\sum_{a:(k,a)\in E^{\mathrm{red}}}z_{k,a}=1
+&&k\in\mathcal K_F,\label{eq:forced_reduced_vehicle}\\
+&\sum_{k:(k,a)\in E^{\mathrm{red}}}z_{k,a}\le u_a
+&&a\in\mathcal U,\label{eq:full_reduced_capacity}\\
+&z_{k,a}\in\{0,1\}&&(k,a)\in E^{\mathrm{red}}.
+\label{eq:full_reduced_binary}
+\end{align}
+An unmatched vehicle in $\mathcal K_B$ executes its stored witness.
+A vehicle in $\mathcal K_F$ must execute a retained real action, even
+if its score is negative. Its $c_k=0$ is an objective reference, not
+a zero-score executable fallback.
+
+\begin{lemma}[Outside-action ownership invariant]
+\label{lem:outside_invariant}
+Baseline scores are nondecreasing. If action $a$ is folded at round
+$r$, then at every later round $s>r$,
+\begin{equation}
+\{k:b_k^s=a\}\subseteq B_a^r,\qquad
+|\{k:b_k^s=a\}|\le u_a.
+\label{eq:outside_owners}
+\end{equation}
+All stored non-null witnesses, and any subset of them, are jointly
+capacity-feasible and use no surviving shared resource.
+\end{lemma}
+\begin{proof}
+Strict improvement makes each baseline nondecreasing, including
+transitions from $-\infty$. A new owner of $a$ must belong to
+$B_a^r$, whose size is at most $u_a$. After that batch $a$ is never
+considered again; an owner can keep $a$ or switch away, but no new
+owner can acquire it. Initially the supplied private witnesses are
+mutually nonconflicting; null markers consume nothing. At later
+rounds, each folded resource obeys the ownership bound, private
+witnesses remain unique, and each vehicle owns at most one witness.
+Deleting witness assignments can only reduce these resource loads.
+\end{proof}
+
+\begin{lemma}[Domination and forced-row retention]
+\label{lem:folded_domination}
+A vehicle's final baseline dominates every available initial private
+score and every incident folded resource. A surviving nonretained
+edge has score at most that vehicle's finite final baseline. Every
+vehicle in $\mathcal K_F$ retains all its feasible incident edges.
+\end{lemma}
+\begin{proof}
+Each folding update takes the maximum of the old baseline and all
+incident folded scores, after which the baseline cannot decrease.
+A finite-score folded edge incident to a vehicle with baseline
+$-\infty$ necessarily gives it a witness. Such a vehicle cannot belong
+to $\mathcal K_F$ at termination. Nor is any edge of $\mathcal K_F$
+removed by dominance. For other surviving discarded edges the
+inequality follows from the retention test.
+\end{proof}
+
+\begin{proof}[Proof of Theorem~\ref{thm:exact_scaling}]
+Every nonterminal batch removes a resource, so at most $|\mathcal A|$
+batches occur. Lift a feasible reduced solution by keeping its chosen
+shared edges and assigning the stored witness to each unmatched
+vehicle in $\mathcal K_B$. Forced rows already have exactly one
+action. Shared choices satisfy the capacities of $\mathcal U$;
+witnesses use only disjoint removed or private resources and satisfy
+Lemma~\ref{lem:outside_invariant}. The lifted assignment is feasible
+and has score
+\begin{equation}
+\sum_{k\in\mathcal K_B}\ell_k+
+\sum_{(k,a)\in E^{\mathrm{red}}}(\Psi_{k,a}-c_k)z_{k,a}.
+\label{eq:unfolded_score_identity}
+\end{equation}
+For an optimum this gives
+\begin{equation}
+J_F^\star\ge\sum_{k\in\mathcal K_B}\ell_k+J_{\mathrm{red}}^\star.
+\label{eq:scaling_lower_direction}
+\end{equation}
+
+Conversely, take any original feasible assignment $\widehat z$ and keep only its
+selected retained edges. Resource loads cannot increase. By
+Lemma~\ref{lem:folded_domination}, no selected edge of a forced row
+is discarded, so all exactly-one constraints on $\mathcal K_F$
+remain satisfied. For every other discarded selection the final
+witness score is at least its old score. Thus the resulting reduced
+solution $z'$ satisfies
+\begin{equation}
+\begin{split}
+J_F(\widehat z)&\le\sum_{k\in\mathcal K_B}\ell_k+
+\sum_{(k,a)\in E^{\mathrm{red}}}(\Psi_{k,a}-c_k)z'_{k,a}\\
+&\le\sum_{k\in\mathcal K_B}\ell_k+J_{\mathrm{red}}^\star.
+\end{split}
+\label{eq:scaling_upper_direction}
+\end{equation}
+The two constructions establish feasibility in both directions,
+including simultaneous infeasibility. For feasible instances, taking
+the original optimum and combining the inequalities proves the
+identity and optimal unfolding. SSG preserves the optimum value and
+a recoverable optimum, not every feasible assignment or tied optimum.
+\end{proof}
+
+\paragraph{Why strict ties and genuine outside actions matter.}
+Two vehicles with private zero-score alternatives and one shared
+capacity-one action of score zero have improving degree zero at that
+action. Replacing both old witnesses on a tie would violate its
+capacity. Keeping old witnesses on equality prevents this error.
+Among genuinely improving ties, the smallest action index makes the
+batch and pointer implementations select the same witness.
+
+Feasible charging is weaker than a certified outside option. Consider
+two must-charge vehicles and two reachable capacity-one stations, with
+both vehicles incident to both stations and no admissible wait. A
+complete charging assignment exists, yet each station has two contenders
+and neither can be folded initially. Both vehicles correctly remain
+in $\mathcal K_F$. With only one such station the instance is
+infeasible. A synthetic benchmark that supplies wait to every vehicle
+is an all-outside-action special case; the NYC low-SoC wait mask is not.
+
+\paragraph{Equivalence of accelerated preprocessing.}
+The implementation initializes improving degrees $g_a^r=|B_a^r|$
+and decrements them when edges become dominated. For each action
+surviving the next batch, let $\Delta_a^r$ contain its incident
+vehicles satisfying $\ell_k^r<\Psi_{k,a}\le\ell_k^{r+1}$. Then
+\begin{equation}
+g_a^{r+1}=g_a^r-|\Delta_a^r|.
+\label{eq:incremental_degree_identity}
+\end{equation}
+Monotonicity makes this exactly the recomputed degree. Batchwise row
+maxima and minimum-index tie selection reproduce the logical folding
+rule. Values above the largest updated baseline cannot be dominated;
+skipping their row tests is a valid bound, not candidate pruning.
+
+At most four vectorized batches are attempted. If a fifth foldable
+batch exists, the implementation \emph{restarts} the monotone-pointer
+routine from the original initial state and returns its complete
+fixed point. It neither stops after four mathematical rounds nor
+continues from a partially transferred fourth-round state. The pointer
+routine sorts each row by score and action index, processes batch
+actions in increasing index order, and crosses each newly dominated
+edge at most once. The same certificates, strict updates, and tie
+rule therefore yield the same final witnesses, baselines, surviving
+resources, and logical round count. Preallocated arc arrays and lazy
+metadata change storage and decoding cost, not the retained network.
+
+\paragraph{Graph size, preprocessing, and solver cost.}
+Let $m=|\mathcal A|$ and let $e$ count feasible edges to $\mathcal A$
+after zero-capacity removal; $d_k$ is vehicle $k$'s degree in this
+edge set. The at most $n$ separate private edges contribute $O(n)$.
+The full and reduced networks have $O(n+m)$ vertices and
+$O(e+n+m)$ arcs. The current dense-input implementation has
+preprocessing time
+\begin{equation}
+\begin{split}
+O\!\left(nm+\sum_k d_k\log(1+d_k)+e+n\right.\\
+\left.{}+m\log(1+m)\right)
+\end{split}
+\label{eq:ssg_preprocessing_bound}
+\end{equation}
+and space $O(nm+e+n+m)$. Dense validation, quantization, and candidate
+extraction cost $O(nm)$. A constant number of vectorized batches
+costs $O(e+n+m)$. On a deep cascade, row sorting costs
+$O(\sum_k d_k\log(1+d_k))$; incident-edge visits and monotone-pointer
+updates cost $O(e+n+m)$, and sorting disjoint batches costs at most
+$O(m\log(1+m))$. Restarting after four batches preserves this bound.
+The dense score and integer matrices remain allocated: this is not
+an $O(e)$ end-to-end implementation. Reconstruction is $O(n)$ after
+selected edges are identified.
+
+The solver receives $n$ units of supply. It adds a direct vehicle--sink
+baseline arc only for $k\in\mathcal K_B$; all other rows must route
+their unit through a real retained resource. Hence no private dummy
+may be added for $\mathcal K_F$. OR-Tools
+\texttt{SimpleMinCostFlow}, used in the measurements, implements
+cost-scaling push--relabel. With $N_f$ flow nodes, $A_f$ arcs and
+maximum absolute integer cost $C_{\max}$, its documented bound is
+$O(N_f^2 A_f\log(N_f\max\{1,C_{\max}\}))$.\footnote{OR-Tools 9.14
+implementation: \url{https://github.com/google/or-tools/blob/v9.14/ortools/graph/min_cost_flow.h}.}
+For comparison, a successive-shortest-path solver initialized on the
+layered acyclic graph with potentials and a binary heap admits
+$O(n(e+n+m)\log(n+m))$; this is a separate algorithmic bound, not
+the measured OR-Tools implementation. SSG can precede either backend
+or a continuous network LP solver such as CPLEX. No strict graph-size
+or runtime improvement is guaranteed. End-to-end assignment timing
+must include quantization, reduction, graph construction, backend
+model creation, optimization, decoding, and per-solve feasibility and
+objective verification. Cross-method comparisons and archive writing
+are outside this timing scope.
+
+\paragraph{Scope and physical action identity.}
+A folded station action retains its station, arrival, service window,
+and executable identity. Scores and capacities stay fixed throughout
+folding; recomputing GAT embeddings after node deletion would change
+the optimized instance. Rerun reduction when state, scores, or
+capacities change. The theorem is exact for the encoded independent
+resource quotas. It does not certify an outer heuristic that deletes
+time-conflicting charging edges, a general interval-scheduling model,
+Top-$K$ candidate truncation, or optimality of additive learned values.

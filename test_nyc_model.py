@@ -39,6 +39,7 @@ from src.recourse.config import (
     resolve_method_list_arguments,
 )
 from run_nyctrainer import run_nyc_training
+from src.charging_config import add_conservative_charging_argument, charging_checkpoint_suffix
 
 
 # Public argparse index.  Testing intentionally exposes the exact same seven
@@ -69,6 +70,8 @@ STRATEGIES = [
 ]
 
 PRESERVED_OUTPUT_COLUMNS = {
+    "conservative_charging",
+    "checkpoint_conservative_charging",
     "avg_wait",
     "waiting_vehicle_count",
     "mean_waiting_vehicle_count",
@@ -95,6 +98,9 @@ def _json_dumps(value) -> str:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate trained Q-network checkpoints across ILP, MCMF, and heuristic backends")
+    add_conservative_charging_argument(parser, default=None)
+    parser.add_argument('--checkpoint-conservative-charging', action=argparse.BooleanOptionalAction,
+                        default=False, help='Select the auto-namespaced conservative training checkpoints; independent of the test charging-model override')
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
     add_method_list_arguments(parser, method_choices=NYC_TEST_METHODS)
@@ -642,6 +648,7 @@ def main(argv=None):
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     zone_distribution_mode = normalize_distribution_mode(args.distribution_mode)
+    args.checkpoint_suffix = charging_checkpoint_suffix(args.checkpoint_suffix, args.checkpoint_conservative_charging)
     if args.aev_charging_center_count:
         args.checkpoint_suffix = "_".join(
             part for part in (
@@ -680,6 +687,8 @@ def main(argv=None):
     ifload_bestloss = checkpoint_selection == "best_loss"
     print("=" * 80)
     print("Model Evaluation")
+    print(f"   Checkpoint charging namespace: {'conservative' if args.checkpoint_conservative_charging else 'current'}")
+    print(f"   Test charging model: {'inherit checkpoint (selected training namespace for pure baselines)' if args.conservative_charging is None else ('conservative' if args.conservative_charging else 'current')}")
     print(f"   Strategies: {[s['name'] for s in selected_strategies]}")
     print(f"   ICAPS methods: {args.methods}")
     print(f"   Seeds: {args.seeds}")
@@ -874,6 +883,8 @@ def main(argv=None):
                     post_demand_q_weight=args.post_demand_q_weight,
                     post_demand_head_lr_multiplier=args.post_demand_head_lr_multiplier,
                     masac_target_entropy_ratio=args.masac_target_entropy_ratio,
+                    conservative_charging=(args.conservative_charging if strat['load_ckpt'] or args.conservative_charging is not None
+                                           else args.checkpoint_conservative_charging),
                 )
 
                 rewards = results.get("episode_rewards", [])
@@ -1028,6 +1039,9 @@ def main(argv=None):
                     peak_completed_orders = 0
 
                 entry = {
+                    "conservative_charging": bool(env.conservative_charging),
+                    "checkpoint_conservative_charging": env.checkpoint_conservative_charging,
+                    "charging_model_source": env.charging_model_source,
                     "strategy": strat["name"],
                     "method": method,
                     "seed": seed,
@@ -1136,6 +1150,11 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     demand_tag = "_fulldemand" if args.full_demand else ""
     distribution_tag = f"_{zone_distribution_mode}{demand_tag}"
+    if args.checkpoint_conservative_charging or args.conservative_charging is not None:
+        trained_label = 'conservative' if args.checkpoint_conservative_charging else 'current'
+        test_label = ('inherit' if args.conservative_charging is None else
+                      'conservative' if args.conservative_charging else 'current')
+        distribution_tag += f"_traincharge-{trained_label}_testcharge-{test_label}"
     out_path = out_dir / f"test_results_4way{distribution_tag}.npy"
     np.save(out_path, all_results)
     print(f"\n✓ Raw results saved to {out_path}")
@@ -1414,6 +1433,8 @@ def main(argv=None):
             peak_completed_hour = None
             peak_completed_orders = 0.0
         summary_rows.append({
+            "conservative_charging": subset[0]["conservative_charging"],
+            "checkpoint_conservative_charging": subset[0]["checkpoint_conservative_charging"],
             "strategy": s,
             "method": m,
             "mean_reward": np.mean(rews),

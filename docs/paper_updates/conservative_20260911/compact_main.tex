@@ -1,0 +1,42 @@
+\paragraph{Arrival-indexed charging capacity.}
+Let $\mathcal O_{c,t}$ contain candidate arrival offsets. Integer quotas
+$\bar K_{c,t+o}$ reserve full service windows after deducting existing
+commitments exactly once; unlisted groups have zero quota.
+
+\begin{assumption}[Reservation-compatible resource groups]
+\label{ass:reservation}
+Each feasible charging edge consumes one unit of a preallocated
+station--arrival quota. Every quota-feasible selection admits jointly
+feasible physical reservations over the full service durations.
+\end{assumption}
+
+Under Assumption~\ref{ass:reservation}, charging assignments satisfy
+\begin{equation}
+\sum_{\substack{k\in\mathcal V_t^{\mathrm{AEV}}:\Delta_{k,c}=o}}
+ y_{k,c,t}\le \bar K_{c,t+o},
+\quad c\in\mathcal C,\ o\in\mathcal O_{c,t}.
+\label{eq:station-cap}
+\end{equation}
+\paragraph{Conservative charging admission.}
+Before assignment, a virtual calendar inserts all current potential
+arrivals in arrival order around existing charging and committed inbound
+reservations. For a candidate arriving at $a_{k,c,t}=t+\Delta_{k,c}$
+with duration $h_{k,c,t}$, let $\sigma_{k,c,t}$ be its earliest feasible
+virtual start. Among otherwise-feasible edges, retain only
+\begin{equation}
+y_{k,c,t}\le\chi_{k,c,t},\qquad
+\chi_{k,c,t}=\mathbf1\{\sigma_{k,c,t}=a_{k,c,t}\}.
+\label{eq:conservative_mask}
+\end{equation}
+\begin{proposition}[Queue-free conservative admission]
+\label{prop:conservative_queue_safety}
+With nonoverlapping existing reservations and deterministic execution
+of the calendar, releasing completed service before simultaneous arrivals,
+every assignment satisfying~\eqref{eq:conservative_mask} starts each
+selected charging action on arrival without delaying any prior reservation.
+\end{proposition}
+The proof is in Appendix~\ref{app:conservative_admission}.
+This sufficient rule can exclude feasible assignments. It only removes
+edges before optimization, preserving flow and SSG exactness for the
+resulting fixed assignment model.
+

@@ -1,0 +1,107 @@
+\subsection{Exact Network-Flow Reformulation}
+\label{sec:flow_reformulation}
+Fix a stage, state, candidate edges, capacities, and scores; suppress
+stage and time indices. Let $\mathcal K$ be the decision vehicles and
+$n=|\mathcal K|$. Construct a layered graph
+$\mathcal G^F=(\mathcal N^F,\mathcal E^F)$ with source $o$, one node
+$v_k$ per decision vehicle, action-resource nodes, and sink $d$.
+Requests have capacity one. Each station--arrival group $(c,o')$ has
+its own node with quota $K_{c,t+o'}$, under
+Assumption~\ref{ass:reservation}. Relocation has capacity $n$ unless
+a zone limit is specified. A private null/wait edge is included only
+when physically admissible.
+
+Source--vehicle and feasible vehicle--action arcs have capacity one;
+action--sink arcs have capacities $u_a$. Only vehicle--action arcs have
+nonzero costs $\kappa_{v_k,a}=-\Psi_{k,a}$. With supplies $b_o=n$,
+$b_d=-n$ and zero elsewhere, solve
+\begin{align}
+\min_{f\ge0}\quad&\sum_{e\in\mathcal E^F}\kappa_e f_e
+\label{eq:flow_objective}\\
+\text{s.t.}\quad&\sum_{e\in\delta^+(u)}f_e
+-\sum_{e\in\delta^-(u)}f_e=b_u,
+&&\forall u,\label{eq:flow_balance}\\
+&f_e\le u_e,&&\forall e\in\mathcal E^F.
+\label{eq:flow_capacity}
+\end{align}
+Here $\delta^+(u)$ and $\delta^-(u)$ are outgoing and incoming arcs.
+
+\begin{thm}[Exact fixed-score action optimization]
+\label{thm:ilp-mcf}
+With fixed scores, edgewise feasibility, integer capacities, and no
+additional cross-resource constraints, integral flows of value $n$
+correspond bijectively to complete feasible assignments with opposite
+objective values. If feasible, the flow LP has an integral optimum;
+otherwise both formulations are infeasible.
+\end{thm}
+
+Conservation enforces one action per vehicle, and total unimodularity
+gives integrality. A feasible private outside action for every vehicle
+guarantees feasibility but is not required for this equivalence
+(Appendix~\ref{app:proof_flow}). The guarantee concerns the fixed
+assignment instance, not unrestricted overlapping service windows or
+optimality of the learned policy.
+
+\subsection{Exact Graph Reduction and Complexity}
+\label{sec:exact_scaling}
+SSG uses capacity-slack and domination certificates, motivated by
+exact reductions for weighted $b$-matching
+\citep{grossmann2026engineering}. An explicitly supplied real private
+outside action initializes $(b_k,\ell_k)$; otherwise initialize
+$b_k=\bot$, $\ell_k=-\infty$. The symbol $\bot$ is not an executable
+action. For each surviving resource $a$, define
+\begin{equation}
+B_a(\ell)=\{k:(v_k,a)\in\mathcal E^F,\ \Psi_{k,a}>\ell_k\}.
+\label{eq:positive_degree}
+\end{equation}
+Fold all resources satisfying $|B_a(\ell)|\le u_a$ in one batch.
+Each vehicle adopts its highest-score incident folded action only
+under strict improvement; equal-score improvements use the smallest
+action index, and ties with the old baseline retain its identity.
+Repeat to a fixed point without recomputing scores or capacities.
+
+At termination let $\mathcal K_B=\{k:b_k\ne\bot\}$ and
+$\mathcal K_F=\mathcal K\setminus\mathcal K_B$. Set $c_k=\ell_k$
+on $\mathcal K_B$ and $c_k=0$ on $\mathcal K_F$. Retain surviving
+shared edges that improve $\ell_k$, and all surviving edges of
+$\mathcal K_F$. The reduced objective is
+\begin{equation}
+J_{\mathrm{red}}^\star=
+\max_z\sum_{(k,a)\in E^{\mathrm{red}}}(\Psi_{k,a}-c_k)z_{k,a}.
+\label{eq:reduced_objective}
+\end{equation}
+Keep shared capacities. Vehicles in $\mathcal K_B$ select at most one
+retained edge and otherwise execute $b_k$; vehicles in $\mathcal K_F$
+must select exactly one. A reachable charging option alone does not
+provide a capacity-certified outside action.
+
+\begin{thm}[Exact capacity-slack scaling]
+\label{thm:exact_scaling}
+Under Theorem~\ref{thm:ilp-mcf}'s assumptions, SSG terminates and
+preserves feasibility. Whenever feasible,
+\begin{equation}
+J_F^\star=\sum_{k\in\mathcal K_B}\ell_k+J_{\mathrm{red}}^\star.
+\label{eq:exact_scaling_identity}
+\end{equation}
+Every reduced optimum unfolds to an optimum of the original fixed
+assignment instance.
+\end{thm}
+
+A folded resource has at most $u_a$ witness owners; strict updates can
+only remove these owners later. Vehicles without a witness remain in
+the shared core. The proof and deterministic pseudocode are in
+Appendices~\ref{app:proof_additional} and
+\ref{app:algorithm_details}. In the implementation, a fixed raw score
+$Q_{k,a}$ becomes $\Psi_{k,a}=\operatorname{round}(LQ_{k,a})/L$
+with $L=10^4$. All comparisons use these scores; integer backends
+multiply them by $L$. Their relation to unrounded scores is
+separate (Proposition~\ref{prop:integer_cost_scaling}).
+
+For $n$ vehicles, $m$ encoded actions, and $e$ feasible edges, the graph
+uses $O(n+m)$ nodes and $O(e+n+m)$ arcs. Dense input handling costs
+$O(nm)$; the full preprocessing bound is in the appendix.
+A vectorized fast path and an exact monotone-pointer routine compute
+the same fixed point. SSG is solver-independent; the measured MCMF
+backend is OR-Tools cost-scaling.
+Net speedup depends on removable structure and includes preprocessing;
+neither strict graph shrinkage nor faster runtime is guaranteed.

@@ -1,9 +1,8 @@
 """Deterministic charging-station occupancy helpers.
 
-The action matrix uses discrete simulator epochs.  A charging action is
-feasible only when one physical plug is free for the candidate's complete
-arrival-to-completion interval; waiting-room capacity is deliberately not a
-substitute for a charging window.
+The action matrix uses discrete simulator epochs.  NYC's default admission
+checks committed occupancy at arrival; conservative admission checks a full
+charging window.  Waiting-room capacity is not physical charging capacity.
 """
 
 from __future__ import annotations
@@ -129,12 +128,14 @@ def build_charge_action_epoch_expansion(
     feasibility,
     station_schedules: Mapping,
     candidate_windows: Mapping,
+    capacity_scope: str = "full_window",
 ) -> dict:
     """Expand the legacy 2-D charge matrix into per-epoch resource masks.
 
     The returned tensor does not replace the public vehicle-by-station matrix.
-    It records which future station epochs each feasible legacy edge consumes,
-    so optimizers can impose capacity at the candidate-specific arrival time.
+    It records the epochs constrained by the admission policy.  ``arrival``
+    uses only the arrival epoch; ``full_window`` uses the charging interval.
+    Candidate windows always retain the physical charging duration.
     """
 
     vehicle_ids = tuple(int(vehicle_id) for vehicle_id in vehicle_ids)
@@ -172,12 +173,12 @@ def build_charge_action_epoch_expansion(
             window = candidate_windows.get((vehicle_id, station_id))
             if not window:
                 continue
-            start = epoch_offset(window.get("travel_epochs", 0))
-            end = start + max(1, epoch_offset(window.get("charging_duration", 1)))
-            action_epoch_mask[vehicle_row, station_col, start:end] = 1
+            epochs = charging_capacity_epochs(window, capacity_scope)
+            action_epoch_mask[vehicle_row, station_col, epochs.start:epochs.stop] = 1
 
     return {
         "vehicle_ids": vehicle_ids,
+        "capacity_scope": capacity_scope,
         "station_ids": station_ids,
         "horizon": int(horizon),
         "epoch_offsets": tuple(range(horizon)),
@@ -187,3 +188,13 @@ def build_charge_action_epoch_expansion(
         "candidate_windows": dict(candidate_windows),
         "station_schedules": dict(station_schedules),
     }
+
+
+def charging_capacity_epochs(window: Mapping, capacity_scope: str) -> range:
+    """Epochs charged to an admission quota, independent of physical duration."""
+    if capacity_scope not in {"arrival", "full_window"}:
+        raise ValueError(f"Unknown charging capacity scope: {capacity_scope}")
+    start = epoch_offset(window.get("travel_epochs", 0))
+    duration = (1 if capacity_scope == "arrival" else
+                max(1, epoch_offset(window.get("charging_duration", 1))))
+    return range(start, start + duration)

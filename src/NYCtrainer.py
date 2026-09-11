@@ -524,6 +524,7 @@ class NYCTrainer:
         only_manhattan_zones: bool = False,
         aev_charging_center_count: int = 0,
         aev_charging_center_csv: str | None = None,
+        conservative_charging: bool = False,
     ):
         self._set_random_seeds(random_seed)
         parquet_paths = self._resolve_parquet_paths(
@@ -571,6 +572,7 @@ class NYCTrainer:
             only_manhattan_zones=only_manhattan_zones,
             aev_charging_center_count=aev_charging_center_count,
             aev_charging_center_csv=aev_charging_center_csv,
+            conservative_charging=conservative_charging,
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -871,6 +873,7 @@ class NYCTrainer:
         human_ev_charge_decision_interval_minutes: float = 120.0,
         aev_charging_center_count: int = 0,
         aev_charging_center_csv: str | None = None,
+        conservative_charging: bool | None = False,
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -939,6 +942,7 @@ class NYCTrainer:
             ),
             aev_charging_center_count=aev_charging_center_count,
             aev_charging_center_csv=aev_charging_center_csv,
+            conservative_charging=bool(conservative_charging),
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -1088,6 +1092,8 @@ class NYCTrainer:
 
         training_run_id = uuid.uuid4().hex
         resume_episode_offset = 0
+        from src.charging_config import resolve_charging_model
+        env.conservative_charging, env.checkpoint_conservative_charging, env.charging_model_source = resolve_charging_model(conservative_charging)
         if ifloadcheckpoint:
             checkpoint_assign_tag = self._trainer_helper._resolve_checkpoint_assign_tag(
                 assignmentgurobi,
@@ -1171,6 +1177,9 @@ class NYCTrainer:
                     raise FileNotFoundError(message)
                 print(f"⚠ {message}; continuing with newly initialized network(s).")
             if aev_ckpt:
+                identities = [self._trainer_helper._checkpoint_identity(path)
+                              for path in (ev_ckpt, aev_ckpt) if path]
+                env.conservative_charging, env.checkpoint_conservative_charging, env.charging_model_source = resolve_charging_model(conservative_charging, identities)
                 if not self._trainer_helper.load_checkpoint(
                     value_function, aev_ckpt
                 ):
@@ -1190,6 +1199,8 @@ class NYCTrainer:
                     "checkpoint once"
                 )
 
+        print(f"Charging model: {'conservative' if env.conservative_charging else 'current'} "
+              f"(source={env.charging_model_source}; checkpoint={env.checkpoint_conservative_charging})")
         if effective_zone_distribution_mode == "bayes_simple_pretrain" and value_function is not None:
             self._configure_pretrained_zone_distributors(
                 value_function=value_function,
@@ -1774,6 +1785,8 @@ class NYCTrainer:
             episode_stats["episode_time_sec"] = episode_time
             episode_stats["avg_step_time_sec"] = avg_step_time
             episode_stats["avg_step_time_ms"] = avg_step_time * 1000.0
+            episode_stats["conservative_charging"] = env.conservative_charging
+            episode_stats["checkpoint_conservative_charging"] = env.checkpoint_conservative_charging
             results["episode_detailed_stats"].append(episode_stats)
             results["drop_off_rates"].append(episode_stats.get("drop_off_rate", 0.0))
             results["episode_rejected_requests"].append(episode_stats.get("rejected_requests", 0))
@@ -1850,6 +1863,9 @@ class NYCTrainer:
         )
         results["excel_path"] = excel_path
         results["spatial_image_path"] = spatial_path
+        results["conservative_charging"] = env.conservative_charging
+        results["checkpoint_conservative_charging"] = env.checkpoint_conservative_charging
+        results["charging_model_source"] = env.charging_model_source
 
         results["optimizer_budget"] = {
             "shared_critic": bool(value_function is value_function_ev),

@@ -1,0 +1,38 @@
+\subsection{Conservative Charging Admission}
+\label{app:conservative_admission}
+At each station, fix a nonoverlapping per-plug calendar containing all
+vehicles currently charging and all committed inbound vehicles. Process
+all current potential candidates in increasing $(a_{k,c,t},k)$ order.
+Place each virtual interval
+$[\sigma_{k,c,t},\sigma_{k,c,t}+h_{k,c,t})$ in the earliest complete gap
+at or after $a_{k,c,t}$, following earlier virtual jobs on that plug
+and avoiding fixed reservations. Even
+candidates eventually rejected retain their virtual intervals until
+construction is complete. The mask in~\eqref{eq:conservative_mask}
+applies in addition to the usual reachability and battery checks.
+
+\begin{proof}[Proof of Proposition~\ref{prop:conservative_queue_safety}]
+By construction, the virtual intervals and existing reservations do
+not overlap on any plug. The optimizer selects a subset of the virtual
+candidates; deleting unselected intervals cannot create an overlap.
+For each selected edge, $\sigma_{k,c,t}=a_{k,c,t}$, so its virtual
+interval is exactly its arrival-to-completion interval
+$[a_{k,c,t},a_{k,c,t}+h_{k,c,t})$. It therefore starts charging on
+arrival and leaves every existing reservation unchanged. Only selected
+intervals are added to the real calendar. Starting from a queue-free
+calendar, the same argument applies at subsequent epochs if all later
+charging arrivals obey this rule, selected reservations are honored,
+and releases precede simultaneous arrivals. Hence the queue-free
+property is preserved inductively over feasible decision epochs.
+\end{proof}
+
+\paragraph{Reactive comparison.}
+Reactive admission checks candidates against existing commitments,
+including inbound vehicles, without inserting all current potential
+arrivals into a virtual calendar. These individual checks alone do not
+certify joint interval feasibility; queueing, if any, is handled by the
+simulator. This is an operational comparison, rather than an alternative
+queue-free setting for the proposition. Neither policy reserves capacity
+for unknown charging decisions at future epochs. The conservative rule
+may leave capacity unused because one vehicle can appear in several
+stations' virtual calendars but selects at most one charging action.

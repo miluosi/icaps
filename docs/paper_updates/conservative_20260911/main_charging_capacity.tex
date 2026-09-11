@@ -1,0 +1,25 @@
+\paragraph{Arrival-indexed charging capacity.}
+Let $\mathcal O_{c,t}$ contain candidate arrival offsets. Integer quotas
+$K_{c,t+o}$ reserve full service windows after deducting existing
+commitments exactly once; unlisted groups have zero quota.
+
+\begin{assumption}[Reservation-compatible resource groups]
+\label{ass:reservation}
+Each feasible charging edge consumes one unit of a preallocated
+station--arrival quota. Every quota-feasible selection admits jointly
+feasible physical reservations over the full service durations.
+\end{assumption}
+
+Under Assumption~\ref{ass:reservation}, charging assignments satisfy
+\begin{equation}
+\sum_{\substack{k\in\mathcal V_t^{\mathrm{AEV}}:\Delta_{k,c}=o}}
+ y_{k,c,t}\le K_{c,t+o},
+\quad c\in\mathcal C,\ o\in\mathcal O_{c,t}.
+\label{eq:station-cap}
+\end{equation}
+An optional conservative model virtually schedules all potential
+arrivals around current charging and committed inbound reservations,
+retaining only immediate starts. Proposition~\ref{prop:conservative_queue_safety}
+proves no-queue invariance under deterministic, calendar-consistent
+transitions; this admission rule may exclude other queue-free actions.
+

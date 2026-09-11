@@ -206,6 +206,7 @@ class NYCEnvironment:
         demand_scale: float = 1.0,
         aev_charging_center_count: int = 0,
         aev_charging_center_csv: str | None = None,
+        conservative_charging: bool = False,
     ):
         # --- base directory of data files ---
         _base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "nyedata", "nye_simulation")
@@ -284,6 +285,7 @@ class NYCEnvironment:
         self.ev_num_vehicles = ev_num_vehicles if ev_num_vehicles is not None else num_vehicles // 2
         self.num_stations = num_stations
         self.charge_wait_bool = bool(charge_wait_bool)
+        self.conservative_charging = bool(conservative_charging)
         self.human_ev_charge_decision_interval_minutes = float(
             human_ev_charge_decision_interval_minutes
         )
@@ -6607,6 +6609,11 @@ class NYCEnvironment:
         return mat
 
     def generate_vehicle_chargerange(self, vehicle_ids):
+        self._last_conservative_charge = None
+        capacity_scope = (
+            'full_window' if getattr(self, 'conservative_charging', False)
+            else 'arrival'
+        )
         station_sets = [
             set(self._charging_station_ids_for_vehicle(int(vehicle_id)))
             for vehicle_id in vehicle_ids
@@ -6620,6 +6627,7 @@ class NYCEnvironment:
                 feasibility=mat,
                 station_schedules={},
                 candidate_windows={},
+                capacity_scope=capacity_scope,
             )
             self._last_expected_charge_expansion['current_time'] = float(
                 getattr(self, 'current_time', 0.0)
@@ -6668,12 +6676,25 @@ class NYCEnvironment:
                     keep_local = feasible_idx[np.argpartition(charge_dists[row_idx, feasible_idx], charge_top_k - 1)[:charge_top_k]]
                     mat[row_idx, :] = 0.0
                     mat[row_idx, keep_local] = 1.0
+        self._last_conservative_charge = None
+        if bool(getattr(self, 'conservative_charging', False)):
+            from src.conservative_charging import conservative_charge_mask
+
+            self._last_conservative_charge = conservative_charge_mask(
+                vehicle_ids=vehicle_ids,
+                station_ids=stations,
+                feasibility=mat,
+                candidate_windows=expected_windows,
+                station_schedules=expected_schedules,
+            )
+            mat = self._last_conservative_charge['feasibility'].astype(np.float32)
         self._last_expected_charge_expansion = build_charge_action_epoch_expansion(
             vehicle_ids=vehicle_ids,
             station_ids=stations,
             feasibility=mat,
             station_schedules=expected_schedules,
             candidate_windows=expected_windows,
+            capacity_scope=capacity_scope,
         )
         self._last_expected_charge_expansion['current_time'] = float(
             getattr(self, 'current_time', 0.0)
@@ -6686,11 +6707,12 @@ class NYCEnvironment:
         rebalance_num=0,
         charge_feasibility=None,
     ):
-        """Gate low-SOC AEV wait actions using expected charging windows.
+        """Gate low-SOC AEV wait actions using the active charging policy.
 
         An AEV at or below ``min_battery_level`` cannot wait when at least one
-        reachable station has a complete free arrival-to-completion window.
-        EVs, higher-SOC AEVs, and low-SOC AEVs without such a window retain
+        reachable station admits charging (a free slot at arrival by default,
+        or a conservative full window when enabled).
+        EVs, higher-SOC AEVs, and low-SOC AEVs without such an action retain
         the wait/outside action.  ``charge_wait_bool=False`` disables the gate.
         """
         del rebalance_num
@@ -7685,7 +7707,11 @@ class NYCEnvironment:
         *,
         base_schedule=None,
     ):
-        """Update station diagnostics and test the candidate's full window."""
+        """Check committed occupancy at arrival, or the conservative full window.
+
+        Other unassigned candidates are not inserted into this background.
+        Already arrived queue entries are committed jobs as well.
+        """
 
         expected = self.calculate_expected_entercharge_station_time_battery(
             vehicle_id, station_id
@@ -7696,7 +7722,9 @@ class NYCEnvironment:
         feasible = bool(expected is not None and has_complete_charging_window(
             schedule,
             arrival_offset=expected['travel_epochs'],
-            charging_duration=expected['charging_duration'],
+            charging_duration=(expected['charging_duration']
+                               if getattr(self, 'conservative_charging', False)
+                               else 1),
         ))
 
         station = self.charging_manager.stations[station_id]

@@ -34,6 +34,7 @@ from src.recourse.config import (
     canonical_method,
 )
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.charging_config import add_conservative_charging_argument
 from summarize_recourse_day import LABELS, build_report
 
 ROOT = Path(__file__).resolve().parent
@@ -125,6 +126,10 @@ def engine_arguments(args):
             command += ['--' + name.replace('_', '-'), str(value)]
     if getattr(args, 'resume', False):
         command += ['--resume']
+    for name in ('conservative_charging', 'test_conservative_charging'):
+        value = getattr(args, name, None)
+        if value is not None:
+            command += ['--' + ('' if value else 'no-') + name.replace('_', '-')]
     return command
 
 
@@ -215,6 +220,8 @@ def parse_args(argv=None, *, input_fn=None):
     for action, help_text in (('train-only', 'Train one day, save checkpoints, and STOP (no evaluation)'),
                               ('train-test', 'Train one day and test a separate full day')):
         train = commands.add_parser(action, help=help_text)
+        add_conservative_charging_argument(train)
+        add_conservative_charging_argument(train, default=None, test=True)
         train.add_argument('--models', '--methods', '--train-models', '--r', nargs='+', default=['all'],
                            type=normalize_method_name, choices=['all', *TRAIN_MODELS],
                            help='Training method list; train-test evaluates the same selected methods')
@@ -250,6 +257,7 @@ def parse_args(argv=None, *, input_fn=None):
                                choices=TRAIN_MODELS, help=argparse.SUPPRESS)
 
     test = commands.add_parser('test-only', help='Use existing checkpoints; NEVER fall back to training')
+    add_conservative_charging_argument(test, default=None)
     test.add_argument('--source-dir', required=True, type=Path,
                       help='A run_recourse_day/test_all_nyc_models experiment directory')
     test.add_argument('--output-dir', type=Path, help='New directory; source results are never overwritten')
@@ -300,6 +308,8 @@ def new_output(label):
 def read_manifest(directory):
     manifest = json.loads((directory / 'manifest.json').read_text())
     args = SimpleNamespace(**manifest['arguments'])
+    args.conservative_charging = bool(getattr(args, 'conservative_charging', False))
+    args.test_conservative_charging = getattr(args, 'test_conservative_charging', None)
     args.output_dir = directory.resolve()
     args.parquet_path = Path(args.parquet_path)
     args.methods = method_selection(args.methods)
@@ -339,6 +349,8 @@ def prepare_test_only(args, *, copy_files=True):
             raise ValueError(f'{method}: incomplete or mismatched training statistics')
         payload = engine.torch.load(checkpoint, weights_only=False, map_location='cpu')
         metadata = payload['metadata']
+        if bool(metadata.get('conservative_charging', False)) != settings.conservative_charging:
+            raise ValueError(f'{method}: checkpoint charging model differs from manifest')
         if payload.get('checkpoint_schema_version') != 2:
             raise ValueError(f'{method}: unsupported checkpoint schema')
         expected = dict(method=method, train_date=settings.train_date, test_date=settings.test_date,
@@ -366,6 +378,9 @@ def prepare_test_only(args, *, copy_files=True):
         raise FileExistsError(f'Use a NEW test output directory: {output}')
     settings.methods, settings.output_dir = selected, output
     settings.workers, settings.resume = args.workers, True
+    # Test-only omission always inherits the TRAINED model, even if a previous
+    # evaluation of this source run used a different model.
+    settings.test_conservative_charging = getattr(args, 'conservative_charging', None)
     settings = engine.parse_args(engine_arguments(settings))
     if copy_files:
         output.mkdir(parents=True, exist_ok=False)
@@ -413,6 +428,7 @@ def run_training_worker(settings):
                         **method_metadata(spec.operating_mode, spec.variant),
                         state_variant=getattr(env, 'state_variant', 'joint_state_separate_critics'),
                         learner_variant=getattr(env, 'learner_variant', 'optimization_anchored_residual'),
+                        conservative_charging=bool(getattr(env, 'conservative_charging', False)),
                         solver_config=dict(
                             rollout_solver=getattr(env, 'mcmf_solver', 'exact'),
                             backend=getattr(env, 'mcmf_backend', "ortools"),

@@ -22,10 +22,13 @@ from run_recourse_audit import MAIN_METHODS, ROOT, build_env, build_pair, rollou
 from src.recourse.contracts import assert_method_event_contract, evaluate_method_event_contract
 from src.recourse.config import METHODS, method_metadata
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
+from src.charging_config import add_conservative_charging_argument
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    add_conservative_charging_argument(parser)
+    add_conservative_charging_argument(parser, default=None, test=True)
     parser.add_argument('--methods', nargs='+', choices=MAIN_METHODS, default=MAIN_METHODS)
     parser.add_argument('--train-date', default='2025-12-18')
     parser.add_argument('--test-date', default='2025-12-19')
@@ -211,6 +214,7 @@ def run_worker(args):
                 **method_metadata(spec.operating_mode, spec.variant),
                 state_variant=env.state_variant, learner_variant=env.learner_variant,
                 energy_model=env.energy_model,
+                conservative_charging=bool(getattr(env, 'conservative_charging', False)),
                 samitha_hold_rule=env.samitha_hold_rule,
                 samitha_fixed_hold_fraction=env.samitha_fixed_hold_fraction,
                 solver_config=dict(
@@ -228,6 +232,12 @@ def run_worker(args):
         trained = json.loads(trained_path.read_text())
         env = build_env(args, args.test_seed, method, training=False)
         payload = torch.load(checkpoint, weights_only=False, map_location='cpu')
+        trained_charging = bool(payload.get('metadata', {}).get('conservative_charging', False))
+        if trained_charging != bool(getattr(args, 'conservative_charging', False)):
+            raise ValueError('Checkpoint charging model differs from the training manifest')
+        env.checkpoint_conservative_charging = trained_charging
+        print(f"Charging model: training={'conservative' if trained_charging else 'current'}, "
+              f"test={'conservative' if env.conservative_charging else 'current'}", flush=True)
         validate_checkpoint_payload(payload, method, env)
         pair = build_pair(
             env, replay_buffer_size=5 * args.joint_replay_capacity,
@@ -261,6 +271,7 @@ def run_worker(args):
         if args.event_contract_mode == 'required':
             assert_method_event_contract(method, contract_stats)
         result = dict(training=trained, testing=tested,
+            test_conservative_charging=bool(env.conservative_charging),
             event_contract=contract.as_dict(),
             checkpoint_loaded=True, test_weights_unchanged=True, **payload['metadata'])
         save_json(folder / 'results.json', result)

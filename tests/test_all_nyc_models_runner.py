@@ -151,6 +151,26 @@ def test_test_only_dry_run_does_not_copy(tmp_path, monkeypatch):
     assert not output.exists()
 
 
+@pytest.mark.parametrize('trained,override', [(False, None), (True, None), (True, False), (False, True)])
+def test_test_only_preserves_training_mode_and_independently_overrides_test(tmp_path, monkeypatch, trained, override):
+    source, payloads = source_run(tmp_path, monkeypatch)
+    manifest_path = source / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    manifest['arguments']['conservative_charging'] = trained
+    manifest['arguments']['test_conservative_charging'] = not trained
+    runner.engine.save_json(manifest_path, manifest)
+    payloads['no_repair']['metadata']['conservative_charging'] = trained
+    flags = [] if override is None else ['--conservative-charging' if override else '--no-conservative-charging']
+    args = runner.parse_args(['test-only', '--source-dir', str(source),
+                              '--output-dir', str(tmp_path / 'new-test'), *flags])
+    settings = runner.prepare_test_only(args, copy_files=False)
+    assert settings.conservative_charging is trained
+    assert settings.test_conservative_charging is override
+    from src.charging_config import phase_charging_model
+    assert phase_charging_model(settings, training=False) is (trained if override is None else override)
+    assert not settings.output_dir.exists()
+
+
 def test_test_only_refuses_overwriting_source(tmp_path, monkeypatch):
     source, _ = source_run(tmp_path, monkeypatch)
     args = runner.parse_args(['test-only', '--source-dir', str(source), '--output-dir', str(source)])

@@ -1,0 +1,143 @@
+\subsection{Conservative Admission and the Queue-Free MDP Invariant}
+\label{app:conservative_admission}
+This optional model restricts charging candidates before assignment;
+it is an alternative sufficient construction for
+Assumption~\ref{ass:reservation}, not an exact description of all
+physically feasible charging decisions.
+
+\paragraph{State and reservations.}
+Let $\mathcal C$ contain the stations subject to this admission rule,
+with physical plugs $\mathcal P_c=\{1,\ldots,C_c\}$, $C_c\ge1$.
+At decision time $t$, write the augmented MDP state as
+$S_t=(Z_t,\mathcal R_t)$, where $Z_t$ contains the remaining vehicle,
+request, and decision-phase information. The reservation state
+$\mathcal R_t$ records each outstanding job $r$ by its vehicle,
+station $c_r$, plug $p_r$, arrival $a_r$, and service interval
+$I_r=[b_r,e_r)$, $e_r>b_r$.
+For each plug, define the disjoint job sets
+$\mathcal R^{\rm ch}_{c,p,t}$ (currently charging) and
+$\mathcal R^{\rm in}_{c,p,t}$ (committed but not yet arrived), and
+\begin{equation}
+\begin{aligned}
+\mathcal R_{c,p,t}&=\mathcal R^{\rm ch}_{c,p,t}
+                     \mathbin{\dot\cup}\mathcal R^{\rm in}_{c,p,t},\\
+H_{c,p,t}&=\bigcup_{r\in\mathcal R_{c,p,t}} I_r,\\
+B_{c,t}(\tau)&=\sum_{p\in\mathcal P_c}
+               \sum_{r\in\mathcal R_{c,p,t}}\mathbf1\{\tau\in I_r\}.
+\end{aligned}
+\label{eq:conservative_background}
+\end{equation}
+The calendar is complete and consistent with actual charging: every
+vehicle charging or committed to arrive at a controlled station appears
+exactly once. Let $\mathcal S_0$ be the states with
+empty charging queues, pairwise disjoint reservations on every plug,
+and $b_r=a_r$ for every committed inbound job. All arrival times and
+positive service durations are determined by the state and candidate
+action. Only new decision vehicles generate potential jobs; a committed
+job is not also counted as a new candidate.
+
+\paragraph{Virtual admission calendar.}
+At station $c$, order all physical candidates
+$k_1,\ldots,k_{m_c}$ by $(a_{k,c,t},k)$, where
+$a_{k,c,t}=t+\Delta_{k,c}$ and $h_{k,c,t}>0$ is the full service duration.
+Its immediate-service interval is
+$I_{k,c,t}=[a_{k,c,t},a_{k,c,t}+h_{k,c,t})$.
+Let $f_{k,c,t}\in\{0,1\}$ be the otherwise-applicable edge mask.
+For this station suppress $c,t$ and write $a_i=a_{k_i,c,t}$,
+$h_i=h_{k_i,c,t}$. Set $L_p^0=t$. Recursively define
+\begin{equation}
+\begin{aligned}
+g_{i,p}&=\min\{s\ge\max(a_i,L_p^{i-1}):\\[-2pt]
+&\qquad[s,s+h_i)\cap H_{c,p,t}=\varnothing\},\\
+p_i&=\operatorname*{arg\,min}_{p\in\mathcal P_c}(g_{i,p},p),
+\qquad \sigma_i=g_{i,p_i},\\
+L_p^i&=\begin{cases}\sigma_i+h_i,&p=p_i,\\
+                         L_p^{i-1},&p\ne p_i.
+          \end{cases}
+\end{aligned}
+\label{eq:conservative_virtual_recursion}
+\end{equation}
+The pair in the argmin is ordered lexicographically. All candidates,
+including rejected ones, retain their virtual intervals
+$\widehat I_i=[\sigma_i,\sigma_i+h_i)$ while this calendar is built.
+The conservative mask and charging selectors satisfy
+\begin{equation}
+\begin{aligned}
+\chi_{k_i,c,t}&=f_{k_i,c,t}\mathbf1\{\sigma_i=a_i\},\\
+y_{k,c,t}&\in\{0,1\},\qquad y_{k,c,t}\le\chi_{k,c,t},\\
+\sum_{c\in\mathcal C}y_{k,c,t}&\le1\qquad\forall k.
+\end{aligned}
+\label{eq:conservative_mask}
+\end{equation}
+Write $\mathcal U_{\rm cons}(s)$ for joint actions obeying this mask
+and all other action constraints. Only selected intervals become real
+commitments; unselected virtual jobs are discarded after the solve.
+
+\begin{proposition}[Conservative charging safety]
+\label{prop:conservative_queue_safety}
+For $S_t=s\in\mathcal S_0$, every
+$u\in\mathcal U_{\rm cons}(s)$ admits immediate service for every
+selected charging arrival, without delaying any existing reservation.
+Suppose further that all arrivals to $\mathcal C$ obey this admission
+rule, selected absolute service intervals remain commitments in later
+decisions, and the transition executes those deterministic times,
+releasing completed service before simultaneous arrivals. Then
+\begin{equation}
+\begin{aligned}
+P(\mathcal S_0\mid s,u)&=1\qquad\forall s\in\mathcal S_0,\\
+&\hspace{9mm}\forall u\in\mathcal U_{\rm cons}(s),
+\end{aligned}
+\label{eq:conservative_safe_kernel}
+\end{equation}
+where $P$ is the augmented MDP transition kernel. Consequently, for
+any policy $\pi$ that is well defined for all decision epochs and
+selects an admissible action at every reachable state, with
+$S_0\in\mathcal S_0$,
+\begin{equation}
+\Pr^\pi\{Q_c(\tau)=0\ \forall c\in\mathcal C,
+                              \ \forall\tau\ge0\}=1,
+\label{eq:conservative_queue_invariant}
+\end{equation}
+where $Q_c(\tau)$ is the number of vehicles waiting for a plug.
+This claim does not assert that an admissible joint action always exists.
+\end{proposition}
+\begin{proof}
+For each plug, the recursion places a new virtual interval after all
+earlier virtual intervals on that plug and outside every fixed
+reservation. Induction over $i$ therefore gives
+\begin{equation}
+\sum_{r\in\mathcal R_{c,p,t}}\mathbf1\{\tau\in I_r\}
++\sum_{i:p_i=p}\mathbf1\{\tau\in\widehat I_i\}\le1
+\quad\forall p,\tau.
+\label{eq:conservative_plug_bound}
+\end{equation}
+A selected candidate has $\sigma_i=a_i$, so its actual service
+interval is exactly its virtual interval. Deleting all unselected
+virtual intervals and summing over plugs yields
+\begin{equation}
+B_{c,t}(\tau)+\sum_k y_{k,c,t}
+\mathbf1\{\tau\in I_{k,c,t}\}\le C_c
+\quad\forall c,\tau.
+\label{eq:conservative_occupancy_bound}
+\end{equation}
+The retained per-plug allocation certifies immediate service and leaves
+every previous commitment intact. Equal-time departures release their
+plugs before arrivals, so this allocation is executable without a queue.
+Recording selected intervals, discarding completed jobs, and preserving
+all remaining commitments gives another state in $\mathcal S_0$.
+All stochastic request or acceptance outcomes preserve this argument
+provided their charging actions obey the same admission rule. Hence
+\eqref{eq:conservative_safe_kernel} holds. Induction over decisions,
+together with the full-interval bound between decisions, proves
+\eqref{eq:conservative_queue_invariant}.
+\end{proof}
+
+\paragraph{Scope.}
+Independent station calendars can reserve virtual capacity for the
+same vehicle at several stations, although only one is selected.
+Thus the rule is sufficient and potentially restrictive. Additional
+group quotas only restrict this safe set further; flow and SSG
+exactness refer to the resulting fixed assignment model. The MDP
+guarantee requires the stated transition semantics, not just a mask
+computed at one epoch. In particular, an arrival-before-release
+implementation or an unrecorded autonomous arrival is not covered.
