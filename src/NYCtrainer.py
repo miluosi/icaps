@@ -1467,6 +1467,9 @@ class NYCTrainer:
                         edge_warmup=warmup_steps,
                     ).any_ready
 
+                learning_phase_start = time.perf_counter()
+                train_aev_time = train_ev_time = 0.0
+                ran_training = False
                 aev_training_ready = _value_training_ready(
                     value_function, ifEV=False
                 )
@@ -1480,7 +1483,10 @@ class NYCTrainer:
                     and episode >= start_training_episode
                     and step % training_frequency == 0
                 ):
+                    ran_training = True
+                    train_start = time.perf_counter()
                     loss_aev = value_function.train_step(batch_size=batch_size, ifEV=False) if aev_training_ready else 0.0
+                    train_aev_time = time.perf_counter() - train_start
 
                     if loss_aev > 0:
                         episode_losses.append(loss_aev)
@@ -1490,7 +1496,9 @@ class NYCTrainer:
                         latest_queue_loss = self._latest_metric(value_function, "queue_training_losses")
                         if latest_queue_loss > 0:
                             episode_queue_losses.append(latest_queue_loss)
+                    train_start = time.perf_counter()
                     loss_ev = value_function_ev.train_step(batch_size=batch_size, ifEV=True) if ev_training_ready else 0.0
+                    train_ev_time = time.perf_counter() - train_start
                     if loss_ev > 0:
                         episode_losses_ev.append(loss_ev)
                         latest_norm_td_ev = self._latest_metric(value_function_ev, "normalized_td_losses")
@@ -1617,6 +1625,21 @@ class NYCTrainer:
                                 value_function_ev=value_function_ev,
                             )
 
+                learning_phase_time = time.perf_counter() - learning_phase_start
+                full_step_time = time.time() - step_start
+                results["step_timing_rows"][-1].update({
+                    "train_aev_time_sec": train_aev_time,
+                    "train_ev_time_sec": train_ev_time,
+                    "learning_phase_time_sec": learning_phase_time,
+                    "full_step_time_sec": full_step_time,
+                })
+                if ran_training or step % 25 == 0:
+                    print(
+                        f"    TrainTiming: step={step} aev={train_aev_time:.3f}s "
+                        f"ev={train_ev_time:.3f}s learning_phase={learning_phase_time:.3f}s "
+                        f"full_step={full_step_time:.3f}s",
+                        flush=True,
+                    )
                 episode_reward += sum(rewards.values())
                 episode_reward_aev += sum(
                     reward for vehicle_id, reward in rewards.items() if env.vehicles.get(vehicle_id, {}).get("type") == 2

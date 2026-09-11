@@ -1402,11 +1402,10 @@ class NYCEnvironment:
     def _charging_station_ids_for_vehicle(self, vehicle_id: int) -> list[int]:
         """Return stations visible to one vehicle without cross-fleet leakage."""
 
-        public_station_ids = list(getattr(
-            self,
-            "public_charging_station_ids",
-            sorted(self.charging_manager.stations),
-        ))
+        # getattr evaluates its default eagerly: do not sort all stations on
+        # every vehicle/station feasibility check when the list already exists.
+        public_ids = getattr(self, "public_charging_station_ids", None)
+        public_station_ids = list(public_ids) if public_ids is not None else sorted(self.charging_manager.stations)
         aev_station_ids = list(getattr(self, "aev_charging_station_ids", []))
         if self._is_ev(vehicle_id):
             return public_station_ids
@@ -1415,11 +1414,10 @@ class NYCEnvironment:
         return public_station_ids
 
     def _charging_station_ids_for_vehicle_record(self, vehicle: dict) -> list[int]:
-        public_station_ids = list(getattr(
-            self,
-            "public_charging_station_ids",
-            sorted(self.charging_manager.stations),
-        ))
+        # getattr evaluates its default eagerly: do not sort all stations on
+        # every vehicle/station feasibility check when the list already exists.
+        public_ids = getattr(self, "public_charging_station_ids", None)
+        public_station_ids = list(public_ids) if public_ids is not None else sorted(self.charging_manager.stations)
         aev_station_ids = list(getattr(self, "aev_charging_station_ids", []))
         if vehicle.get("type") == 1:
             return public_station_ids
@@ -5318,7 +5316,10 @@ class NYCEnvironment:
             )
             qvalue_mode = "structured_only"
         elif self.adp_value > 0 and self.value_function is not None:
-            bqv = self.generate_vehicle_qvalue(vehicles_to_rebalance, onlyev=onlyev)
+            bqv = self.generate_vehicle_qvalue(
+                vehicles_to_rebalance, onlyev=onlyev,
+                prepared_action_matrix=(vam, nr, ns, nz),
+            )
             qvalue_mode = 'network'
         else:
             bqv = self.generate_vehicle_qvalue_withoutqnetwork(vehicles_to_rebalance)
@@ -6885,36 +6886,51 @@ class NYCEnvironment:
     def generate_whole_matrix(self, vehicle_ids, rebalance_num=0, onlyev=False):
         req_mat = self.generate_vehicle_requests(vehicle_ids)
         ev_rows = np.array([self._is_ev(vehicle_id) for vehicle_id in vehicle_ids], dtype=bool)
-        zone_target_ids = list(self.relocation_target_ids) if self.relocation_target_ids else sorted(self.zone_to_locs.keys())
-        zone_indices = list(range(len(zone_target_ids)))
-        zone_mat = self.generate_vehicle_zone(vehicle_ids)
-        if zone_mat.size > 0 and np.any(ev_rows):
-            zone_mat[ev_rows, :] = 0.0
-        if zone_mat.size > 0:
-            keep_zone_cols = np.any(zone_mat > 0, axis=0)
-            zone_mat = zone_mat[:, keep_zone_cols]
-            zone_indices = [idx for idx, keep in zip(zone_indices, keep_zone_cols) if keep]
-            zone_target_ids = [zone_id for zone_id, keep in zip(zone_target_ids, keep_zone_cols) if keep]
-        charge_mat = self.generate_vehicle_chargerange(vehicle_ids)
-        if charge_mat.size > 0 and np.any(ev_rows):
-            charge_mat[ev_rows, :] = 0.0
-        if charge_mat.size > 0 and zone_mat.size > 0:
-            vehicle_battery = np.asarray([self.vehicles[vid]['battery'] for vid in vehicle_ids], dtype=np.float32)
-            no_reloc_rows = (
-                (~ev_rows)
-                & (vehicle_battery <= float(getattr(self, 'no_reloc_battery_threshold', 0.15)))
+        if len(vehicle_ids) > 0 and np.all(ev_rows):
+            # These two action blocks were computed and then unconditionally
+            # zeroed for every HEV row. Human charging is handled separately
+            # by _ev_charging_phase, before the assignment problem is built.
+            zone_mat = np.zeros((len(vehicle_ids), 0), dtype=np.float32)
+            charge_mat = np.zeros((len(vehicle_ids), 0), dtype=np.float32)
+            zone_target_ids, zone_indices, charge_station_ids = [], [], []
+            self._last_conservative_charge = None
+            self._last_expected_charge_expansion = build_charge_action_epoch_expansion(
+                vehicle_ids=vehicle_ids, station_ids=[], feasibility=charge_mat,
+                station_schedules={}, candidate_windows={},
+                capacity_scope=('full_window' if getattr(self, 'conservative_charging', False) else 'arrival'),
             )
-            if np.any(no_reloc_rows):
-                zone_mat[no_reloc_rows, :] = 0.0
-        charge_station_ids = sorted({
-            station_id
-            for vehicle_id in vehicle_ids
-            for station_id in self._charging_station_ids_for_vehicle(int(vehicle_id))
-        })
-        if charge_mat.size > 0:
-            keep_charge_cols = np.any(charge_mat > 0, axis=0)
-            charge_mat = charge_mat[:, keep_charge_cols]
-            charge_station_ids = [sid for sid, keep in zip(charge_station_ids, keep_charge_cols) if keep]
+            self._last_expected_charge_expansion['current_time'] = float(self.current_time)
+        else:
+            zone_target_ids = list(self.relocation_target_ids) if self.relocation_target_ids else sorted(self.zone_to_locs.keys())
+            zone_indices = list(range(len(zone_target_ids)))
+            zone_mat = self.generate_vehicle_zone(vehicle_ids)
+            if zone_mat.size > 0 and np.any(ev_rows):
+                zone_mat[ev_rows, :] = 0.0
+            if zone_mat.size > 0:
+                keep_zone_cols = np.any(zone_mat > 0, axis=0)
+                zone_mat = zone_mat[:, keep_zone_cols]
+                zone_indices = [idx for idx, keep in zip(zone_indices, keep_zone_cols) if keep]
+                zone_target_ids = [zone_id for zone_id, keep in zip(zone_target_ids, keep_zone_cols) if keep]
+            charge_mat = self.generate_vehicle_chargerange(vehicle_ids)
+            if charge_mat.size > 0 and np.any(ev_rows):
+                charge_mat[ev_rows, :] = 0.0
+            if charge_mat.size > 0 and zone_mat.size > 0:
+                vehicle_battery = np.asarray([self.vehicles[vid]['battery'] for vid in vehicle_ids], dtype=np.float32)
+                no_reloc_rows = (
+                    (~ev_rows)
+                    & (vehicle_battery <= float(getattr(self, 'no_reloc_battery_threshold', 0.15)))
+                )
+                if np.any(no_reloc_rows):
+                    zone_mat[no_reloc_rows, :] = 0.0
+            charge_station_ids = sorted({
+                station_id
+                for vehicle_id in vehicle_ids
+                for station_id in self._charging_station_ids_for_vehicle(int(vehicle_id))
+            })
+            if charge_mat.size > 0:
+                keep_charge_cols = np.any(charge_mat > 0, axis=0)
+                charge_mat = charge_mat[:, keep_charge_cols]
+                charge_station_ids = [sid for sid, keep in zip(charge_station_ids, keep_charge_cols) if keep]
         self._last_matrix_charge_station_ids = charge_station_ids
         self._last_matrix_zone_indices = zone_indices
         self._last_matrix_zone_target_ids = zone_target_ids
@@ -7158,7 +7174,8 @@ class NYCEnvironment:
                    int(getattr(value_function, 'joint_training_step', 0) or 0)) > 0
         )
 
-    def generate_vehicle_qvalue(self, vehicles_to_rebalance, onlyev=False, prior_features=None):
+    def generate_vehicle_qvalue(self, vehicles_to_rebalance, onlyev=False, prior_features=None,
+                               *, prepared_action_matrix=None):
         del prior_features
         vf = self.value_function_ev if onlyev else self.value_function
         if not self._value_function_ready_for_dispatch(vf):
@@ -7188,9 +7205,14 @@ class NYCEnvironment:
         ])
         num_reqs = len(self.active_requests)
 
-        vehicle_action_matrix, nr, ns, nz = self.generate_whole_matrix(
-            vehicles_to_rebalance, rebalance_num=n, onlyev=onlyev
-        )
+        # _solve_rebalancing has just built this exact matrix and its layout
+        # metadata. Reuse only within that call; never cache across EV/AEV
+        # decisions or epochs, where requests/reservations may have changed.
+        if prepared_action_matrix is None:
+            prepared_action_matrix = self.generate_whole_matrix(
+                vehicles_to_rebalance, rebalance_num=n, onlyev=onlyev
+            )
+        vehicle_action_matrix, nr, ns, nz = prepared_action_matrix
         total_cols = vehicle_action_matrix.shape[1]
         batch_q_value = np.full((n, total_cols), invalid_q, dtype=np.float32)
         if total_cols == 0:

@@ -1141,6 +1141,13 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         *,
         target: bool = False,
     ):
+        cache_key_name = "_target_graph_cache_key" if target else "_graph_cache_key"
+        cache_name = "_target_graph_cache" if target else "_graph_cache"
+        existing = getattr(self, cache_name)
+        if (snapshot is not None and existing is not None
+                and getattr(self, cache_key_name) is not None
+                and existing.get("snapshot") is snapshot):
+            return existing
         key = (
             "snapshot",
             hash(snapshot),
@@ -1150,8 +1157,6 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             int(getattr(self.env, "current_time", 0) if self.env is not None else 0),
             len(getattr(self.env, "active_requests", {}) if self.env is not None else {}),
         )
-        cache_key_name = "_target_graph_cache_key" if target else "_graph_cache_key"
-        cache_name = "_target_graph_cache" if target else "_graph_cache"
         if getattr(self, cache_key_name) == key and getattr(self, cache_name) is not None:
             return getattr(self, cache_name)
         node_features, zone_to_row, station_to_row, global_row = self._build_graph_node_features(snapshot)
@@ -1161,6 +1166,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         pooled = embeddings.mean(dim=0)
         w_ev, w_aev, baseline = mixer(pooled)
         cache = {
+            "snapshot": snapshot,
             "embeddings": embeddings,
             "zone_to_row": zone_to_row,
             "station_to_row": station_to_row,
@@ -2835,14 +2841,23 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             if edge.edge_id not in selected:
                 continue
             provider = self._provider_for_edge(edge)
-            providers[id(provider)] = provider
-            provider._graph_cache_key = None
-            provider._graph_cache = None
+            if id(provider) not in providers:
+                # One fresh autograd graph per provider and selected joint
+                # prediction. All edges see the same immutable state/weights.
+                # The encoder has no dropout; sharing preserves sum gradients.
+                provider._graph_cache_key = None
+                provider._graph_cache = None
+                providers[id(provider)] = provider
             correction1, correction2, _ = provider._edge_correction_tensors(
                 graph, edge, target_context=False
             )
             values1.append(correction1.reshape(()))
             values2.append(correction2.reshape(()))
+        # Do not let a completed backward/optimizer update reuse this cache.
+        # Returned tensors retain the shared graph needed by this TD loss.
+        for provider in providers.values():
+            provider._graph_cache_key = None
+            provider._graph_cache = None
         if not values1:
             zero = torch.zeros((), dtype=torch.float32, device=self.device)
             return zero, zero, tuple(providers.values())
@@ -2867,14 +2882,23 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             if edge.edge_id not in selected:
                 continue
             provider = self._provider_for_edge(edge)
-            providers[id(provider)] = provider
-            provider._graph_cache_key = None
-            provider._graph_cache = None
+            if id(provider) not in providers:
+                # One fresh autograd graph per provider and selected joint
+                # prediction. All edges see the same immutable state/weights.
+                # The encoder has no dropout; sharing preserves sum gradients.
+                provider._graph_cache_key = None
+                provider._graph_cache = None
+                providers[id(provider)] = provider
             raw1, raw2, _ = provider._edge_raw_tensors(
                 graph, edge, target_context=False
             )
             values1.append(raw1.reshape(()))
             values2.append(raw2.reshape(()))
+        # Do not let a completed backward/optimizer update reuse this cache.
+        # Returned tensors retain the shared graph needed by this TD loss.
+        for provider in providers.values():
+            provider._graph_cache_key = None
+            provider._graph_cache = None
         if not values1:
             zero = torch.zeros((), dtype=torch.float32, device=self.device)
             return zero, zero, tuple(providers.values())
