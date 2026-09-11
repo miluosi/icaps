@@ -259,10 +259,12 @@ class RecourseTargetBuilder:
             )
 
         action_keys = []
+        seen_action_keys = set()
         for edge in edges:
             key = action_key(edge)
-            if key not in action_keys:
+            if key not in seen_action_keys:
                 action_keys.append(key)
+                seen_action_keys.add(key)
         action_index = {key: index for index, key in enumerate(action_keys)}
         feasibility = np.zeros(
             (len(vehicle_ids), len(action_keys)), dtype=bool

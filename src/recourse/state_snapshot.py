@@ -156,6 +156,18 @@ class StateSnapshotBuilder:
         request_map = {request.request_id: request for request in state.requests}
         station_ids = list(getattr(env, "_last_matrix_charge_station_ids", ()))[:num_stations]
         station_map = {station.station_id: station for station in state.stations}
+        # Freeze the same arrival quotas used by the NYC assignment adapter.
+        # Without this, all future arrivals are incorrectly checked against a
+        # single station's current vacancy during rollout and Bellman replay.
+        charge_expansion = getattr(env, '_last_expected_charge_expansion', None)
+        arrival_expansion = None
+        if (
+            isinstance(charge_expansion, dict)
+            and charge_expansion.get('capacity_scope') == 'arrival'
+            and tuple(charge_expansion.get('vehicle_ids', ())) == tuple(map(int, vehicle_ids))
+            and float(charge_expansion.get('current_time', env.current_time)) == float(env.current_time)
+        ):
+            arrival_expansion = charge_expansion
         zone_indices = list(getattr(env, "_last_matrix_zone_indices", ()))[:num_zones]
         zone_ids = list(getattr(env, "_last_matrix_zone_target_ids", ()))[:num_zones]
         vehicle_map = {vehicle.vehicle_id: vehicle for vehicle in state.vehicles}
@@ -248,6 +260,20 @@ class StateSnapshotBuilder:
                     resource_capacity = int(
                         station.remaining_admission_capacity
                     )
+                    if arrival_expansion is not None:
+                        window = arrival_expansion['candidate_windows'].get(
+                            (int(vehicle_id), station_id)
+                        )
+                        schedule = arrival_expansion['station_schedules'].get(station_id)
+                        if not window or schedule is None:
+                            raise ValueError('Missing arrival-capacity metadata for feasible charge edge')
+                        arrival = int(window['travel_epochs'])
+                        occupancy = schedule.get('occupancy', ())
+                        occupied = int(occupancy[arrival]) if arrival < len(occupancy) else 0
+                        resource_type = f'station_arrival:{arrival}'
+                        resource_capacity = max(0, int(schedule['capacity']) - occupied)
+                        station_travel_duration = float(arrival)
+                        post_duration = float(arrival + int(window['charging_duration']))
                 elif column < num_requests + num_stations + num_zones:
                     local_column = column - num_requests - num_stations
                     if local_column >= len(zone_ids):
