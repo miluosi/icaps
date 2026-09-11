@@ -113,7 +113,7 @@ def _wait_test_environment(charge_wait_bool=True):
     return env
 
 
-def test_low_battery_aev_wait_is_gated_only_when_charge_edge_is_feasible():
+def test_low_battery_aev_wait_remains_feasible_with_reachable_charge():
     env = _wait_test_environment(charge_wait_bool=True)
     env.min_battery_level = 0.20
     charge_feasibility = np.asarray([
@@ -128,7 +128,7 @@ def test_low_battery_aev_wait_is_gated_only_when_charge_edge_is_feasible():
     )
     np.testing.assert_array_equal(
         wait,
-        np.asarray([[1.0], [0.0], [1.0], [1.0]], dtype=np.float32),
+        np.asarray([[1.0], [1.0], [1.0], [1.0]], dtype=np.float32),
     )
     assert env.generate_capacity_charge(env.vehicles[2]) == 1
     assert env.generate_capacity_charge(env.vehicles[3]) == 0

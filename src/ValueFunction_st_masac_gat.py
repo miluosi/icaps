@@ -2963,7 +2963,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             return (
                 transition.ev_stage_graph,
                 transition.ev_joint_action,
-                float(transition.reward_system),
+                float(transition.learning_reward_system),
                 "system",
             )
         if transition.mode == "ev_first":
@@ -2971,7 +2971,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 return (
                     transition.ev_stage_graph,
                     transition.ev_joint_action,
-                    float(transition.reward_system if transition.recourse_target_family == "macro_realized" else transition.reward_ev),
+                    float(transition.learning_reward_system if transition.recourse_target_family == "macro_realized" else transition.reward_ev),
                     "ev_leader",
                 )
             if transition.recourse_variant in {"r1_structured", "r2"}:
@@ -2979,7 +2979,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             return (
                 transition.aev_stage_graph,
                 transition.aev_joint_action,
-                float(transition.reward_aev),
+                float(transition.learning_reward_aev),
                 "aev_follower",
             )
         if transition.mode == "aev_first":
@@ -2993,7 +2993,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             return (
                 transition.aev_stage_graph,
                 transition.aev_joint_action,
-                float(transition.reward_aev),
+                float(transition.learning_reward_aev),
                 "aev_leader",
             )
         raise ValueError(f"unsupported joint transition mode: {transition.mode}")

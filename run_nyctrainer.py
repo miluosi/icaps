@@ -135,9 +135,8 @@ def parse_args(argv=None):
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "When enabled, reserve reachable current charger capacity for "
-            "the lowest-SOC AEV rows and make their wait actions infeasible. "
-            "Use --no-charge-wait-bool to restore an all-one wait column."
+            "Compatibility option: NYC wait is always feasible at every SoC. "
+            "Low-SoC AEV idle cost is shaped in learning reward only."
         ),
     )
     parser.add_argument(

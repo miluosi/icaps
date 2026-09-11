@@ -6,7 +6,7 @@ from benchmark_conservative_charging import (
 )
 
 
-def test_nyc_opt_in_filters_only_charge_edges_and_updates_wait_gate():
+def test_nyc_opt_in_filters_only_charge_edges_and_retains_all_waits():
     env, ids, _, _ = make_case(20, 2, 3, "synchronized", 0)
     for vehicle in env.vehicles.values():
         vehicle["battery"] = 0.1
@@ -18,8 +18,8 @@ def test_nyc_opt_in_filters_only_charge_edges_and_updates_wait_gate():
     assert current.sum() == 40
     assert reduced.sum() == 6
     assert np.all(reduced <= current)
-    assert current_wait.sum() == 0
-    assert reduced_wait.sum() == 17
+    assert current_wait.sum() == 20
+    assert reduced_wait.sum() == 20
     assert all(not station.charging_queue_notarrived
                for station in env.charging_manager.stations.values())
 

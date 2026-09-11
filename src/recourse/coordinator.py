@@ -220,6 +220,11 @@ class RecourseCoordinator:
             reward_ev=reward_ev,
             reward_aev=reward_aev,
             reward_system=reward_ev + reward_aev,
+            aev_soc_wait_learning_penalty=sum(
+                float(getattr(env, '_epoch_soc_wait_learning_penalties', {}).get(vehicle_id, 0.0))
+                for vehicle_id in rewarded_vehicle_ids
+                if int(env.vehicles[vehicle_id].get('type', 1)) == 2
+            ),
             next_state=next_state,
             elapsed_epochs=max(0.0, next_state.current_time - pending.pre_state.current_time),
             done=bool(done),

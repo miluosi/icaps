@@ -134,14 +134,14 @@ def test_aev_wait_remains_feasible_for_every_epoch_and_soc():
     assert env.generate_vehicle_wait([0]).tolist() == [[1.0]]
 
 
-def test_low_battery_wait_uses_expected_arrival_window_feasibility():
+def test_low_battery_wait_is_independent_of_charge_window():
     env = _nyc_expected_environment(current_remaining=2)
     env.min_battery_level = 0.50
     charge_matrix = env.generate_vehicle_chargerange([0])
     assert charge_matrix.tolist() == [[1.0]]
     assert env.generate_vehicle_wait(
         [0], charge_feasibility=charge_matrix
-    ).tolist() == [[0.0]]
+    ).tolist() == [[1.0]]
 
     env = _nyc_expected_environment(current_remaining=5)
     env.min_battery_level = 0.50

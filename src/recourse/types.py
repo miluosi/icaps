@@ -660,6 +660,8 @@ class RecourseTransition:
     committed_aev_edge_ids: tuple[str, ...] = ()
     repair_hold_aev_ids: tuple[int, ...] = ()
     repair_candidate_request_ids: tuple[int, ...] = ()
+    # Frozen separately from the reconciled economic reward/ledger.
+    aev_soc_wait_learning_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         if self.schema_version != REPLAY_SCHEMA_VERSION:
@@ -688,6 +690,14 @@ class RecourseTransition:
             expected = JointActionSnapshot.from_graph(graph, action.selected_edge_ids)
             if abs(action.structured_value - expected.structured_value) > 1e-5 * max(1., abs(expected.structured_value)):
                 raise ValueError('Joint structured value is not the sum of selected frozen anchors')
+
+    @property
+    def learning_reward_aev(self) -> float:
+        return self.reward_aev - getattr(self, 'aev_soc_wait_learning_penalty', 0.0)
+
+    @property
+    def learning_reward_system(self) -> float:
+        return self.reward_system - getattr(self, 'aev_soc_wait_learning_penalty', 0.0)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

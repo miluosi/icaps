@@ -7,6 +7,8 @@ from benchmark_conservative_charging import make_case, solve_adapter
 from src.recourse.state_snapshot import StateSnapshotBuilder
 from src.recourse.target_builder import RecourseTargetBuilder
 from src.recourse.types import ActionType
+from src.recourse.types import JointActionSnapshot
+from src.recourse.coordinator import RecourseCoordinator
 
 
 def snapshot_case(*, same_arrival=False, committed=False):
@@ -118,3 +120,25 @@ def test_nyc_full_station_arrival_queues_and_records_wait_penalty():
     assert station.charging_queue == [str(vid) for vid in ids[4:]]
     assert env.charging_wait_steps == 4
     assert env.charging_wait_penalty_total == 2.
+
+
+def test_macro_collects_eight_charging_assignments_with_four_slots():
+    """Server trace: macro must retain arrival resources and queue permission."""
+    env, ids, mask, scores, graph = snapshot_case()
+    coordinator = RecourseCoordinator()
+    pending = coordinator.begin(env, mode='ev_first', recourse_variant='macro')
+    assignments, _ = solve_adapter(env, ids, mask, scores, True)
+    assert sum(action == 'charge_100' for action in assignments.values()) == 8
+    selected = StateSnapshotBuilder.selected_edge_ids(graph, assignments)
+    graph = graph.with_selected(selected, status='selected')
+    RecourseTargetBuilder.verify_feasible(graph, selected)
+    pending.ev_stage_graph = replace(graph, graph_id='empty-ev', stage_id=1,
+                                     edges=(), selected_edge_ids=())
+    pending.ev_joint_action = JointActionSnapshot.from_graph(pending.ev_stage_graph)
+    pending.aev_stage_graph = graph
+    pending.aev_joint_action = JointActionSnapshot.from_graph(graph)
+    row = coordinator.finalize(env, rewards={vid: -.1 for vid in ids}, done=True)
+    assert row.recourse_target_family == 'macro_realized'
+    assert row.aev_stage_graph.allow_charging_queue
+    assert row.reward_aev == pytest.approx(-.8)
+    RecourseTargetBuilder.verify_feasible(row.aev_stage_graph, row.aev_joint_action.selected_edge_ids)

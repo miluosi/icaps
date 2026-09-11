@@ -437,6 +437,11 @@ class NYCEnvironment:
         self.charging_wait_penalty_per_hour = 8.0
         self.charging_wait_penalty_per_step = self.charging_wait_penalty_per_hour * self.reward_epoch_hours
         self.learning_wait_penalty = self.charging_wait_penalty_per_step
+        # AEV idle shaping only: never included in physical/system reward.
+        self.learning_soc_wait_threshold = self.min_battery_level + 0.1
+        self.learning_soc_wait_reference = self.min_battery_level
+        self.learning_soc_wait_penalty_per_hour = 8.0
+        self.learning_soc_wait_exponent = 2.0
         self.charging_wait_penalty_total = 0.0
         self.charging_wait_steps = 0
         self.charging_wait_observations: list[dict] = []
@@ -4085,6 +4090,38 @@ class NYCEnvironment:
     # Execute action  (mirrors ChargingIntegratedEnvironment)
     # ==================================================================
 
+    def soc_wait_learning_penalty(self, battery: float, duration_epochs: float = 1.0) -> float:
+        """Positive learning-only cost; NYC durations are epochs, not seconds.
+
+        At the reference SoC the hourly cost equals the configured rate.
+        Below it the quadratic cost continues growing (no clipping at one).
+        """
+        threshold = float(getattr(self, 'learning_soc_wait_threshold', 0.3))
+        reference = float(getattr(self, 'learning_soc_wait_reference', 0.2))
+        rate = float(getattr(self, 'learning_soc_wait_penalty_per_hour', 8.0))
+        exponent = float(getattr(self, 'learning_soc_wait_exponent', 2.0))
+        if threshold <= reference or rate < 0.0 or exponent <= 0.0:
+            raise ValueError('invalid SoC wait learning-penalty configuration')
+        deficit = max(0.0, threshold - float(battery)) / (threshold - reference)
+        hours = max(0.0, float(duration_epochs)) * float(self.EPOCH_LENGTH) / 3600.0
+        return rate * hours * deficit ** exponent
+
+    def _action_soc_wait_learning_penalty(self, vehicle_id: int, action) -> float:
+        vehicle = self.vehicles[vehicle_id]
+        if (int(vehicle.get('type', 1)) != 2
+                or not vehicle.get('is_online', True)
+                or not isinstance(action, IdleAction)
+                or getattr(action, 'learning_action_type', None) == 'reloc'):
+            return 0.0
+        target = self._coerce_location_for_candidate(
+            getattr(action, 'target_location', None), vehicle['location'],
+        )
+        if (target != vehicle['location']
+                or (not vehicle.get('is_stationary', False)
+                    and vehicle.get('idle_target') is not None)):
+            return 0.0
+        return self.soc_wait_learning_penalty(vehicle['battery'])
+
     def _execute_action(self, vehicle_id: int, action) -> Tuple[float, float]:
         vehicle = self.vehicles[vehicle_id]
         if not vehicle.get('is_online', True):
@@ -4260,7 +4297,11 @@ class NYCEnvironment:
 
         execute_actions_start = time.time()
         self._epoch_rejection_reward_components = {}
+        self._epoch_soc_wait_learning_penalties = {}
         for vehicle_id, action in actions.items():
+            self._epoch_soc_wait_learning_penalties[vehicle_id] = (
+                self._action_soc_wait_learning_penalty(vehicle_id, action)
+            )
             reject_before = self.step_rejection_reward_total
             reward, dur_reward = self._execute_action(vehicle_id, action)
             self._epoch_rejection_reward_components[vehicle_id] = self.step_rejection_reward_total - reject_before
@@ -4764,7 +4805,9 @@ class NYCEnvironment:
                         learning_reward -= float(self.learning_reloc_penalty_base)
                         learning_reward -= float(self.learning_reloc_penalty_per_km) * idle_distance
                     else:
-                        learning_reward -= float(self.learning_wait_penalty)
+                        learning_reward -= self.soc_wait_learning_penalty(
+                            current_battery, action_dur_time,
+                        )
                     store_aev_experience({
                         'vehicle_id': vehicle_id,
                         'action_type': idle_kind,
@@ -6709,56 +6752,16 @@ class NYCEnvironment:
         rebalance_num=0,
         charge_feasibility=None,
     ):
-        """Gate low-SOC AEV wait actions using the active charging policy.
+        """Keep a real outside action for every decision vehicle at every SoC.
 
-        An AEV at or below ``min_battery_level`` cannot wait when at least one
-        reachable station admits charging (a free slot at arrival by default,
-        or a conservative full window when enabled).
-        EVs, higher-SOC AEVs, and low-SOC AEVs without such an action retain
-        the wait/outside action.  ``charge_wait_bool=False`` disables the gate.
+        Charging admission remains controlled by the charge mask.  Competition
+        for shared slots must not remove this private feasibility fallback.
+        Legacy arguments and charge_wait_bool are retained for compatibility;
+        they no longer gate NYC wait, including in conservative mode.
         """
-        del rebalance_num
+        del rebalance_num, charge_feasibility
         self._last_wait_forced_charge_station = {}
-        wait = np.ones((len(vehicle_ids), 1), dtype=np.float32)
-        if not bool(getattr(self, 'charge_wait_bool', True)) or not vehicle_ids:
-            return wait
-
-        if charge_feasibility is None:
-            expansion = getattr(self, '_last_expected_charge_expansion', {})
-            if tuple(expansion.get('vehicle_ids', ())) == tuple(
-                int(vehicle_id) for vehicle_id in vehicle_ids
-            ):
-                epoch_mask = np.asarray(expansion.get('action_epoch_mask', ()))
-                if epoch_mask.ndim == 3:
-                    charge_feasibility = np.any(epoch_mask > 0, axis=2)
-        if charge_feasibility is None:
-            # Standalone callers still receive the established safe outside
-            # action.  generate_whole_matrix always supplies the expected-
-            # occupancy-aware charging matrix below.
-            return wait
-
-        charge_feasibility = np.asarray(charge_feasibility)
-        if charge_feasibility.ndim != 2 or charge_feasibility.shape[0] != len(vehicle_ids):
-            raise ValueError(
-                'charge_feasibility must have one row per vehicle_id'
-            )
-        station_ids = list(getattr(self, '_last_matrix_charge_station_ids', []))
-        threshold = float(getattr(self, 'min_battery_level', 0.2))
-        for row, vehicle_id in enumerate(vehicle_ids):
-            vehicle = self.vehicles[int(vehicle_id)]
-            if self._is_ev(int(vehicle_id)):
-                continue
-            if float(vehicle.get('battery', 1.0)) > threshold + 1e-12:
-                continue
-            feasible_columns = np.flatnonzero(charge_feasibility[row] > 0)
-            if feasible_columns.size == 0:
-                continue
-            wait[row, 0] = 0.0
-            if station_ids and int(feasible_columns[0]) < len(station_ids):
-                self._last_wait_forced_charge_station[int(vehicle_id)] = int(
-                    station_ids[int(feasible_columns[0])]
-                )
-        return wait
+        return np.ones((len(vehicle_ids), 1), dtype=np.float32)
 
     def _active_gat_neighbour_number(self) -> int:
         neighbour_numbers = []
