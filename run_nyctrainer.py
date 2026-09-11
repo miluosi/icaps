@@ -60,7 +60,7 @@ def parse_args(argv=None):
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
     add_method_list_arguments(parser, method_choices=NYC_TRAIN_METHODS)
-    parser.add_argument("--paper-parameter-preset", action="store_true",
+    parser.add_argument("--paper-parameter-preset", action="store_true",default = True,
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
     parser.add_argument("--parquet-path", type=str, default=None,
