@@ -167,11 +167,12 @@ class RecourseCoordinator:
         rewarded_vehicle_ids = tuple(
             sorted({int(edge.vehicle_id) for edge in selected_edges})
         )
+        rewarded_vehicle_set = set(rewarded_vehicle_ids)
         unattributed = [
             int(vehicle_id)
             for vehicle_id, reward in rewards.items()
             if abs(float(reward)) > 1e-12
-            and int(vehicle_id) not in rewarded_vehicle_ids
+            and int(vehicle_id) not in rewarded_vehicle_set
         ]
         if unattributed:
             raise AssertionError(
@@ -186,13 +187,13 @@ class RecourseCoordinator:
         reward_ev = sum(
             float(rewards.get(vehicle_id, 0.0))
             for vehicle_id, vehicle in getattr(env, "vehicles", {}).items()
-            if int(vehicle_id) in rewarded_vehicle_ids
+            if int(vehicle_id) in rewarded_vehicle_set
             if int(vehicle.get("type", 1)) == 1
         )
         reward_aev = sum(
             float(rewards.get(vehicle_id, 0.0))
             for vehicle_id, vehicle in getattr(env, "vehicles", {}).items()
-            if int(vehicle_id) in rewarded_vehicle_ids
+            if int(vehicle_id) in rewarded_vehicle_set
             if int(vehicle.get("type", 1)) == 2
         )
         next_state = StateSnapshotBuilder.build(env)

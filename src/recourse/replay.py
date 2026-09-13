@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
@@ -325,17 +325,27 @@ class PrioritizedJointReplayBuffer:
     def _content_hash(
         items: Sequence[RecourseTransition], priorities: Sequence[float]
     ) -> str:
-        payload = {
-            "items": [transition.to_dict() for transition in items],
-            "priorities": [float(priority).hex() for priority in priorities],
-        }
-        canonical = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return sha256(canonical).hexdigest()
+        # Preserve the original canonical JSON bytes/hash, without asdict's
+        # recursive deepcopy of every replay snapshot or a whole-buffer JSON
+        # string. At most one transition's serialization is held at a time.
+        def record(value):
+            if is_dataclass(value) and not isinstance(value, type):
+                return {field.name: getattr(value, field.name) for field in fields(value)}
+            raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+        def encode(value):
+            return json.dumps(value, default=record, ensure_ascii=False,
+                              sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+        digest = sha256(b'{"items":[')
+        for index, transition in enumerate(items):
+            if index:
+                digest.update(b',')
+            digest.update(encode(transition))
+        digest.update(b'],"priorities":')
+        digest.update(encode([float(priority).hex() for priority in priorities]))
+        digest.update(b'}')
+        return digest.hexdigest()
 
     def save(self, path: str | Path) -> None:
         path = Path(path)

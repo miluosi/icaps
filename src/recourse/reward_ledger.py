@@ -15,7 +15,8 @@ def build_reward_ledger(env, pending, rewards, lifecycle):
     chosen = {}
     for graph in (pending.ev_stage_graph, pending.aev_stage_graph):
         if graph is not None:
-            chosen.update({e.vehicle_id: e for e in graph.edges if e.edge_id in graph.selected_edge_ids})
+            selected = set(graph.selected_edge_ids)
+            chosen.update({e.vehicle_id: e for e in graph.edges if e.edge_id in selected})
     rejected = set(lifecycle.rejection_outcome(transition_id=pending.transition_id).rejected_request_ids)
     labels = dict(pending.residual_state.request_labels) if pending.residual_state else {}
     components = {name: 0.0 for name in RewardLedger.__dataclass_fields__}

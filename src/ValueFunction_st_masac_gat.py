@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+import time
 from collections import deque
 from typing import Any
 
@@ -2345,23 +2346,23 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         edge: FeasibleEdgeSnapshot,
         *,
         state_variant: str,
+        observation_context=None,
     ) -> dict:
-        observation_state = graph.state.masked(
-            state_variant, vehicle_type=int(edge.vehicle_type)
-        )
-        vehicle = next(
-            item for item in observation_state.vehicles
-            if item.vehicle_id == edge.vehicle_id
-        )
+        if observation_context is None:
+            observation_state = graph.state.masked(
+                state_variant, vehicle_type=int(edge.vehicle_type)
+            )
+            vehicles = {item.vehicle_id: item for item in observation_state.vehicles}
+            online_count = sum(item.online for item in observation_state.vehicles)
+        else:
+            observation_state, vehicles, online_count = observation_context
+        vehicle = vehicles[edge.vehicle_id]
         # Compute this scalar from precisely the state view delivered to the
         # critic.  The old code used the unmasked graph and leaked the online
         # population of the other fleet into fleet-local ablations.
         other_vehicles = max(
             0,
-            sum(
-                item.online for item in observation_state.vehicles
-                if item.vehicle_id != edge.vehicle_id
-            ),
+            online_count - int(vehicle.online),
         )
         return {
             "vehicle_id": edge.vehicle_id,
@@ -2523,6 +2524,67 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         raw2 = critic2(edge_tensor) * type_weight
         return raw1, raw2, type_weight
 
+    def _graph_edge_tensor_batch(self, graph, edges, *, target_context):
+        """Build replay edge features in batches, retaining online gradients.
+
+        Keep fleet-local ablations separate even when they share a critic.
+        The context and vehicle index are call-local, never reused after a
+        state/weight change. Returned rows retain the input edge order.
+        """
+        groups = {}
+        for index, edge in enumerate(edges):
+            if edge.response_model_hash != self.response_model_hash:
+                raise ValueError('Replay rejection predictor hash mismatch')
+            groups.setdefault(int(edge.vehicle_type), []).append((index, edge))
+        tensors, weights, order = [], [], []
+        for fleet, members in groups.items():
+            state = graph.state.masked(self.state_variant, vehicle_type=fleet)
+            context = (state, {v.vehicle_id: v for v in state.vehicles},
+                       sum(v.online for v in state.vehicles))
+            exps = [self._edge_experience(graph, edge, state_variant=self.state_variant,
+                                         observation_context=context) for _, edge in members]
+            def array(key, dtype=np.float32):
+                return np.asarray([exp[key] for exp in exps], dtype=dtype)
+            locations = [self._experience_location(exp['vehicle_location'], 0) for exp in exps]
+            targets = [self._experience_location(exp['target_location'], loc)
+                       for exp, loc in zip(exps, locations)]
+            post_locations = [self._experience_location(exp['post_action_location'], target)
+                              for exp, target in zip(exps, targets)]
+            demand = [exp['post_demand_feature'] for exp in exps]
+            # Preserve the optional subclass feature's default when all rows
+            # omit it; mixed snapshots use the reference row path below.
+            if any(x is None for x in demand) and not all(x is None for x in demand):
+                rows = [self._edge_tensor_from_experience(exp, target_context=target_context,
+                        state_snapshot=state) for exp in exps]
+                tensor = torch.cat([row[0] for row in rows])
+                weight = torch.cat([row[1] for row in rows])
+            else:
+                tensor, weight, _ = self._edge_tensor_from_arrays(
+                    vehicle_ids=array('vehicle_id', np.int64),
+                    vehicle_locations=np.asarray(locations), target_locations=np.asarray(targets),
+                    current_times=array('current_time'), other_vehicles=array('other_vehicles'),
+                    num_requests=array('num_requests'), battery_levels=array('battery_level'),
+                    target_distances=array('target_distance'), vehicle_idle_times=array('vehicle_idle_time'),
+                    action_type_ids=array('action_type_id', np.int64),
+                    post_action_distances=array('post_action_distance'),
+                    post_action_durations=array('post_action_duration'),
+                    post_action_locations=np.asarray(post_locations),
+                    target_station_ids=np.asarray([exp['target_station_id'] if exp['target_station_id'] is not None
+                                                   else -1 for exp in exps], dtype=np.int64),
+                    queue_wait_features=np.asarray([self._queue_wait_feature_from_experience(
+                        exp, target_context=target_context) for exp in exps], dtype=np.float32),
+                    vehicle_neighbour_candidates={}, graph_snapshot=state, target_context=target_context,
+                    vehicle_types=array('vehicle_type', np.int64),
+                    post_demand_features=None if all(x is None for x in demand) else np.asarray(demand, dtype=np.float32),
+                    rejection_probabilities=[self.rejection_from_experience(exp) for exp in exps],
+                    human_response_masks=[self.response_mask_from_experience(exp) for exp in exps],
+                )
+            tensors.append(tensor); weights.append(weight)
+            order.extend(index for index, _ in members)
+        restore = torch.as_tensor(np.argsort(order), dtype=torch.long, device=self.device)
+        return (torch.cat(tensors).index_select(0, restore),
+                torch.cat(weights).index_select(0, restore))
+
     def _edge_correction_tensors(
         self,
         graph: FeasibleGraphSnapshot,
@@ -2574,21 +2636,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 # target evaluation; no autograd graph is required here.
                 with torch.no_grad():
                     chunk_edges = provider_edges[part]
-                    edge_rows = []
-                    type_rows = []
-                    for edge in chunk_edges:
-                        exp = provider._edge_experience(
-                            graph, edge, state_variant=provider.state_variant
-                        )
-                        edge_tensor, type_weight, _ = provider._edge_tensor_from_experience(
-                            exp,
-                            target_context=target_context,
-                            state_snapshot=exp["state_snapshot"],
-                        )
-                        edge_rows.append(edge_tensor.squeeze(0))
-                        type_rows.append(type_weight.reshape(()))
-                    edges_tensor = torch.stack(edge_rows)
-                    type_weights = torch.stack(type_rows).reshape(-1, 1)
+                    edges_tensor, type_weights = provider._graph_edge_tensor_batch(
+                        graph, chunk_edges, target_context=target_context
+                    )
                     critic1 = provider.target_network if target_context else provider.network
                     critic2 = provider.target_critic2 if target_context else provider.critic2
                     raw1 = critic1(edges_tensor) * type_weights
@@ -2875,38 +2925,35 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         """Return the unbounded online twin predictions used by TD loss."""
 
         selected = set(selected_edge_ids)
-        values1 = []
-        values2 = []
-        providers: dict[int, "PyTorchChargingValueFunction"] = {}
-        for edge in graph.edges:
-            if edge.edge_id not in selected:
-                continue
+        grouped = {}
+        selected_edges = [edge for edge in graph.edges if edge.edge_id in selected]
+        for index, edge in enumerate(selected_edges):
             provider = self._provider_for_edge(edge)
-            if id(provider) not in providers:
-                # One fresh autograd graph per provider and selected joint
-                # prediction. All edges see the same immutable state/weights.
-                # The encoder has no dropout; sharing preserves sum gradients.
-                provider._graph_cache_key = None
-                provider._graph_cache = None
-                providers[id(provider)] = provider
-            raw1, raw2, _ = provider._edge_raw_tensors(
-                graph, edge, target_context=False
-            )
-            values1.append(raw1.reshape(()))
-            values2.append(raw2.reshape(()))
-        # Do not let a completed backward/optimizer update reuse this cache.
-        # Returned tensors retain the shared graph needed by this TD loss.
-        for provider in providers.values():
-            provider._graph_cache_key = None
-            provider._graph_cache = None
+            grouped.setdefault(id(provider), (provider, []))[1].append((index, edge))
+        values1, values2, order = [], [], []
+        providers = tuple(provider for provider, _ in grouped.values())
+        try:
+            for provider, members in grouped.values():
+                provider._graph_cache_key = provider._graph_cache = None
+                batch_size = max(1, min(provider.qvalue_inference_batch_size,
+                    getattr(provider, '_qvalue_safe_batch_size', provider.qvalue_inference_batch_size)))
+                for start in range(0, len(members), batch_size):
+                    chunk = members[start:start + batch_size]
+                    features, weights = provider._graph_edge_tensor_batch(
+                        graph, [edge for _, edge in chunk], target_context=False)
+                    values1.append((provider.network(features) * weights).reshape(-1))
+                    values2.append((provider.critic2(features) * weights).reshape(-1))
+                    order.extend(index for index, _ in chunk)
+        finally:
+            # Never carry an online autograd graph across optimizer updates.
+            for provider in providers:
+                provider._graph_cache_key = provider._graph_cache = None
         if not values1:
             zero = torch.zeros((), dtype=torch.float32, device=self.device)
-            return zero, zero, tuple(providers.values())
-        return (
-            torch.stack(values1).sum(),
-            torch.stack(values2).sum(),
-            tuple(providers.values()),
-        )
+            return zero, zero, providers
+        restore = torch.as_tensor(np.argsort(order), dtype=torch.long, device=self.device)
+        return (torch.cat(values1).index_select(0, restore).sum(),
+                torch.cat(values2).index_select(0, restore).sum(), providers)
 
     def _selected_residual_tensor(
         self,
@@ -3063,6 +3110,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         return provider(graph, structured_only=False)
 
     def _train_joint_step(self, batch_size: int, *, ifEV: bool) -> float:
+        started = time.perf_counter()
+        self._last_joint_train_profile = {}
         if len(self.joint_replay_buffer) == 0:
             return 0.0
         sample = self.joint_replay_buffer.sample_ready(
@@ -3073,6 +3122,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         )
         if not sample.transitions:
             return 0.0
+        sample_seconds = time.perf_counter() - started
+        prediction_seconds = target_seconds = 0.0
         losses = []
         td_errors = []
         used_indices = []
@@ -3120,9 +3171,11 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             if losses and consumed_edges + graph_edge_count > max_edges_per_update:
                 break
             consumed_edges += graph_edge_count
+            phase_started = time.perf_counter()
             prediction1, prediction2, providers = self._selected_raw_tensors(
                 graph, action.selected_edge_ids
             )
+            prediction_seconds += time.perf_counter() - phase_started
             for provider in providers:
                 providers_to_step[id(provider)] = provider
             structured_value = float(action.structured_value)
@@ -3131,6 +3184,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             continuation_discount = 0.0
             target_components = None
             target_graph_for_diagnostics = None
+            phase_started = time.perf_counter()
             if (
                 transition.mode == "ev_first"
                 and phase == "ev_leader"
@@ -3175,6 +3229,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 continuation_discount = self.gamma ** float(
                     transition.elapsed_epochs
                 )
+            target_seconds += time.perf_counter() - phase_started
             full_target_value = float(reward) + (
                 continuation_discount * continuation_full_value
             )
@@ -3284,6 +3339,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         if not losses:
             return 0.0
         loss = torch.stack(losses).mean()
+        optimize_started = time.perf_counter()
         for provider in providers_to_step.values():
             provider.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -3324,6 +3380,15 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             )
         self.joint_replay_buffer.update_priorities(used_indices, td_errors)
         self.joint_replay_buffer.advance_beta()
+        self._last_joint_train_profile = {
+            'sample_sec': sample_seconds,
+            'online_prediction_sec': prediction_seconds,
+            'target_evaluation_sec': target_seconds,
+            'backward_optimizer_sec': time.perf_counter() - optimize_started,
+            'total_sec': time.perf_counter() - started,
+            'transitions': len(losses),
+            'online_graph_edges': consumed_edges,
+        }
         self.joint_training_diagnostics.extend(diagnostics)
         if len(self.joint_training_diagnostics) > 10_000:
             del self.joint_training_diagnostics[:-10_000]

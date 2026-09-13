@@ -4340,7 +4340,9 @@ class NYCEnvironment:
             and bool(getattr(action, "was_rejected", False))
         }
         done_after_update = self.current_time >= self.episode_length
+        joint_collection_start = time.time()
         self._finalize_joint_collection(rewards, done_after_update)
+        joint_collection_time = time.time() - joint_collection_start
 
         q_learning_aev_start = time.time()
         self._activate_bayes_step_context('aev')
@@ -4376,6 +4378,7 @@ class NYCEnvironment:
             'execute_actions_time_sec': execute_actions_time,
             'update_environment_time_sec': update_env_time,
             'dead_battery_time_sec': dead_battery_time,
+            'joint_collection_time_sec': joint_collection_time,
             'q_learning_aev_time_sec': q_learning_aev_time,
             'q_learning_ev_time_sec': q_learning_ev_time,
             'record_usage_time_sec': record_usage_time,
@@ -4385,7 +4388,8 @@ class NYCEnvironment:
             print(
                 f"⏱ env.step step={int(step_index)} total={total_step_time:.3f}s execute={execute_actions_time:.3f}s "
                 f"update_env={update_env_time:.3f}s dead_battery={dead_battery_time:.3f}s "
-                f"qlearn_aev={q_learning_aev_time:.3f}s qlearn_ev={q_learning_ev_time:.3f}s usage={record_usage_time:.3f}s",
+                f"qlearn_aev={q_learning_aev_time:.3f}s qlearn_ev={q_learning_ev_time:.3f}s usage={record_usage_time:.3f}s "
+                f"joint_collection={joint_collection_time:.3f}s",
                 flush=True,
             )
 

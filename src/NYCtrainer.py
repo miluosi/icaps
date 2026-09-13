@@ -1386,6 +1386,7 @@ class NYCTrainer:
                     "simulation_fallback_time_sec": float(simulation_profile.get("fallback_time_sec", 0.0) or 0.0),
                     "execute_actions_time_sec": float(step_profile.get("execute_actions_time_sec", 0.0) or 0.0),
                     "update_environment_time_sec": float(step_profile.get("update_environment_time_sec", 0.0) or 0.0),
+                    "joint_collection_time_sec": float(step_profile.get("joint_collection_time_sec", 0.0) or 0.0),
                     "q_learning_aev_time_sec": float(step_profile.get("q_learning_aev_time_sec", 0.0) or 0.0),
                     "q_learning_ev_time_sec": float(step_profile.get("q_learning_ev_time_sec", 0.0) or 0.0),
                     "step_profile_total_time_sec": float(step_profile.get("total_time_sec", 0.0) or 0.0),
@@ -1454,6 +1455,7 @@ class NYCTrainer:
                         print(
                             f"    StepTiming: env_step={env_step_time:.3f}s execute={step_profile.get('execute_actions_time_sec', 0.0):.3f}s "
                             f"update_env={step_profile.get('update_environment_time_sec', 0.0):.3f}s "
+                            f"joint_collection={step_profile.get('joint_collection_time_sec', 0.0):.3f}s "
                             f"qlearn_aev={step_profile.get('q_learning_aev_time_sec', 0.0):.3f}s "
                             f"qlearn_ev={step_profile.get('q_learning_ev_time_sec', 0.0):.3f}s",
                             flush=True,
@@ -1633,6 +1635,17 @@ class NYCTrainer:
                     "learning_phase_time_sec": learning_phase_time,
                     "full_step_time_sec": full_step_time,
                 })
+                for fleet, value, elapsed in (
+                    ('aev', value_function, train_aev_time),
+                    ('ev', value_function_ev, train_ev_time),
+                ):
+                    if elapsed > 0:
+                        profile = dict(getattr(value, '_last_joint_train_profile', {}))
+                        results["step_timing_rows"][-1][f'joint_train_{fleet}'] = profile
+                        if profile:
+                            print(f"    JointTrainTiming: step={step} fleet={fleet} "
+                                  + " ".join(f"{key}={number:.3f}" for key, number in profile.items()),
+                                  flush=True)
                 if ran_training or step % 25 == 0:
                     print(
                         f"    TrainTiming: step={step} aev={train_aev_time:.3f}s "

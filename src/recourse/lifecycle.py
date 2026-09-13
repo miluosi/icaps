@@ -412,14 +412,19 @@ class RequestLifecycleTracker:
             and state.residual_epoch_id is not None
             and state.residual_category in {"unoffered", "other"}
         )
-        first_rejected_epoch = {
-            request_id: min(
-                event_epoch
-                for candidate_request_id, event_epoch in self._rejection_events
-                if candidate_request_id == request_id
-            )
-            for request_id, _ in self._rejection_events
-        }
+        # One pass over history, rather than rescanning all events for every
+        # event (quadratic in the number of historical rejections).
+        first_rejected_epoch = {}
+        for request_id, event_epoch in self._rejection_events:
+            previous = first_rejected_epoch.get(request_id)
+            if previous is None or event_epoch < previous:
+                first_rejected_epoch[request_id] = event_epoch
+        if epoch_id is not None:
+            wanted_epoch = int(epoch_id)
+            rows = [state for state in rows if (
+                state.rejected_epoch_id if state.rejected_epoch_id is not None
+                else _epoch_or_default(state.residual_epoch_id)
+            ) == wanted_epoch]
         events = []
         for state in sorted(
             rows,
