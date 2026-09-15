@@ -165,8 +165,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--checkpoint-replay",
         choices=["none", "recent", "full"],
-        default="recent",
-        help="Joint replay payload stored in checkpoints",
+        default="none",
+        help="Compatibility option; NYC saves Test models without replay regardless of this value",
     )
     parser.add_argument(
         "--checkpoint-replay-recent",
@@ -412,7 +412,7 @@ def apply_paper_parameter_preset(args):
     args.mcmf_verify = True
     args.target_solver_policy = "same_as_rollout_exact"
     if args.start_date is None:
-        args.start_date = f"{args.start_year_month}-15"
+        args.start_date = f"{args.start_year_month}-8"
     if args.end_date is None:
         start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
         args.end_date = (start_dt + timedelta(days=max(0, int(args.episodes) - 1))).strftime("%Y-%m-%d")
@@ -933,7 +933,7 @@ def run_nyc_training(
     iftransformer: bool = False,
     gat_neighbour_number: int = 0,
     post_demand_q_weight: float = 0.0,
-    checkpoint_replay: str = "recent",
+    checkpoint_replay: str = "none",
     checkpoint_replay_recent: int = 5_000,
     post_demand_head_lr_multiplier: float = 10.0,
     masac_target_entropy_ratio: float = 0.9,

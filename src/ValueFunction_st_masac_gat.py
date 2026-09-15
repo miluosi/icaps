@@ -3667,6 +3667,22 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
     # Checkpoint extras
     # ------------------------------------------------------------------
 
+    def inference_checkpoint_state(self) -> dict[str, Any]:
+        state = {
+            "ev_response": self.acceptance_checkpoint_state(),
+            "queue_predictor_trained": bool(self.queue_predictor_trained),
+            "recent_station_waits": dict(self.recent_station_waits),
+            # Deployment beta can depend on joint updates even when the legacy
+            # per-edge training_step stays at zero.
+            "joint_training_step": int(self.joint_training_step),
+            "state_variant": self.state_variant,
+            "learner_variant": self.learner_variant,
+            "recourse_variant": getattr(self, "recourse_variant", "legacy"),
+        }
+        for name in ("critic2", "graph_encoder", "mixer", "actor", "queue_predictor"):
+            state[f"{name}_state_dict"] = getattr(self, name).state_dict()
+        return state
+
     def extra_checkpoint_state(self) -> dict[str, Any]:
         joint_replay_state = self.joint_replay_buffer.state_dict(
             mode=(

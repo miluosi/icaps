@@ -224,6 +224,18 @@ class PyTorchChargingValueFunction(_PostDemandFeatureMASAC):
             })
         return loss
 
+    def inference_checkpoint_state(self) -> dict[str, Any]:
+        state = super().inference_checkpoint_state()
+        state.pop("reloc_request_score_margin", None)
+        state.pop("reloc_request_cap_total", None)
+        state.update({
+            "post_demand_direct_version": self.post_demand_direct_version,
+            "post_demand_q_clip": self.post_demand_q_clip,
+            "post_demand_q1_action_weights": self.network.action_weights.detach().cpu(),
+            "post_demand_q2_action_weights": self.critic2.action_weights.detach().cpu(),
+        })
+        return state
+
     def extra_checkpoint_state(self) -> dict[str, Any]:
         state = super().extra_checkpoint_state()
         state.pop("reloc_request_score_margin", None)

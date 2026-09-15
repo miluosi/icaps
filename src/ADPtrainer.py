@@ -345,12 +345,85 @@ class ADPTrainer:
     
     
     @staticmethod
+    def _save_inference_checkpoint(
+        value_function, episode, checkpoint_dir, checkpoint_tag="latest",
+        checkpoint_metadata=None,
+    ) -> dict:
+        """Keep episode endpoints and reward-best models, without replay/optimizers.
+
+        Retain the historical filename and loader schema for test_nyc_model.
+        Replace atomically before pruning an older best model.
+        """
+        import tempfile
+
+        if checkpoint_tag not in {"latest", "best", "best_ev", "best_aev"}:
+            raise ValueError(f"Unsupported inference checkpoint tag: {checkpoint_tag}")
+        root = Path(checkpoint_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        prefix = "" if checkpoint_tag == "latest" else f"{checkpoint_tag}_"
+        path = root / f"{prefix}full_state_episode_{episode}.pth"
+        payload = {
+            "checkpoint_format": "inference_v1",
+            "episode": int(episode),
+            "checkpoint_tag": checkpoint_tag,
+            "conservative_charging": bool(getattr(getattr(value_function, "env", None), "conservative_charging", False)),
+            "training_step": int(getattr(value_function, "training_step", 0)),
+            "network_state_dict": value_function.network.state_dict(),
+            "extra_value_function_state": value_function.inference_checkpoint_state(),
+        }
+        if checkpoint_metadata:
+            payload.update(checkpoint_metadata)
+        for name in (
+            "time_zone_dist_predictor", "zone_dist_predictor", "rejection_predictor",
+            "time_zone_dist_predictor_leader", "time_zone_dist_predictor_follower",
+            "zone_dist_predictor_leader", "zone_dist_predictor_follower",
+        ):
+            module = getattr(value_function, name, None)
+            if module is not None:
+                payload[f"{name}_state_dict"] = module.state_dict()
+        payload["rejection_predictor_trained"] = bool(
+            getattr(value_function, "rejection_predictor_trained", False)
+        )
+
+        def cpu_state(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu()
+            if isinstance(value, dict):
+                return {key: cpu_state(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return type(value)(cpu_state(item) for item in value)
+            return value
+
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=root, suffix=".tmp", delete=False) as handle:
+                temporary_path = Path(handle.name)
+                torch.save(cpu_state(payload), handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        # All episode-end models remain available; best tags keep one winner.
+        if checkpoint_tag != "latest":
+            for pattern in (f"{prefix}full_state_episode_*.pth", f"{prefix}network_episode_*.pth"):
+                for previous in root.glob(pattern):
+                    if previous != path:
+                        previous.unlink()
+        artifacts = getattr(value_function, "checkpoint_artifact_paths", [])
+        value_function.checkpoint_artifact_paths = list(dict.fromkeys([*artifacts, str(path)]))
+        print(f"✓ Test model {checkpoint_tag} saved: {path} ({path.stat().st_size / 1024**2:.2f} MiB; no replay/optimizer)", flush=True)
+        return {"full_state": str(path)}
+
+    @staticmethod
     def _save_q_network_checkpoint(
         value_function,
         episode: int,
         checkpoint_dir: str = "checkpoints/q_networks",
         checkpoint_tag: str = "latest",
         checkpoint_metadata: dict | None = None,
+        inference_only: bool = False,
     ) -> dict:
         """保存Q-network检查点，并按标签保留最近一次保存。"""
         import os
@@ -359,6 +432,11 @@ class ADPTrainer:
         if value_function is None:
             print("❌ Value function为空，无法保存")
             return {}
+
+        if inference_only:
+            return ADPTrainer._save_inference_checkpoint(
+                value_function, episode, checkpoint_dir, checkpoint_tag, checkpoint_metadata
+            )
 
         os.makedirs(checkpoint_dir, exist_ok=True)
 

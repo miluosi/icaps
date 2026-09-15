@@ -45,7 +45,7 @@ def test_training_dispatch_keeps_conservative_checkpoints_separate(monkeypatch):
     run_nyctrainer.main(['--methods', 'r1', '--episodes', '1', '--start-date', '2025-12-18',
                         '--conservative-charging', '--checkpoint-suffix', 'experiment'])
     assert calls[0]['conservative_charging'] is True
-    assert 'experiment_charge-conservative_method-r1' in calls[0]['checkpoint_suffix']
+    assert 'experiment_charge-conservative_aev-centers-3_method-r1' in calls[0]['checkpoint_suffix']
     assert charging_checkpoint_suffix('experiment', False) == 'experiment'
 
 

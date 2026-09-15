@@ -466,6 +466,19 @@ class PyTorchChargingValueFunction(_BaseMASAC):
             self.train_post_demand_predictor(batch_size=batch_size)
         return loss
 
+    def inference_checkpoint_state(self) -> dict[str, Any]:
+        state = super().inference_checkpoint_state()
+        state.update({
+            "post_demand_predictor_state_dict": self.post_demand_predictor.state_dict(),
+            "post_demand_predictor_trained": self.post_demand_predictor_trained,
+            "post_demand_scale": self.post_demand_scale,
+            "post_demand_output_bias": self.post_demand_output_bias,
+            "post_demand_feature_version": self.post_demand_feature_version,
+            "reloc_request_score_margin": self.reloc_request_score_margin,
+            "reloc_request_cap_total": self.reloc_request_cap_total,
+        })
+        return state
+
     def extra_checkpoint_state(self) -> dict[str, Any]:
         state = super().extra_checkpoint_state()
         state.update({

@@ -1688,6 +1688,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
     def extra_checkpoint_state(self):
         return {"ev_response": self.acceptance_checkpoint_state()}
 
+    def inference_checkpoint_state(self):
+        """Prediction metadata only; never traverse training/replay state."""
+        return {"ev_response": self.acceptance_checkpoint_state()}
+
     def load_extra_checkpoint_state(self, state):
         self.load_acceptance_checkpoint_state(state)
 

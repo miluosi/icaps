@@ -792,7 +792,7 @@ class NYCTrainer:
         assignmentgurobi: bool,
         mip_backend: str = "docplex",
         batch_size: int,
-        checkpoint_replay: str = "recent",
+        checkpoint_replay: str = "none",
         checkpoint_replay_recent: int = 5_000,
         num_vehicles: int,
         num_ev: int,
@@ -1312,11 +1312,9 @@ class NYCTrainer:
         best_reward = float("-inf")
         best_reward_ev = float("-inf")
         best_reward_aev = float("-inf")
-        best_loss_aev = float("inf")
-        best_loss_ev = float("inf")
 
+        print("Checkpoint policy: episode-end + reward-best; Test models only (no replay, optimizer, or loss checkpoints)", flush=True)
         global_step = 0
-        combined_best_loss = float("inf")
         for episode in range(num_episodes):
             cumulative_episode_index = resume_episode_offset + episode
             global_episode_number = cumulative_episode_index + 1
@@ -1480,6 +1478,7 @@ class NYCTrainer:
                 )
                 if (
                     use_neural_network
+                    and trainnetwork
                     and global_step >= prestep
                     and (aev_training_ready or ev_training_ready)
                     and episode >= start_training_episode
@@ -1510,72 +1509,6 @@ class NYCTrainer:
                         if latest_queue_loss_ev > 0:
                             episode_queue_losses_ev.append(latest_queue_loss_ev)
 
-                    if not ifloadcheckpoint:
-                        evfile, aevfile = self._checkpoint_dirs(
-                            transportation_mode=transportation_mode,
-                            assignmentgurobi=assignmentgurobi,
-                            num_ev=num_ev,
-                            use_intense_requests=use_intense_requests,
-                            start_date=start_date,
-                            end_date=end_date,
-                            zone_distribution_mode=effective_zone_distribution_mode,
-                            only_manhattan_zones=only_manhattan_zones,
-                            full_demand=full_demand,
-                            checkpoint_suffix=checkpoint_suffix,
-                        )
-
-                        loss_aev_f = float(loss_aev)
-                        loss_ev_f = float(loss_ev)
-                        if loss_aev_f > 0 and loss_ev_f > 0:
-                            combined_loss_f = loss_aev_f + loss_ev_f
-                            if np.isfinite(combined_loss_f) and combined_loss_f < float(combined_best_loss):
-                                combined_best_loss = combined_loss_f
-                                print(
-                                    f"🏆 New best combined loss: {combined_best_loss:.6f} at episode {episode + 1}, step {step}"
-                                )
-                                self._trainer_helper._save_q_network_checkpoint(
-                                    value_function,
-                                    episode + 1,
-                                    checkpoint_dir=aevfile,
-                                    checkpoint_tag="best_combined_loss",
-                                )
-                                self._trainer_helper._save_q_network_checkpoint(
-                                    value_function_ev,
-                                    episode + 1,
-                                    checkpoint_dir=evfile,
-                                    checkpoint_tag="best_combined_loss",
-                                )
-
-                        if (
-                            np.isfinite(loss_aev_f)
-                            and loss_aev_f > 0
-                            and loss_aev_f < best_loss_aev
-                        ):
-                            best_loss_aev = loss_aev_f
-                            print(
-                                f"🏆 New best AEV loss: {best_loss_aev:.6f} at episode {episode + 1}, step {step}, saving AEV checkpoint..."
-                            )
-                            self._trainer_helper._save_q_network_checkpoint(
-                                value_function,
-                                episode + 1,
-                                checkpoint_dir=aevfile,
-                                checkpoint_tag="best_loss",
-                            )
-                        if (
-                            np.isfinite(loss_ev_f)
-                            and loss_ev_f > 0
-                            and loss_ev_f < best_loss_ev
-                        ):
-                            best_loss_ev = loss_ev_f
-                            print(
-                                f"🏆 New best EV loss: {best_loss_ev:.6f} at episode {episode + 1}, step {step}, saving EV checkpoint..."
-                            )
-                            self._trainer_helper._save_q_network_checkpoint(
-                                value_function_ev,
-                                episode + 1,
-                                checkpoint_dir=evfile,
-                                checkpoint_tag="best_loss",
-                            )
                     if (
                         global_step > 0
                         and global_step % loss_save_interval == 0
@@ -1663,7 +1596,13 @@ class NYCTrainer:
                 episode_charging_events.extend(info.get("charging_events", []))
                 global_step += 1
 
-            if use_neural_network:
+            print(
+                f"Episode {global_episode_number} rollout finished: "
+                f"reward={episode_reward:.2f} AEV={episode_reward_aev:.2f} EV={episode_reward_ev:.2f}",
+                flush=True,
+            )
+
+            if use_neural_network and trainnetwork:
                 evfile, aevfile = self._checkpoint_dirs(
                     transportation_mode=transportation_mode,
                     assignmentgurobi=assignmentgurobi,
@@ -1694,27 +1633,17 @@ class NYCTrainer:
                         value_function,
                         global_episode_number,
                         checkpoint_dir=aevfile,
+                        inference_only=True,
                         checkpoint_tag="best",
                         checkpoint_metadata=best_metadata,
                     )
-                    shared_payload_owner = bool(
-                        getattr(
-                            value_function_ev,
-                            "_owns_joint_replay_payload",
-                            True,
-                        )
-                    )
-                    if value_function_ev is value_function:
-                        value_function_ev._owns_joint_replay_payload = False
                     self._trainer_helper._save_q_network_checkpoint(
                         value_function_ev,
                         global_episode_number,
                         checkpoint_dir=evfile,
+                        inference_only=True,
                         checkpoint_tag="best",
                         checkpoint_metadata=best_metadata,
-                    )
-                    value_function_ev._owns_joint_replay_payload = (
-                        shared_payload_owner
                     )
 
                 if episode_reward_ev > best_reward_ev:
@@ -1724,6 +1653,7 @@ class NYCTrainer:
                         value_function_ev,
                         global_episode_number,
                         checkpoint_dir=evfile,
+                        inference_only=True,
                         checkpoint_tag="best_ev",
                     )
 
@@ -1734,10 +1664,11 @@ class NYCTrainer:
                         value_function,
                         global_episode_number,
                         checkpoint_dir=aevfile,
+                        inference_only=True,
                         checkpoint_tag="best_aev",
                     )
 
-            if use_neural_network:
+            if use_neural_network and trainnetwork:
                 evfile, aevfile = self._checkpoint_dirs(
                     transportation_mode=transportation_mode,
                     assignmentgurobi=assignmentgurobi,
@@ -1756,25 +1687,24 @@ class NYCTrainer:
                 checkpoint_metadata = {
                     "checkpoint_pair_id": latest_pair_id,
                     "training_run_id": training_run_id,
+                    "combined_reward": float(episode_reward),
+                    "episode_reward_ev": float(episode_reward_ev),
+                    "episode_reward_aev": float(episode_reward_aev),
                 }
                 self._trainer_helper._save_q_network_checkpoint(
                     value_function,
                     global_episode_number,
                     checkpoint_dir=aevfile,
+                    inference_only=True,
                     checkpoint_metadata=checkpoint_metadata,
                 )
-                shared_payload_owner = bool(
-                    getattr(value_function_ev, "_owns_joint_replay_payload", True)
-                )
-                if value_function_ev is value_function:
-                    value_function_ev._owns_joint_replay_payload = False
                 self._trainer_helper._save_q_network_checkpoint(
                     value_function_ev,
                     global_episode_number,
                     checkpoint_dir=evfile,
+                    inference_only=True,
                     checkpoint_metadata=checkpoint_metadata,
                 )
-                value_function_ev._owns_joint_replay_payload = shared_payload_owner
 
             avg_loss_aev = np.mean(episode_losses) if episode_losses else 0.0
             avg_loss_ev = np.mean(episode_losses_ev) if episode_losses_ev else 0.0
