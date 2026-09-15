@@ -113,8 +113,9 @@ def parse_args(argv=None):
     parser.add_argument("--num-ev", type=int, default=25, help="EV vehicles")
     parser.add_argument("--seeds", type=int, nargs="+", default=[256],
                         help="Random seeds for evaluation (different from training seed)")
-    parser.add_argument("--start-date", type=str, default="2025-12-18", help="Start date for NYC evaluation dataset (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, default=None, help="End date for NYC evaluation dataset (YYYY-MM-DD); defaults to --start-date")
+    parser.add_argument("--start-date", type=str, default="2025-12-15", help="Start date for NYC evaluation dataset (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default="2025-12-17", help="End date for NYC evaluation dataset (YYYY-MM-DD); defaults to --start-date")
+    parser.add_argument("--duration-days", type=int, default=3, help="Optional override for evaluation duration in days; derived from start/end date if not provided")
     parser.add_argument("--parquet-path", type=str, default=None,
                         help="Yellow Taxi parquet path or comma-separated list")
     parser.add_argument("--full-demand", action="store_true",
