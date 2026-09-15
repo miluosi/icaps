@@ -105,7 +105,7 @@ def parse_args(argv=None):
     add_acceptance_arguments(parser)
     add_method_list_arguments(parser, method_choices=NYC_TEST_METHODS)
     parser.add_argument('--checkpoint-suffix', default='', help='Experiment namespace printed by the training CLI, excluding the auto-added EV predictor hash')
-    parser.add_argument("--paper-parameter-preset", action="store_true",
+    parser.add_argument("--paper-parameter-preset", action="store_true",default=True,
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
     parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes per seed")
