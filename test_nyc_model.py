@@ -626,7 +626,9 @@ def build_checkpoint_dir(
         full_demand=full_demand,
         checkpoint_suffix=checkpoint_suffix,
     )
-    return ev_dir if vtype == "ev" else aev_dir
+    return NYCTrainer._resolve_checkpoint_dir(
+        ev_dir if vtype == "ev" else aev_dir, start_date, end_date,
+    )
 
 
 def resolve_dataset_dates(start_date: str, end_date: str | None) -> tuple[str, str, str, str]:
@@ -1117,6 +1119,14 @@ def main(argv=None):
                         f"ChargeTime: {mean_charge_duration_all:.2f} min  "
                         f"DropOff: {mean_drop_off_rate:.4f}  "
                         f"MaxPressure: {mean_max_station_pressure:.2f}")
+
+    if not all_results:
+        raise SystemExit(
+            "No evaluation results: all requested configurations were skipped. "
+            "Check the checkpoint paths above and --load-model-start-date / "
+            "--load-model-end-date, method and charging namespace. "
+            "Existing result files were not overwritten."
+        )
 
     # ── 3. Summary table ──
     print("\n" + "=" * 120)

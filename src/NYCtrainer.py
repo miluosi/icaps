@@ -53,6 +53,53 @@ class NYCTrainer:
         raise ValueError(f"Unsupported transportation mode: {transportation_mode}")
 
     @staticmethod
+    def _checkpoint_date_token(value: str | None, fallback: str) -> str:
+        if not value:
+            return fallback
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y%m%d")
+
+    @staticmethod
+    def _resolve_checkpoint_dir(
+        directory: str, start_date: str | None, end_date: str | None,
+    ) -> str:
+        """Read legacy unpadded date names without changing any other namespace.
+
+        New saves use YYYYMMDD. Older saves stripped '-' from raw CLI dates,
+        so 2025-12-8 produced 2025128. Prefer the canonical directory; reject
+        ambiguous legacy matches instead of choosing a potentially wrong run.
+        """
+        path = Path(directory)
+        if path.is_dir() or not start_date:
+            return directory
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date or start_date, "%Y-%m-%d")
+        canonical = f"_{start:%Y%m%d}_{end:%Y%m%d}_"
+        if canonical not in path.name:
+            return directory
+
+        def aliases(date):
+            return {
+                f"{date.year:04d}{month}{day}"
+                for month in (str(date.month), f"{date.month:02d}")
+                for day in (str(date.day), f"{date.day:02d}")
+            }
+
+        candidates = {
+            path.with_name(path.name.replace(canonical, f"_{left}_{right}_", 1))
+            for left in aliases(start) for right in aliases(end)
+        }
+        matches = sorted(p for p in candidates if p.is_dir())
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous legacy checkpoint date directories for {directory}: "
+                + ", ".join(map(str, matches))
+            )
+        if matches:
+            print(f"✓ Legacy checkpoint date directory: {directory} -> {matches[0]}")
+            return str(matches[0])
+        return directory
+
+    @staticmethod
     def _checkpoint_dirs(
         transportation_mode: str,
         assignmentgurobi: bool,
@@ -66,8 +113,8 @@ class NYCTrainer:
         checkpoint_suffix: str | None = None,
     ) -> tuple[str, str]:
         assign_tag = "gurobi" if assignmentgurobi else "heu"
-        start_date = (start_date or "unknown_start").replace("-", "")
-        end_date = (end_date or start_date).replace("-", "")
+        start_date = NYCTrainer._checkpoint_date_token(start_date, "unknown_start")
+        end_date = NYCTrainer._checkpoint_date_token(end_date, start_date)
         date_suffix = f"_{start_date}_{end_date}"
         distribution_suffix = NYCTrainer._distribution_suffix(zone_distribution_mode)
         zone_scope_suffix = "_manhattan" if only_manhattan_zones else ""
@@ -1115,6 +1162,14 @@ class NYCTrainer:
                 only_manhattan_zones=only_manhattan_zones,
                 full_demand=full_demand,
                 checkpoint_suffix=checkpoint_suffix,
+            )
+            evfile = self._resolve_checkpoint_dir(
+                evfile, load_checkpoint_start_date or start_date,
+                load_checkpoint_end_date or load_checkpoint_start_date or end_date,
+            )
+            aevfile = self._resolve_checkpoint_dir(
+                aevfile, load_checkpoint_start_date or start_date,
+                load_checkpoint_end_date or load_checkpoint_start_date or end_date,
             )
             if load_best_loss:
                 checkpoint_selection = "best_loss"
