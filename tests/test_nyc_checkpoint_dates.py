@@ -91,3 +91,58 @@ def test_missing_all_checkpoints_exits_without_overwriting_results(tmp_path, mon
         ])
     assert output.read_bytes() == b"previous valid results"
     assert not list(output.parent.glob("*.xlsx"))
+
+
+def test_server_r1_r3_defaults_find_legacy_models_without_rollout(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    # Actual server naming: unpadded Dec 8, three dedicated AEV centers.
+    for method in ("r1", "r3"):
+        for role in ("ev", "aev"):
+            directory = Path(
+                "checkpoints/q_networksevfirst_nyc_gurobi_evfirst_1500_True_"
+                "2025128_20251210_optimization_anchored_residual_manhattan_"
+                f"aev-centers-3_method-{method}_rec-{method}_state-joint_state_separate_critics_"
+                f"learner-optimization_anchored_residual_shift-0_{role}"
+            )
+            directory.mkdir(parents=True)
+            torch.save({"episode": 3, "checkpoint_tag": "best",
+                        "checkpoint_pair_id": f"{method}:best:3"},
+                       directory / "best_full_state_episode_3.pth")
+
+    def unexpected_training(**kwargs):
+        pytest.fail("Precheck must not start a rollout")
+
+    monkeypatch.setattr(test_nyc_model, "run_nyc_training", unexpected_training)
+    test_nyc_model.main([
+        "--methods", "r3", "r1", "--strategies", "ADP-MCMF", "--checkpoints-only",
+        "--output-dir", "results/isolated",
+    ])
+    output = capsys.readouterr().out
+    assert "Checkpoint precheck passed" in output
+    assert "NOT FOUND" not in output
+    assert "AEV charging centers: 3" in output
+    assert "Dataset dates: 2025-12-15 -> 2025-12-17" in output
+    assert "Checkpoint dates: 2025-12-08 -> 2025-12-10" in output
+    assert "Result directory: results/isolated" in output
+    assert not Path("results").exists()
+
+
+def test_checkpoints_only_fails_on_missing_models(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="Checkpoint precheck failed"):
+        test_nyc_model.main([
+            "--methods", "r1", "--strategies", "ADP-MCMF", "--checkpoints-only",
+        ])
+
+
+def test_server_defaults_preserve_explicit_other_experiments():
+    args = test_nyc_model.apply_paper_parameter_preset(test_nyc_model.parse_args([
+        "--aev-charging-center-count", "0", "--load-model-start-date", "2025-11-01",
+        "--load-model-end-date", "2025-11-03", "--output-dir", "results/custom",
+    ]))
+    assert args.aev_charging_center_count == 0
+    assert args.load_model_start_date == "2025-11-01"
+    assert args.load_model_end_date == "2025-11-03"
+    assert args.output_dir == Path("results/custom")
+    assert args.mcmf_backend == "ortools"
+    assert args.mcmf_graph_reduction

@@ -105,6 +105,10 @@ def parse_args(argv=None):
     add_acceptance_arguments(parser)
     add_method_list_arguments(parser, method_choices=NYC_TEST_METHODS)
     parser.add_argument('--checkpoint-suffix', default='', help='Experiment namespace printed by the training CLI, excluding the auto-added EV predictor hash')
+    parser.add_argument('--checkpoints-only', action='store_true',
+                        help='Check checkpoint availability and exit without starting simulation')
+    parser.add_argument('--output-dir', type=Path, default=Path('results/test_model'),
+                        help='Result directory; use separate directories for concurrent tests')
     parser.add_argument("--paper-parameter-preset", action="store_true",default=True,
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
@@ -133,7 +137,7 @@ def parse_args(argv=None):
         "--aev-charging-center-count",
         type=int,
         choices=(0, 3, 4, 5),
-        default=0,
+        default=3,
         help=(
             "AEV-only Manhattan charging-center scenario. 0 keeps legacy "
             "public-station access; 3/4/5 selects the workbook-derived centers."
@@ -164,10 +168,10 @@ def parse_args(argv=None):
                         help="Start hour used when the loaded checkpoint was trained")
     parser.add_argument("--checkpoint-trained-stop-hour", type=float, default=24.0,
                         help="Stop hour used when the loaded checkpoint was trained")
-    parser.add_argument("--load-model-start-date", type=str, default=None,
-                        help="Start date encoded in the checkpoint directory; defaults to evaluation start date")
-    parser.add_argument("--load-model-end-date", type=str, default=None,
-                        help="End date encoded in the checkpoint directory; defaults to evaluation end date")
+    parser.add_argument("--load-model-start-date", type=str, default="2025-12-08",
+                        help="Training start date encoded in the checkpoint directory (default: 2025-12-08)")
+    parser.add_argument("--load-model-end-date", type=str, default="2025-12-10",
+                        help="Training end date encoded in the checkpoint directory (default: 2025-12-10)")
     
     parser.add_argument("--strategies", type=str, nargs="+",
                         default=["ADP-MCMF","ADP-MCMF-K", "MCMF","MCMF-K", "ADP-HEU", "ADP-HEU-K", "HEU",],
@@ -200,7 +204,7 @@ def parse_args(argv=None):
     parser.add_argument("--num-stations", type=int, default=5, help="Number of charging stations")
     parser.add_argument("--grid-size", type=int, default=20, help="Grid size for the environment (NxN)")
     parser.add_argument("--test_episodenumber", type=int, default=1, help="Starting episode number for evaluation (used in checkpoint naming convention)")
-    parser.add_argument("--test-steps-per-episode", type=int, default=1920,
+    parser.add_argument("--test-steps-per-episode", type=int, default=2880,
                         help="Expected steps for alignment check; actual episode length is derived from start/stop-hour and epoch-length")
     parser.add_argument(
         "--checkpoint-selection",
@@ -567,8 +571,8 @@ def apply_paper_parameter_preset(args):
         return args
 
     default_paper_date = "2025-12-18"
-    load_model_start_dataset_date = "2025-12-15"
-    load_model_end_dataset_date = "2025-12-17"
+    load_model_start_dataset_date = "2025-12-08"
+    load_model_end_dataset_date = "2025-12-10"
     args.num_vehicles = 3000
     args.num_ev = args.num_vehicles//2
     if args.station_csv is None:
@@ -706,6 +710,7 @@ def main(argv=None):
     print(f"   Dataset dates: {dataset_start_date} -> {dataset_end_date}")
     print(f"   Checkpoint dates: {checkpoint_start_date} -> {checkpoint_end_date}")
     print(f"   Checkpoint selection: {checkpoint_selection}")
+    print(f"   Result directory: {args.output_dir}")
     print(f"   Time window: {args.start_hour:.1f} -> {args.stop_hour:.1f} ({expected_steps} steps @ {args.epoch_length:.1f}s)")
     print(f"   Zone scope: {'Manhattan only' if args.only_manhattan_zones else 'full NYC CSV zones'}")
     print(f"   Demand: {'Yellow + non-pooled HVFHV' if args.full_demand else 'Yellow only'}")
@@ -774,6 +779,15 @@ def main(argv=None):
         if missing_count:
             print(f"\n⚠  {missing_count} config(s) missing checkpoint — ADP strategies will be skipped for those.")
     print()
+
+    if args.checkpoints_only:
+        if not need_ckpt:
+            print("No checkpoints required for the selected baseline strategies.")
+        elif not all(ckpt_available.values()):
+            raise SystemExit("Checkpoint precheck failed; no simulation started.")
+        else:
+            print("Checkpoint precheck passed; no simulation started.")
+        return
 
     # ── 2. Run evaluation ──
     all_results = []
@@ -1157,7 +1171,7 @@ def main(argv=None):
         print(f"{s:<12} {m:<12} {np.mean(rews):>12.2f} {np.std(rews):>12.2f} {mean_service_ratio:>9.1f}% {mean_avg_wait:>10.2f} {mean_drop_off:>10.4f} {len(rews):>6}")
 
     # Save raw results
-    out_dir = Path("results/test_model")
+    out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     demand_tag = "_fulldemand" if args.full_demand else ""
     distribution_tag = f"_{zone_distribution_mode}{demand_tag}"
