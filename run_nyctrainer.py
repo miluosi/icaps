@@ -957,6 +957,7 @@ def run_nyc_training(
     aev_charging_center_count: int = 0,
     aev_charging_center_csv: str | None = None,
     conservative_charging: bool | None = False,
+    continuous_evaluation: bool | None = None,
 ):
     """Compatibility wrapper that delegates NYC training to src.NYCtrainer.NYCTrainer."""
 
@@ -1055,6 +1056,7 @@ def run_nyc_training(
         aev_charging_center_count=aev_charging_center_count,
         aev_charging_center_csv=aev_charging_center_csv,
         conservative_charging=conservative_charging,
+        continuous_evaluation=continuous_evaluation,
     )
 
 

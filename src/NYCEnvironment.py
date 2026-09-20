@@ -1087,12 +1087,17 @@ class NYCEnvironment:
     def _current_day_index(self, current_time=None) -> int:
         if current_time is None:
             current_time = self.current_time
+        if getattr(self, 'continuous_evaluation', False):
+            return int((self.START_EPOCH + float(current_time) * self.EPOCH_LENGTH) // 86400)
         demand_step = max(0.0, float(current_time) - 1.0)
         return int(self.episode_day_index + int(demand_step // max(1, self.simulation_period)))
 
     def _day_step_offset(self, current_time=None) -> float:
         if current_time is None:
             current_time = self.current_time
+        if getattr(self, 'continuous_evaluation', False):
+            second = (self.START_EPOCH + float(current_time) * self.EPOCH_LENGTH) % 86400
+            return (second - self.START_EPOCH) / self.EPOCH_LENGTH
         demand_step = max(0.0, float(current_time) - 1.0)
         return demand_step % max(1, self.simulation_period)
 
@@ -1101,7 +1106,35 @@ class NYCEnvironment:
         if not self._available_demand_dates:
             return None
         day_index = self._current_day_index(current_time)
+        if getattr(self, 'continuous_evaluation', False):
+            # Final-state reporting stays on the last date, never wraps to day 1.
+            return self._available_demand_dates[min(day_index, len(self._available_demand_dates) - 1)]
         return self._available_demand_dates[day_index % len(self._available_demand_dates)]
+
+    def configure_continuous_evaluation(self) -> int:
+        """One physical trajectory from first-date start to last-date stop.
+
+        With a partial daily demand window, motion and charging still advance
+        overnight; new requests are admitted only during that daily window.
+        Empty dates inside an explicit range are retained as calendar days.
+        """
+        self._ensure_demand_loaded()
+        if self.start_date is not None and self.end_date is not None:
+            dates = list(pd.date_range(self.start_date, self.end_date, freq='D'))
+        else:
+            dates = list(pd.date_range(self._available_demand_dates[0], self._available_demand_dates[-1], freq='D')) if self._available_demand_dates else []
+        if len(dates) <= 1:
+            return 1
+        seconds = (len(dates) - 1) * 86400 + self.STOP_EPOCH - self.START_EPOCH
+        steps = seconds / self.EPOCH_LENGTH
+        if not math.isclose(steps, round(steps)):
+            raise ValueError('Continuous evaluation boundaries must align with epoch_length')
+        self.model_episode_length = self.episode_length
+        self.continuous_evaluation = True
+        self._available_demand_dates = dates
+        self.episode_day_index = -1
+        self.episode_length = int(round(steps))
+        return len(dates)
 
     # ==================================================================
     # Distance / travel time
@@ -1558,6 +1591,17 @@ class NYCEnvironment:
         else:
             self.episode_day_index = 0
         self.current_time = 0.0
+        # A real reset (once per continuous test) must clear both vehicle and
+        # station state. Daily transitions in a continuous run do not call it.
+        for station in self.charging_manager.stations.values():
+            station.current_vehicles.clear()
+            station.charging_queue.clear()
+            station.charging_queue_notarrived.clear()
+            station.available_slots = station.max_capacity
+            station.expected_charging_occupancy = []
+            station.expected_charging_intervals = []
+            station.expected_charging_occupancy_updated_at = None
+        self.idle_charging_num = {sid: s.max_capacity for sid, s in self.charging_manager.stations.items()}
         self.request_value_sum = 0.0
         self.whole_req = 0
         self.ev_requests = []
@@ -1690,11 +1734,19 @@ class NYCEnvironment:
                     'station_count': 0,
                     'total_capacity': 0,
                     'queue_vehicle_count': 0,
+                    'waiting_vehicle_count': 0,
+                    'reservation_vehicle_count': 0,
                 },
             )
             bucket['station_count'] += 1
             bucket['total_capacity'] += int(station.max_capacity)
-            bucket['queue_vehicle_count'] += int(len(station.charging_queue) + len(station.charging_queue_notarrived))
+            # Count each vehicle once; charging occupants are not a queue.
+            charging = {str(v) for v in station.current_vehicles}
+            waiting = {str(v) for v in station.charging_queue} - charging
+            reservations = {str(v) for v in station.charging_queue_notarrived} - charging - waiting
+            bucket['waiting_vehicle_count'] += len(waiting)
+            bucket['reservation_vehicle_count'] += len(reservations)
+            bucket['queue_vehicle_count'] += len(waiting) + len(reservations)
         return zone_station_counts
 
     def _compute_station_pressure_snapshot(self):
@@ -1799,12 +1851,16 @@ class NYCEnvironment:
                     'station_count_sum': 0.0,
                     'total_capacity_sum': 0.0,
                     'queue_vehicle_count_sum': 0.0,
+                    'waiting_vehicle_count_sum': 0.0,
+                    'reservation_vehicle_count_sum': 0.0,
                 },
             )
             bucket['snapshot_count'] += 1
             bucket['station_count_sum'] += float(zone_stats.get('station_count', 0))
             bucket['total_capacity_sum'] += float(zone_stats.get('total_capacity', 0))
             bucket['queue_vehicle_count_sum'] += float(zone_stats.get('queue_vehicle_count', 0))
+            for field in ('waiting_vehicle_count', 'reservation_vehicle_count'):
+                bucket[field + '_sum'] += float(zone_stats[field])
 
     # ==================================================================
     # Demand generation from real data
@@ -1993,6 +2049,10 @@ class NYCEnvironment:
         Each epoch covers [current_time * EPOCH_LENGTH, (current_time+1) * EPOCH_LENGTH)
         seconds of the day.
         """
+        if getattr(self, 'continuous_evaluation', False) and self.current_time >= self.episode_length:
+            self.last_generated_requests = 0
+            self.last_generated_request_time = self.current_time
+            return []
         date_label = self._normalize_demand_date(day if day is not None else self._current_date_label())
         if self._demand_day_cache is None or self._demand_day_cache_label != date_label:
             self._prepare_day_demand(date_label)
@@ -2001,7 +2061,7 @@ class NYCEnvironment:
         epoch_end_sec = epoch_start_sec + self.EPOCH_LENGTH
 
         # filter outside operating hours
-        if epoch_start_sec >= self.STOP_EPOCH:
+        if epoch_start_sec < self.START_EPOCH or epoch_start_sec >= self.STOP_EPOCH:
             self.last_generated_requests = 0
             self.last_generated_request_time = self.current_time
             return []
@@ -2216,6 +2276,10 @@ class NYCEnvironment:
         ``snapshot_window_seconds`` models request retention at a decision
         snapshot: all requests arriving in [t - window, t) are active at t.
         """
+        if getattr(self, 'continuous_evaluation', False) and rand is None and self.current_time >= self.episode_length:
+            self.last_generated_requests = 0
+            self.last_generated_request_time = self.current_time
+            return []
         date_label = self._normalize_demand_date(day if day is not None else self._current_date_label())
         if self._demand_day_cache is None or self._demand_day_cache_label != date_label:
             self._prepare_day_demand(date_label)
@@ -2424,7 +2488,7 @@ class NYCEnvironment:
             lon / -74.0,
             v['battery'],
             float(v['charging_station'] is not None),
-            self.current_time / max(1, self.episode_length),
+            (self._day_step_offset() if getattr(self, "continuous_evaluation", False) else self.current_time) / max(1, getattr(self, "model_episode_length", self.episode_length)),
         ], dtype=np.float32)
 
     def get_initial_states(self, num_agents=None, is_training=True):
@@ -2524,6 +2588,8 @@ class NYCEnvironment:
         vehicle = self.vehicles[vehicle_id]
         self._mark_ev_pending_dropout_penalty(vehicle_id)
         next_day_time = (self._current_day_index() + 1) * self.simulation_period
+        if getattr(self, 'continuous_evaluation', False):
+            next_day_time = ((self._current_day_index() + 1) * 86400 - self.START_EPOCH) / self.EPOCH_LENGTH
         vehicle['is_online'] = False
         vehicle['offline_until_time'] = next_day_time
         vehicle['assigned_request'] = None
@@ -2610,7 +2676,8 @@ class NYCEnvironment:
         self._update_all_ev_satisfaction()
         daily_online = 0
         for vehicle_id, vehicle in self.vehicles.items():
-            vehicle['idle_timer'] = 0
+            if not getattr(self, 'continuous_evaluation', False):
+                vehicle['idle_timer'] = 0
             was_online = vehicle.get('is_online', True)
             if self.daily_drop_off and self._can_daily_dropout(vehicle):
                 self._handle_vehicle_dropout_event(vehicle_id)
@@ -2827,7 +2894,7 @@ class NYCEnvironment:
             v = self.vehicles[vid]
             loc_norm = float(v['location']) / norm
             battery = float(v.get('battery', 1.0))
-            idle_time = float(v.get('idle_timer', 0)) / max(1.0, float(self.episode_length))
+            idle_time = float(v.get('idle_timer', 0)) / max(1.0, float(getattr(self, 'model_episode_length', self.episode_length)))
             act = actions.get(vid)
             if act is None:
                 target_loc_norm = loc_norm
@@ -4370,7 +4437,7 @@ class NYCEnvironment:
 
         record_usage_start = time.time()
         self._record_charging_usage()
-        self._record_hourly_zone_vehicle_snapshot(current_time=self.current_time)
+        self._record_hourly_zone_vehicle_snapshot(current_time=(self.current_time - 1 if getattr(self, 'continuous_evaluation', False) else self.current_time))
         record_usage_time = time.time() - record_usage_start
         total_step_time = time.time() - step_start
         self._last_step_profile = {
@@ -4538,7 +4605,10 @@ class NYCEnvironment:
         pressure_snapshot = self._record_station_pressure_snapshot()
         total_occ = sum(len(s.current_vehicles) for s in self.charging_manager.stations.values())
         total_st = len(self.charging_manager.stations)
+        queue_counts = self._compute_zone_charge_station_counts()
         self.charging_usage_history.append({
+            **{field: sum(row[field] for row in queue_counts.values())
+               for field in ('queue_vehicle_count', 'waiting_vehicle_count', 'reservation_vehicle_count')},
             'time': self.current_time,
             'total_occupied': total_occ,
             'total_stations': total_st,
@@ -4550,7 +4620,7 @@ class NYCEnvironment:
                 sid: len(s.current_vehicles) for sid, s in self.charging_manager.stations.items()
             },
         })
-        self._record_hourly_zone_charge_station_snapshot(current_time=self.current_time)
+        self._record_hourly_zone_charge_station_snapshot(current_time=(self.current_time - 1 if getattr(self, 'continuous_evaluation', False) else self.current_time))
 
     # ==================================================================
     # Q-learning update (placeholder – real logic in value_function)
@@ -6757,16 +6827,21 @@ class NYCEnvironment:
         rebalance_num=0,
         charge_feasibility=None,
     ):
-        """Keep a real outside action for every decision vehicle at every SoC.
+        """Learned dispatch keeps wait; myopic dispatch forbids it below min SoC.
 
-        Charging admission remains controlled by the charge mask.  Competition
-        for shared slots must not remove this private feasibility fallback.
-        Legacy arguments and charge_wait_bool are retained for compatibility;
-        they no longer gate NYC wait, including in conservative mode.
+        Applies to pure myopic evaluation (adp_value=0), including Myopic r1/r2.
+        Learned r2 retains its fallback even though its follower is structured.
+        Wait is not restored when charging competition makes the graph infeasible.
         """
         del rebalance_num, charge_feasibility
         self._last_wait_forced_charge_station = {}
-        return np.ones((len(vehicle_ids), 1), dtype=np.float32)
+        wait = np.ones((len(vehicle_ids), 1), dtype=np.float32)
+        myopic = float(getattr(self, 'adp_value', 1.0)) <= 0.0
+        if myopic:
+            for row, vid in enumerate(vehicle_ids):
+                if self.vehicles[vid]['battery'] < self.min_battery_level:
+                    wait[row, 0] = 0.0
+        return wait
 
     def _active_gat_neighbour_number(self) -> int:
         neighbour_numbers = []
@@ -8097,6 +8172,8 @@ class NYCEnvironment:
                     'mean_station_count': mean_station_count,
                     'mean_total_capacity': mean_total_capacity,
                     'mean_queue_vehicle_count': mean_queue_vehicle_count,
+                    'mean_waiting_vehicle_count': float(bucket.get('waiting_vehicle_count_sum', 0.0)) / divisor,
+                    'mean_reservation_vehicle_count': float(bucket.get('reservation_vehicle_count_sum', 0.0)) / divisor,
                     'mean_queue_to_capacity_ratio': mean_queue_vehicle_count / mean_total_capacity if mean_total_capacity > 0 else 0.0,
                 })
         avg_charging_wait_time = (
@@ -8144,6 +8221,7 @@ class NYCEnvironment:
             'rejected_orders': total_rejected,
             'rejected_requests': rejected_requests,
             'recourse_requests': recourse_requests,
+            **{key: lifecycle_metrics[key] for key in ('recourse_assigned_requests', 'recourse_completed_requests', 'recourse_uncompleted_requests', 'recourse_success_rate')},
             'lost_requests': lost_requests,
             'unresolved_requests': unresolved_requests,
             'rejection_reward_total': rejection_reward_total,
@@ -8228,6 +8306,10 @@ class NYCEnvironment:
             'avg_station_utilization': avg_util,
             'vehicles_unable_to_reach_charging': self._count_vehicles_unable_to_reach_charging(),
             'avg_vehicles_per_station': avg_per_station,
+            **{name: float(np.mean([row.get(field, 0) for row in self.charging_usage_history])) if self.charging_usage_history else 0.0
+               for name, field in (('avg_queue_length_including_reservations', 'queue_vehicle_count'),
+                                   ('avg_queue_length_waiting', 'waiting_vehicle_count'),
+                                   ('avg_queue_length_reservations', 'reservation_vehicle_count'))},
             'ev_rejected': ev_rej,
             'aev_rejected': aev_rej,
             'recourse_variant': getattr(self, 'recourse_variant', 'legacy'),

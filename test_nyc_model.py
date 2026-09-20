@@ -70,6 +70,18 @@ STRATEGIES = [
 ]
 
 PRESERVED_OUTPUT_COLUMNS = {
+    "recourse_assigned_requests",
+    "recourse_completed_requests",
+    "recourse_uncompleted_requests",
+    "recourse_success_rate",
+    "recourse_success_rate_pct",
+    "recourse_recovery_share",
+    "avg_queue_length_including_reservations",
+    "avg_queue_length_waiting",
+    "avg_queue_length_reservations",
+    "mean_reservation_vehicle_count",
+    "mean_queue_vehicle_count",
+
     "conservative_charging",
     "checkpoint_conservative_charging",
     "avg_wait",
@@ -112,7 +124,7 @@ def parse_args(argv=None):
     parser.add_argument("--paper-parameter-preset", action="store_true",default=True,
                         help="Apply the paper-aligned EV preset: 3000 EVs, 24h window, 30s epoch; battery/speed/charge parameters are already defined in NYCEnvironment")
     # --- NYC-specific ---
-    parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes per seed")
+    parser.add_argument("--episodes", type=int, default=20, help="Calendar days per seed; a multi-day date range runs one continuous trajectory")
     parser.add_argument("--num-vehicles", type=int, default=50, help="Total vehicles")
     parser.add_argument("--num-ev", type=int, default=25, help="EV vehicles")
     parser.add_argument("--seeds", type=int, nargs="+", default=[256],
@@ -451,6 +463,8 @@ def _aggregate_hourly_zone_charge_station_counts(detailed: list[dict]) -> tuple[
             mean_station_count = float(zone_row.get("mean_station_count", 0.0) or 0.0)
             mean_total_capacity = float(zone_row.get("mean_total_capacity", 0.0) or 0.0)
             mean_queue_vehicle_count = float(zone_row.get("mean_queue_vehicle_count", 0.0) or 0.0)
+            mean_waiting_vehicle_count = float(zone_row.get("mean_waiting_vehicle_count", 0.0) or 0.0)
+            mean_reservation_vehicle_count = float(zone_row.get("mean_reservation_vehicle_count", 0.0) or 0.0)
             mean_queue_to_capacity_ratio = float(zone_row.get("mean_queue_to_capacity_ratio", 0.0) or 0.0)
             hourly_zone_rows.append({
                 "episode_number": episode_idx,
@@ -461,6 +475,8 @@ def _aggregate_hourly_zone_charge_station_counts(detailed: list[dict]) -> tuple[
                 "mean_station_count": mean_station_count,
                 "mean_total_capacity": mean_total_capacity,
                 "mean_queue_vehicle_count": mean_queue_vehicle_count,
+                "mean_waiting_vehicle_count": mean_waiting_vehicle_count,
+                "mean_reservation_vehicle_count": mean_reservation_vehicle_count,
                 "mean_queue_to_capacity_ratio": mean_queue_to_capacity_ratio,
             })
 
@@ -475,12 +491,16 @@ def _aggregate_hourly_zone_charge_station_counts(detailed: list[dict]) -> tuple[
                     "weighted_station_count": 0.0,
                     "weighted_total_capacity": 0.0,
                     "weighted_queue_vehicle_count": 0.0,
+                    "weighted_waiting_vehicle_count": 0.0,
+                    "weighted_reservation_vehicle_count": 0.0,
                 },
             )
             bucket["snapshot_count"] += snapshot_count
             bucket["weighted_station_count"] += mean_station_count * weight
             bucket["weighted_total_capacity"] += mean_total_capacity * weight
             bucket["weighted_queue_vehicle_count"] += mean_queue_vehicle_count * weight
+            bucket["weighted_waiting_vehicle_count"] += mean_waiting_vehicle_count * weight
+            bucket["weighted_reservation_vehicle_count"] += mean_reservation_vehicle_count * weight
 
     aggregated_rows = []
     for key in sorted(hourly_zone_map.keys(), key=lambda item: (item[0] or "", item[1], item[2])):
@@ -497,6 +517,8 @@ def _aggregate_hourly_zone_charge_station_counts(detailed: list[dict]) -> tuple[
             "mean_station_count": mean_station_count,
             "mean_total_capacity": mean_total_capacity,
             "mean_queue_vehicle_count": mean_queue_vehicle_count,
+            "mean_waiting_vehicle_count": bucket["weighted_waiting_vehicle_count"] / divisor,
+            "mean_reservation_vehicle_count": bucket["weighted_reservation_vehicle_count"] / divisor,
             "mean_queue_to_capacity_ratio": mean_queue_vehicle_count / mean_total_capacity if mean_total_capacity > 0 else 0.0,
         })
 
@@ -699,7 +721,7 @@ def main(argv=None):
     print(f"   Strategies: {[s['name'] for s in selected_strategies]}")
     print(f"   ICAPS methods: {args.methods}")
     print(f"   Seeds: {args.seeds}")
-    print(f"   Episodes per config: {args.episodes}")
+    print(f"   Evaluation days per config: {args.episodes} (continuous across dates; daily model clock)")
     print(
         "   AEV charging centers: "
         f"{args.aev_charging_center_count} "
@@ -825,6 +847,7 @@ def main(argv=None):
 
                 fine_tune = bool(strat.get("train_during_test", False))
                 results, env = run_nyc_training(
+                    continuous_evaluation=True,
                     adpvalue=strat["adp"],
                     num_episodes=args.episodes,
                     use_intense_requests=intense,
@@ -905,7 +928,10 @@ def main(argv=None):
                 )
 
                 rewards = results.get("episode_rewards", [])
-                avg_reward = np.mean(rewards) if rewards else 0.0
+                continuous = bool(results.get("continuous_evaluation", False))
+                evaluation_days = int(results.get("evaluation_days", 1)) if continuous else max(1, len(rewards))
+                daily_divisor = evaluation_days if continuous else 1
+                avg_reward = sum(rewards) / evaluation_days if rewards else 0.0
 
                 detailed = results.get("episode_detailed_stats", [])
                 demand_signature = tuple(
@@ -1055,7 +1081,20 @@ def main(argv=None):
                     peak_completed_hour = None
                     peak_completed_orders = 0
 
+                recourse_assigned = sum(d.get("recourse_assigned_requests", 0) for d in detailed)
+                recourse_completed = sum(d.get("recourse_completed_requests", 0) for d in detailed)
                 entry = {
+                    "continuous_evaluation": continuous,
+                    "rollouts": len(rewards),
+                    "statistics_scope": "counts: full date range; reward: per calendar day; queues: time mean of network total",
+                    "daily_evaluation_json": _json_dumps(results.get("daily_evaluation", [])),
+                    "recourse_assigned_requests": recourse_assigned,
+                    "recourse_completed_requests": recourse_completed,
+                    "recourse_uncompleted_requests": recourse_assigned - recourse_completed,
+                    "recourse_success_rate": recourse_completed / recourse_assigned if recourse_assigned else np.nan,
+                    "recourse_success_rate_pct": 100 * recourse_completed / recourse_assigned if recourse_assigned else np.nan,
+                    "recourse_recovery_share": total_recourse_requests / (total_recourse_requests + total_lost_requests) if total_recourse_requests + total_lost_requests else np.nan,
+                    **{key: _mean_detail_metric(detailed, key) for key in ("avg_queue_length_including_reservations", "avg_queue_length_waiting", "avg_queue_length_reservations")},
                     "conservative_charging": bool(env.conservative_charging),
                     "checkpoint_conservative_charging": env.checkpoint_conservative_charging,
                     "charging_model_source": env.charging_model_source,
@@ -1064,7 +1103,7 @@ def main(argv=None):
                     "seed": seed,
                     "avg_reward": avg_reward,
                     "total_reward": sum(rewards),
-                    "episodes": len(rewards),
+                    "episodes": evaluation_days,
                     "total_orders": total_orders,
                     "accept": total_accept,
                     "reject": total_reject,
@@ -1072,8 +1111,8 @@ def main(argv=None):
                     "recourse_requests": total_recourse_requests,
                     "lost_requests": total_lost_requests,
                     "complete": total_complete,
-                    "mean_ev_completed_orders": mean_ev_completed_orders,
-                    "mean_aev_completed_orders": mean_aev_completed_orders,
+                    "mean_ev_completed_orders": mean_ev_completed_orders / daily_divisor,
+                    "mean_aev_completed_orders": mean_aev_completed_orders / daily_divisor,
                     "mean_assignment_success_rate": mean_assignment_success_rate,
                     "mean_completed_order_value": mean_completed_order_value,
                     "mean_ev_completed_order_value": mean_ev_completed_order_value,
@@ -1092,13 +1131,13 @@ def main(argv=None):
                     "mean_station_pressure_ratio": mean_station_pressure_ratio,
                     "avg_wait": mean_avg_wait,
                     "waiting_vehicle_count": total_waiting_vehicle_count,
-                    "mean_waiting_vehicle_count": mean_waiting_vehicle_count,
-                    "episode_reward_aev": mean_episode_reward_aev,
-                    "episode_reward_ev": mean_episode_reward_ev,
-                    "episode_aev_reward": mean_episode_reward_aev,
-                    "episode_ev_reward": mean_episode_reward_ev,
+                    "mean_waiting_vehicle_count": mean_waiting_vehicle_count / daily_divisor,
+                    "episode_reward_aev": mean_episode_reward_aev / daily_divisor,
+                    "episode_reward_ev": mean_episode_reward_ev / daily_divisor,
+                    "episode_aev_reward": mean_episode_reward_aev / daily_divisor,
+                    "episode_ev_reward": mean_episode_reward_ev / daily_divisor,
                     "avg_battery_level": mean_avg_battery_level,
-                    "finished_charge": mean_finished_charge,
+                    "finished_charge": mean_finished_charge / daily_divisor,
                     "avg_daily_charging_sessions_per_human_ev": mean_daily_charges_human_ev,
                     "avg_daily_charging_sessions_per_aev": mean_daily_charges_aev,
                     "avg_daily_charging_sessions_per_vehicle": mean_daily_charges_all,
@@ -1125,8 +1164,8 @@ def main(argv=None):
                         f"Accept: {entry['accept']}  Reject: {entry['reject']}  "
                         f"RejectedReq: {entry['rejected_requests']}  RecourseReq: {entry['recourse_requests']}  LostReq: {entry['lost_requests']}  "
                         f"Complete: {entry['complete']}  "
-                        f"EV complete(avg): {mean_ev_completed_orders:.2f}  "
-                        f"AEV complete(avg): {mean_aev_completed_orders:.2f}  "
+                        f"EV complete/day: {entry['mean_ev_completed_orders']:.2f}  "
+                        f"AEV complete/day: {entry['mean_aev_completed_orders']:.2f}  "
                         f"AvgWait: {mean_avg_wait:.2f}  "
                         f"WaitVeh: {mean_waiting_vehicle_count:.1f}  "
                         f"Charge/veh-day: {mean_daily_charges_all:.3f}  "
@@ -1180,6 +1219,8 @@ def main(argv=None):
         test_label = ('inherit' if args.conservative_charging is None else
                       'conservative' if args.conservative_charging else 'current')
         distribution_tag += f"_traincharge-{trained_label}_testcharge-{test_label}"
+    if any(r["continuous_evaluation"] for r in all_results):
+        distribution_tag += "_continuous"
     out_path = out_dir / f"test_results_4way{distribution_tag}.npy"
     np.save(out_path, all_results)
     print(f"\n✓ Raw results saved to {out_path}")
@@ -1237,6 +1278,8 @@ def main(argv=None):
                 "mean_station_count": zone_row.get("mean_station_count", 0.0),
                 "mean_total_capacity": zone_row.get("mean_total_capacity", 0.0),
                 "mean_queue_vehicle_count": zone_row.get("mean_queue_vehicle_count", 0.0),
+                "mean_waiting_vehicle_count": zone_row.get("mean_waiting_vehicle_count", 0.0),
+                "mean_reservation_vehicle_count": zone_row.get("mean_reservation_vehicle_count", 0.0),
                 "mean_queue_to_capacity_ratio": zone_row.get("mean_queue_to_capacity_ratio", 0.0),
             })
         for zone_row in result.get("hourly_zone_vehicle_counts", []) or []:
@@ -1363,17 +1406,23 @@ def main(argv=None):
                         "mean_station_count": 0.0,
                         "mean_total_capacity": 0.0,
                         "mean_queue_vehicle_count": 0.0,
+                        "mean_waiting_vehicle_count": 0.0,
+                        "mean_reservation_vehicle_count": 0.0,
                     },
                 )
                 bucket["mean_station_count"] += float(zone_row.get("mean_station_count", 0.0) or 0.0)
                 bucket["mean_total_capacity"] += float(zone_row.get("mean_total_capacity", 0.0) or 0.0)
                 bucket["mean_queue_vehicle_count"] += float(zone_row.get("mean_queue_vehicle_count", 0.0) or 0.0)
+                for field in ("mean_waiting_vehicle_count", "mean_reservation_vehicle_count"):
+                    bucket[field] += float(zone_row.get(field, 0.0) or 0.0)
         mean_hourly_zone_charge_station_counts = []
         if hourly_zone_charge_station_summary_map:
             for bucket in hourly_zone_charge_station_summary_map.values():
                 bucket["mean_station_count"] /= len(subset)
                 bucket["mean_total_capacity"] /= len(subset)
                 bucket["mean_queue_vehicle_count"] /= len(subset)
+                for field in ("mean_waiting_vehicle_count", "mean_reservation_vehicle_count"):
+                    bucket[field] /= len(subset)
                 bucket["mean_queue_to_capacity_ratio"] = (
                     bucket["mean_queue_vehicle_count"] / bucket["mean_total_capacity"]
                     if bucket["mean_total_capacity"] > 0
@@ -1457,7 +1506,21 @@ def main(argv=None):
             peak_completed_date = None
             peak_completed_hour = None
             peak_completed_orders = 0.0
+        recourse_sum = sum(r["recourse_requests"] for r in subset)
+        lost_sum = sum(r["lost_requests"] for r in subset)
+        assigned_sum = sum(r["recourse_assigned_requests"] for r in subset)
+        completed_sum = sum(r["recourse_completed_requests"] for r in subset)
         summary_rows.append({
+            "continuous_evaluation": subset[0]["continuous_evaluation"],
+            "episodes": subset[0]["episodes"],
+            "statistics_scope": subset[0]["statistics_scope"],
+            "recourse_recovery_share": recourse_sum / (recourse_sum + lost_sum) if recourse_sum + lost_sum else np.nan,
+            "recourse_assigned_requests": assigned_sum,
+            "recourse_completed_requests": completed_sum,
+            "recourse_uncompleted_requests": assigned_sum - completed_sum,
+            "recourse_success_rate": completed_sum / assigned_sum if assigned_sum else np.nan,
+            "recourse_success_rate_pct": 100 * completed_sum / assigned_sum if assigned_sum else np.nan,
+            **{key: np.mean([r[key] for r in subset]) for key in ("avg_queue_length_including_reservations", "avg_queue_length_waiting", "avg_queue_length_reservations")},
             "conservative_charging": subset[0]["conservative_charging"],
             "checkpoint_conservative_charging": subset[0]["checkpoint_conservative_charging"],
             "strategy": s,

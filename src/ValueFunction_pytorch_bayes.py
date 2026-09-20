@@ -1074,7 +1074,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         if aligned_episode_length <= 0:
             aligned_episode_length = float(self.episode_length) if self.episode_length > 0 else 1.0
         aligned_time_offset = float(getattr(self, 'aligned_inference_time_offset', 0.0))
-        aligned_current_time = float(current_time) + aligned_time_offset
+        local_time = float(current_time)
+        if getattr(getattr(self, "env", None), "continuous_evaluation", False):
+            local_time = self.env._day_step_offset(local_time)
+        aligned_current_time = local_time + aligned_time_offset
         aligned_current_time = min(max(0.0, aligned_current_time), aligned_episode_length)
         return aligned_current_time, aligned_episode_length
 
@@ -1083,7 +1086,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin, PyTorchValueFunction)
         if aligned_episode_length <= 0:
             aligned_episode_length = float(self.episode_length) if self.episode_length > 0 else 1.0
         aligned_time_offset = float(getattr(self, 'aligned_inference_time_offset', 0.0))
-        aligned_current_times = np.asarray(current_times, dtype=np.float32) + np.float32(aligned_time_offset)
+        local_times = np.asarray(current_times, dtype=np.float32)
+        if getattr(getattr(self, "env", None), "continuous_evaluation", False):
+            local_times = ((self.env.START_EPOCH + local_times * self.env.EPOCH_LENGTH) % 86400 - self.env.START_EPOCH) / self.env.EPOCH_LENGTH
+        aligned_current_times = local_times + np.float32(aligned_time_offset)
         aligned_current_times = np.clip(aligned_current_times, 0.0, aligned_episode_length)
         return aligned_current_times, aligned_episode_length
 

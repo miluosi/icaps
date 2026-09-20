@@ -921,6 +921,7 @@ class NYCTrainer:
         aev_charging_center_count: int = 0,
         aev_charging_center_csv: str | None = None,
         conservative_charging: bool | None = False,
+        continuous_evaluation: bool | None = None,
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -1333,7 +1334,18 @@ class NYCTrainer:
                 f"({training_frequency * float(epoch_length) / 60.0:.1f} min)"
             )
 
+        evaluation_days = 1
+        continuous_test = continuous_evaluation if continuous_evaluation is not None else not trainnetwork
+        if continuous_test:
+            evaluation_days = env.configure_continuous_evaluation()
+        if evaluation_days > 1:
+            num_episodes = 1
+            print(f"✓ Continuous test: {evaluation_days} calendar days, {env.episode_length} steps; one reset, physical state retained across midnight")
+
         results = {
+            "continuous_evaluation": evaluation_days > 1,
+            "evaluation_days": evaluation_days,
+            "daily_evaluation": [],
             "Idle_average": [],
             "episode_rewards": [],
             "episode_rewards_aev": [],
@@ -1385,6 +1397,15 @@ class NYCTrainer:
             })
 
             env.reset()
+            if evaluation_days > 1:
+                # Continuous time starts at the first requested instant, so
+                # generate its demand before the first dispatch (no empty step).
+                if env.test_request_less_aev:
+                    eligible = [vid for vid in env._build_vehicles_to_rebalance(list(env.vehicles)) if not env._is_ev(vid)]
+                    env.generate_requests_time(sample_num=len(eligible), vehicle_ids=eligible)
+                else:
+                    env.generate_requests()
+            daily_rewards = {}
             episode_reward = 0
             episode_reward_aev = 0
             episode_reward_ev = 0
@@ -1400,6 +1421,7 @@ class NYCTrainer:
 
             for step in range(env.episode_length):
                 step_start = time.time()
+                decision_date = str(env._current_date_label().date()) if evaluation_days > 1 else None
                 current_requests = list(env.active_requests.values())
                 simulate_motion_start = time.time()
                 heuristic_phase = use_neural_network and global_step < prestep
@@ -1648,6 +1670,16 @@ class NYCTrainer:
                 episode_reward_ev += sum(
                     reward for vehicle_id, reward in rewards.items() if env.vehicles.get(vehicle_id, {}).get("type") == 1
                 )
+                if evaluation_days > 1:
+                    day = daily_rewards.setdefault(decision_date, {
+                        "date": decision_date, "reward": 0.0,
+                        "reward_ev": 0.0, "reward_aev": 0.0,
+                    })
+                    day['reward'] += sum(rewards.values())
+                    for vid, reward in rewards.items():
+                        day['reward_ev' if env.vehicles[vid]['type'] == 1 else 'reward_aev'] += reward
+                    if step + 1 == env.episode_length or str(env._current_date_label().date()) != decision_date:
+                        day['final_mean_battery'] = float(np.mean([v['battery'] for v in env.vehicles.values()]))
                 episode_charging_events.extend(info.get("charging_events", []))
                 global_step += 1
 
@@ -1814,6 +1846,8 @@ class NYCTrainer:
             episode_stats["conservative_charging"] = env.conservative_charging
             episode_stats["checkpoint_conservative_charging"] = env.checkpoint_conservative_charging
             results["episode_detailed_stats"].append(episode_stats)
+            if evaluation_days > 1:
+                results['daily_evaluation'] = list(daily_rewards.values())
             results["drop_off_rates"].append(episode_stats.get("drop_off_rate", 0.0))
             results["episode_rejected_requests"].append(episode_stats.get("rejected_requests", 0))
             results["episode_recourse_requests"].append(episode_stats.get("recourse_requests", 0))
@@ -1845,11 +1879,11 @@ class NYCTrainer:
             torch.cuda.empty_cache()
 
         print("\n=== NYC Training Complete ===")
-        print(f"Episodes: {num_episodes}, Avg reward: {np.mean(results['episode_rewards']):.2f}")
+        print(f"Rollouts: {num_episodes}, Avg daily reward: {np.mean(results['episode_rewards']) / evaluation_days:.2f}")
         if results["episode_rewards_aev"]:
-            print(f"Avg AEV reward: {np.mean(results['episode_rewards_aev']):.2f}")
+            print(f"Avg daily AEV reward: {np.mean(results['episode_rewards_aev']) / evaluation_days:.2f}")
         if results["episode_rewards_ev"]:
-            print(f"Avg EV reward: {np.mean(results['episode_rewards_ev']):.2f}")
+            print(f"Avg daily EV reward: {np.mean(results['episode_rewards_ev']) / evaluation_days:.2f}")
         if results["episode_times"]:
             print(f"Avg episode time: {np.mean(results['episode_times']):.2f}s")
         if results["avg_step_times"]:

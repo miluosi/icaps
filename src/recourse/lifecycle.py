@@ -491,6 +491,12 @@ class RequestLifecycleTracker:
     def metrics(self) -> dict[str, float | int]:
         events = self.outcome_summary().events
         rejected = [event for event in events if event.residual_category == "rejected"]
+        # Unique requests, with completion attributed to the assigned recourse AEV.
+        recourse_ids = {e.request_id for e in rejected if e.same_epoch_recourse_link}
+        completed_ids = {e.request_id for e in rejected
+                         if e.same_epoch_recourse_link and e.completed
+                         and e.completion_vehicle_type == 2
+                         and e.completion_vehicle_id == e.assigned_vehicle_id}
         assigned = sum(event.same_epoch_recourse_link for event in rejected)
         picked_up = sum(event.picked_up for event in rejected)
         completed = sum(event.completed for event in rejected)
@@ -549,6 +555,10 @@ class RequestLifecycleTracker:
         accepted_offers = sum(offer.accepted for offer in self._offers)
         rejected_offers = sum(offer.rejected for offer in self._offers)
         return {
+            "recourse_assigned_requests": len(recourse_ids),
+            "recourse_completed_requests": len(completed_ids),
+            "recourse_uncompleted_requests": len(recourse_ids - completed_ids),
+            "recourse_success_rate": len(completed_ids) / len(recourse_ids) if recourse_ids else None,
             "samitha_repair_pickup_count": sum(e.picked_up for e in self._integrated_repairs.values()),
             "samitha_repair_completion_count": sum(e.completed for e in self._integrated_repairs.values()),
             "ev_offer_count": len(self._offers),
