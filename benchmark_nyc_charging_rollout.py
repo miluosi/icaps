@@ -32,6 +32,8 @@ def parse_args(argv=None):
     p.add_argument('--hours', type=float, default=4.)
     p.add_argument('--seeds', type=int, nargs='+', default=list(range(10)))
     p.add_argument('--scenarios', nargs='+', choices=('burst','staggered'), default=['burst','staggered'])
+    p.add_argument('--policies', nargs='+', choices=('current','conservative','real_conservative'),
+                   default=['current','conservative'])
     p.add_argument('--output-dir', type=Path, default=ROOT/'results/nyc_charging_rollout_1000')
     p.add_argument('--resume', action='store_true')
     args = p.parse_args(argv)
@@ -40,8 +42,14 @@ def parse_args(argv=None):
     return args
 
 
-def build_environment(args, seed):
-    env = NYCEnvironment(
+def build_environment(args, seed, policy='current'):
+    environment_class = NYCEnvironment
+    extra = {}
+    if policy == 'real_conservative':
+        from src.real_conservative_charging import RealConservativeNYCEnvironment
+        environment_class = RealConservativeNYCEnvironment
+        extra['real_conservative_active'] = False  # install identical initial state first
+    env = environment_class(
         num_vehicles=args.vehicles, ev_num_vehicles=args.hev, random_seed=seed,
         parquet_path=str(ROOT/'nyedata/nye_simulation/parquet/yellow_tripdata_2025-12-18_sample.parquet'),
         station_csv=str(ROOT/'nyedata/nyc_all_charging_stations.csv'),
@@ -49,6 +57,7 @@ def build_environment(args, seed):
         start_hour=0., stop_hour=args.hours, epoch_length_sec=30.,
         assignmentgurobi=True, usemcmf=True, mcmf_solver='exact', mcmf_backend='ortools',
         mcmf_strict=True, daily_drop_off=False, ifreject=False,
+        **extra,
     )
     env.adp_value = 0.; env.evaluatemode = True
     env.value_function = env.value_function_ev = None
@@ -140,11 +149,14 @@ def summarize(records, rows, fleet, capacity, horizon, epoch_minutes=.5):
 
 
 def run_case(args, seed, scenario, conservative, output):
-    horizon=int(round(args.hours*120)); env=build_environment(args,seed)
+    policy = conservative if isinstance(conservative, str) else ('conservative' if conservative else 'current')
+    horizon=int(round(args.hours*120)); env=build_environment(args,seed,policy)
     records=install_workload(env,seed,scenario,horizon)
     initial=json.dumps(list(records.values()),sort_keys=True)
     fingerprint=hashlib.sha256(initial.encode()).hexdigest()
-    env.conservative_charging=conservative
+    env.conservative_charging=policy != 'current'
+    if policy == 'real_conservative':
+        env.enable_real_conservative()
     events=[]; rows=[]; station_rows=[]; admissions=[]
     original_arrival=env._mark_charging_queue_arrival
     def arrival(vid,sid):
@@ -173,8 +185,9 @@ def run_case(args, seed, scenario, conservative, output):
         def stop(vid,_sid=sid,_old=original_stop):
             stopped=_old(vid)
             if stopped:
-                records[int(vid)]['completion_epoch']=float(env.current_time+1)
-                events.append(dict(event='complete',epoch=env.current_time+1,vehicle_id=int(vid),station_id=_sid))
+                # NYC has already advanced current_time before releasing plugs.
+                records[int(vid)]['completion_epoch']=float(env.current_time)
+                events.append(dict(event='complete',epoch=env.current_time,vehicle_id=int(vid),station_id=_sid))
             return stopped
         station.add_to_queue=add; station.stop_charging=stop
     aev_sids=set(env.aev_charging_station_ids)
@@ -246,7 +259,7 @@ def run_case(args, seed, scenario, conservative, output):
                 actions[vid]=IdleAction([],v['coordinates'],v['coordinates'],v['location'],v['battery'])
         env.step(actions,{}, {})
         if epoch%120==0: print(f'epoch={epoch}/{horizon} completed={sum(r["completion_epoch"] is not None for r in records.values())}',flush=True)
-    summary=[dict(scenario=scenario,seed=seed,policy='conservative' if conservative else 'current',
+    summary=[dict(scenario=scenario,seed=seed,policy=policy,
                   initial_state_sha256=fingerprint,wall_seconds=time.perf_counter()-wall,
                   charge_mask_seconds=charge_mask_seconds,assignment_seconds=solve_seconds,
                   **summarize(records,rows,fleet,capacities[fleet],horizon)) for fleet in ('AEV','HEV','ALL')]
@@ -255,6 +268,15 @@ def run_case(args, seed, scenario, conservative, output):
             for row in data:f.write(json.dumps(row)+'\n')
     assert len({r['vehicle_id'] for r in records.values()})==args.vehicles
     assert sum(r['completion_epoch'] is not None for r in records.values())==env.charge_finished
+    if policy == 'real_conservative':
+        audit = dict(invariant_checks=env.real_invariant_checks,
+                     reservations=env.real_reservation_history,
+                     execution_events=env.real_execution_events,
+                     outstanding=[vars(r) for r in env.real_reservations.values()])
+        (output/'reservation_audit.json').write_text(json.dumps(audit,indent=2))
+        aev_arrivals = [r for r in records.values() if r['fleet']=='AEV' and
+                        r['arrival_epoch'] is not None and not r['initial_charging']]
+        assert all(not r['ever_queued'] and r['start_epoch']==r['arrival_epoch'] for r in aev_arrivals)
     (output/'summary.json').write_text(json.dumps(summary,indent=2))
     return summary
 
@@ -263,7 +285,7 @@ def main(argv=None):
     args=parse_args(argv);args.output_dir.mkdir(parents=True,exist_ok=args.resume)
     config={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items() if k!='resume'}
     manifest=args.output_dir/'manifest.json'
-    metadata=dict(config=config,python=platform.python_version(),source_sha256={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in ('benchmark_nyc_charging_rollout.py','src/NYCEnvironment.py','src/conservative_charging.py','src/GurobiOptimizer.py')},
+    metadata=dict(config=config,python=platform.python_version(),source_sha256={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in ('benchmark_nyc_charging_rollout.py','src/NYCEnvironment.py','src/conservative_charging.py','src/real_conservative_charging.py','src/GurobiOptimizer.py')},
                   policy='Controlled one-charge-per-vehicle workload; no passenger requests, no value network; AEV max-admitted then min-travel on existing adapter final graph; fixed HEV nearest-station tie choices.',
                   wait_definition='30-second queue exposure sampled after action execution and before charging update; includes same-epoch queue/release. Native arrival-to-start timestamps reported separately. Unfinished waits/delays are censored lower bounds.',
                   occupancy_definition='Time mean of occupied physical plugs sampled after action execution, before update; station records cover AEV centers; fleet aggregates include public stations.')
@@ -275,16 +297,16 @@ def main(argv=None):
     for scenario in args.scenarios:
         for seed in args.seeds:
             paired=[]
-            for conservative in (False,True):
-                policy='conservative' if conservative else 'current';out=args.output_dir/f'{scenario}_seed{seed}_{policy}'
+            for policy in args.policies:
+                out=args.output_dir/f'{scenario}_seed{seed}_{policy}'
                 out.mkdir(exist_ok=args.resume)
                 if args.resume and (out/'summary.json').exists():rows=json.loads((out/'summary.json').read_text())
                 else:
-                    with (out/'run.log').open('w') as log, contextlib.redirect_stdout(log): rows=run_case(args,seed,scenario,conservative,out)
+                    with (out/'run.log').open('w') as log, contextlib.redirect_stdout(log): rows=run_case(args,seed,scenario,policy,out)
                 paired.append(rows[0]['initial_state_sha256']);all_rows.extend(rows)
                 (args.output_dir/'summary.json').write_text(json.dumps(all_rows,indent=2))
                 print(scenario,seed,policy,'AEV:',{k:rows[0][k] for k in ('utilization','mean_wait_minutes_all_arrivals','max_queue_length','completion_count','queued_arrival_count','wall_seconds')},flush=True)
-            assert paired[0]==paired[1], 'Unpaired initial states'
+            assert len(set(paired))==1, 'Unpaired initial states'
     print('Saved:',args.output_dir,flush=True)
 
 if __name__=='__main__':main()
