@@ -9,7 +9,7 @@
 
 24 小时窗口的三日测试共 8640 个 30 秒步骤，第二天 00:00 的模型时间为当天 0，不是 2880，也不是训练结束的常量。部分日内窗口（如 12:00–17:00）只在该窗口生成需求；跨夜期间仿真仍推进车辆与充电，不重新随机状态。测试窗口应与模型训练窗口一致。
 
-纯 Myopic (`adp_value=0`，含 Myopic r1/r2) 在 `battery < min_battery_level` 时 wait feasibility 为 0，等于阈值时仍可等待。Learning 各方法保留 wait fallback（包括 AEV follower 无学习的 Learning r2）。硬禁 wait 可能在没有其他可行动作/充电竞争时使 assignment 不可解；没有偷偷恢复 wait。
+Myopic 与 Learning 统一保留 wait fallback：所有传入决策车辆的 wait feasibility 均为 1，不因电量低于 `min_battery_level`、没有其他动作或充电容量竞争而禁用。已有的学习专用低电量 wait penalty 保持不变，不计入系统 reward。
 
 ## Excel / NPY
 

@@ -6827,21 +6827,10 @@ class NYCEnvironment:
         rebalance_num=0,
         charge_feasibility=None,
     ):
-        """Learned dispatch keeps wait; myopic dispatch forbids it below min SoC.
-
-        Applies to pure myopic evaluation (adp_value=0), including Myopic r1/r2.
-        Learned r2 retains its fallback even though its follower is structured.
-        Wait is not restored when charging competition makes the graph infeasible.
-        """
+        """Keep a private wait fallback for every vehicle in all policies."""
         del rebalance_num, charge_feasibility
         self._last_wait_forced_charge_station = {}
-        wait = np.ones((len(vehicle_ids), 1), dtype=np.float32)
-        myopic = float(getattr(self, 'adp_value', 1.0)) <= 0.0
-        if myopic:
-            for row, vid in enumerate(vehicle_ids):
-                if self.vehicles[vid]['battery'] < self.min_battery_level:
-                    wait[row, 0] = 0.0
-        return wait
+        return np.ones((len(vehicle_ids), 1), dtype=np.float32)
 
     def _active_gat_neighbour_number(self) -> int:
         neighbour_numbers = []

@@ -96,12 +96,15 @@ def test_recourse_success_follows_assigned_aev_across_midnight():
     assert metrics['recourse_success_rate'] == pytest.approx(1/3)
 
 
-@pytest.mark.parametrize('adp,structured,expected', [(0,False,[0,1,1]),(1,True,[1,1,1]),(1,False,[1,1,1])])
-def test_myopic_wait_strictly_below_minimum(adp, structured, expected):
+@pytest.mark.parametrize('adp,structured', [(0,False),(0,True),(1,True),(1,False)])
+@pytest.mark.parametrize('charge_available', [0, 1])
+def test_all_policies_keep_wait_at_every_battery_level(adp, structured, charge_available):
     env = calendar_env()
     env.adp_value, env._structured_only_planning, env.min_battery_level = adp, structured, .2
-    env.vehicles = {i: {'battery':soc} for i,soc in enumerate([.199,.2,.3])}
-    assert env.generate_vehicle_wait([0,1,2]).ravel().tolist() == expected
+    ids = [0,1,2,3]
+    env.vehicles = {i: {'battery':soc} for i,soc in enumerate([0.,.199,.2,.3])}
+    charge = np.full((4, 1), charge_available)
+    assert env.generate_vehicle_wait(ids, charge_feasibility=charge).ravel().tolist() == [1,1,1,1]
 
 
 def test_excel_uses_daily_reward_range_counts_and_pooled_success(tmp_path, monkeypatch):
