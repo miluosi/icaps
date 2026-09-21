@@ -119,6 +119,10 @@ class NYCTrainer:
         distribution_suffix = NYCTrainer._distribution_suffix(zone_distribution_mode)
         zone_scope_suffix = "_manhattan" if only_manhattan_zones else ""
         demand_suffix = "_fulldemand" if full_demand else ""
+        checkpoint_root = "checkpoints"
+        if "charge-real-conservative" in (checkpoint_suffix or "").split("_"):
+            checkpoint_root += "/charge-real-conservative"
+            checkpoint_suffix = "_".join(part for part in checkpoint_suffix.split("_") if part != "charge-real-conservative")
         extra_suffix = ""
         if checkpoint_suffix:
             clean_suffix = "".join(
@@ -129,18 +133,18 @@ class NYCTrainer:
                 extra_suffix = f"_{clean_suffix}"
         if transportation_mode in {"integrated", "integrated_repair"}:
             return (
-                f"checkpoints/q_networks_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
-                f"checkpoints/q_networks_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
+                f"{checkpoint_root}/q_networks_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
+                f"{checkpoint_root}/q_networks_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
             )
         if transportation_mode == "evfirst":
             return (
-                f"checkpoints/q_networksevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
-                f"checkpoints/q_networksevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
+                f"{checkpoint_root}/q_networksevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
+                f"{checkpoint_root}/q_networksevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
             )
         if transportation_mode == "aevfirst":
             return (
-                f"checkpoints/q_networksaevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
-                f"checkpoints/q_networksaevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
+                f"{checkpoint_root}/q_networksaevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_ev",
+                f"{checkpoint_root}/q_networksaevfirst_nyc_{assign_tag}_{transportation_mode}_{num_ev}_{use_intense_requests}{date_suffix}{distribution_suffix}{zone_scope_suffix}{demand_suffix}{extra_suffix}_aev",
             )
         raise ValueError(f"Unsupported transportation mode: {transportation_mode}")
 
@@ -572,6 +576,7 @@ class NYCTrainer:
         aev_charging_center_count: int = 0,
         aev_charging_center_csv: str | None = None,
         conservative_charging: bool = False,
+        charging_model: str | None = None,
     ):
         self._set_random_seeds(random_seed)
         parquet_paths = self._resolve_parquet_paths(
@@ -620,6 +625,7 @@ class NYCTrainer:
             aev_charging_center_count=aev_charging_center_count,
             aev_charging_center_csv=aev_charging_center_csv,
             conservative_charging=conservative_charging,
+            charging_model=charging_model,
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -922,6 +928,8 @@ class NYCTrainer:
         aev_charging_center_csv: str | None = None,
         conservative_charging: bool | None = False,
         continuous_evaluation: bool | None = None,
+        charging_model: str | None = None,
+        checkpoint_charging_model: str | None = None,
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -937,6 +945,15 @@ class NYCTrainer:
         print(f"📦 Training parquet files ({len(parquet_paths)}):")
         for resolved_path in parquet_paths:
             print(f"   - {resolved_path}")
+
+        from src.charging_config import (requested_charging_model, resolve_nyc_charging_model,
+                                         apply_nyc_charging_model, charging_checkpoint_suffix)
+        requested_model = requested_charging_model(charging_model, conservative_charging)
+        construction_model = requested_model or checkpoint_charging_model or 'current'
+        if trainnetwork:
+            checkpoint_suffix = charging_checkpoint_suffix(checkpoint_suffix, charging_model=construction_model)
+        elif checkpoint_charging_model is not None:
+            checkpoint_suffix = charging_checkpoint_suffix(checkpoint_suffix, charging_model=checkpoint_charging_model)
 
         env = self._create_environment(
             num_vehicles=num_vehicles,
@@ -990,7 +1007,8 @@ class NYCTrainer:
             ),
             aev_charging_center_count=aev_charging_center_count,
             aev_charging_center_csv=aev_charging_center_csv,
-            conservative_charging=bool(conservative_charging),
+            conservative_charging=construction_model != "current",
+            charging_model=construction_model,
         )
         env.mcmf_use_gpu = bool(mcmf_use_gpu)
         env.use_cuda_ssp = bool(mcmf_use_gpu)
@@ -1140,8 +1158,7 @@ class NYCTrainer:
 
         training_run_id = uuid.uuid4().hex
         resume_episode_offset = 0
-        from src.charging_config import resolve_charging_model
-        env.conservative_charging, env.checkpoint_conservative_charging, env.charging_model_source = resolve_charging_model(conservative_charging)
+        apply_nyc_charging_model(env, *resolve_nyc_charging_model(requested_model, checkpoint_hint=checkpoint_charging_model))
         if ifloadcheckpoint:
             checkpoint_assign_tag = self._trainer_helper._resolve_checkpoint_assign_tag(
                 assignmentgurobi,
@@ -1235,7 +1252,10 @@ class NYCTrainer:
             if aev_ckpt:
                 identities = [self._trainer_helper._checkpoint_identity(path)
                               for path in (ev_ckpt, aev_ckpt) if path]
-                env.conservative_charging, env.checkpoint_conservative_charging, env.charging_model_source = resolve_charging_model(conservative_charging, identities)
+                resolved = resolve_nyc_charging_model(requested_model, identities, checkpoint_charging_model)
+                if trainnetwork and resolved[0] != resolved[1]:
+                    raise ValueError("Resumed training must use the checkpoint charging model; use evaluation for a charging-model override")
+                apply_nyc_charging_model(env, *resolved)
                 if not self._trainer_helper.load_checkpoint(
                     value_function, aev_ckpt
                 ):
@@ -1255,8 +1275,8 @@ class NYCTrainer:
                     "checkpoint once"
                 )
 
-        print(f"Charging model: {'conservative' if env.conservative_charging else 'current'} "
-              f"(source={env.charging_model_source}; checkpoint={env.checkpoint_conservative_charging})")
+        print(f"Charging model: {env.charging_model} "
+              f"(source={env.charging_model_source}; checkpoint={env.checkpoint_charging_model})")
         print(f"NYC AEV wait: always feasible; learning-only SoC penalty "
               f"threshold={env.learning_soc_wait_threshold:.2f}, "
               f"reference={env.learning_soc_wait_reference:.2f}, "
@@ -1843,6 +1863,8 @@ class NYCTrainer:
             episode_stats["episode_time_sec"] = episode_time
             episode_stats["avg_step_time_sec"] = avg_step_time
             episode_stats["avg_step_time_ms"] = avg_step_time * 1000.0
+            episode_stats["charging_model"] = env.charging_model
+            episode_stats["checkpoint_charging_model"] = env.checkpoint_charging_model
             episode_stats["conservative_charging"] = env.conservative_charging
             episode_stats["checkpoint_conservative_charging"] = env.checkpoint_conservative_charging
             results["episode_detailed_stats"].append(episode_stats)
@@ -1913,6 +1935,8 @@ class NYCTrainer:
             )
 
         results_dir = Path("results/nyc_tests") if assignmentgurobi else Path("results/nyc_tests_h")
+        if env.charging_model == "real_conservative":
+            results_dir /= "charge-real-conservative"
         results_dir.mkdir(parents=True, exist_ok=True)
         excel_path, spatial_path = self._trainer_helper._save_episode_stats_to_excel(
             env,
@@ -1923,6 +1947,8 @@ class NYCTrainer:
         )
         results["excel_path"] = excel_path
         results["spatial_image_path"] = spatial_path
+        results["charging_model"] = env.charging_model
+        results["checkpoint_charging_model"] = env.checkpoint_charging_model
         results["conservative_charging"] = env.conservative_charging
         results["checkpoint_conservative_charging"] = env.checkpoint_conservative_charging
         results["charging_model_source"] = env.charging_model_source

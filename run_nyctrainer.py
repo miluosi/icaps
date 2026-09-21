@@ -23,7 +23,8 @@ from src.NYCEnvironment import DEFAULT_INITIAL_BATTERY_MEAN, NYCEnvironment
 from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
 from src.charging_wait_metrics import aggregate_wait_metrics
-from src.charging_config import add_conservative_charging_argument, charging_checkpoint_suffix
+from src.charging_config import (add_conservative_charging_argument, charging_checkpoint_suffix,
+    add_nyc_charging_model_argument, requested_charging_model)
 from src.value_function_registry import (
     DEFAULT_VALUE_FUNCTION,
     VALUE_FUNCTION_CHOICES,
@@ -57,6 +58,7 @@ def _get_value_function_class(distribution_mode: str):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run NYC zone-based ADP training")
     add_conservative_charging_argument(parser)
+    add_nyc_charging_model_argument(parser)
     from src.acceptance_features import add_acceptance_arguments
     add_acceptance_arguments(parser)
     add_method_list_arguments(parser, method_choices=NYC_TRAIN_METHODS)
@@ -705,9 +707,15 @@ def _create_nyc_environment(
     aev_charging_center_count: int = 0,
     aev_charging_center_csv: str | None = None,
     conservative_charging: bool = False,
+    charging_model: str | None = None,
 ):
     print(f"NYCEnvironment zone filter flag: ifonlymanhatten={only_manhattan_zones}")
-    env = NYCEnvironment(
+    mode = requested_charging_model(charging_model, conservative_charging)
+    environment_class = NYCEnvironment
+    if mode == "real_conservative":
+        from src.real_conservative_charging import RealConservativeNYCEnvironment
+        environment_class = RealConservativeNYCEnvironment
+    env = environment_class(
         num_vehicles=num_vehicles,
         num_stations=5,
         ev_num_vehicles=num_ev,
@@ -756,8 +764,9 @@ def _create_nyc_environment(
         human_ev_charge_decision_interval_minutes=human_ev_charge_decision_interval_minutes,
         aev_charging_center_count=aev_charging_center_count,
         aev_charging_center_csv=aev_charging_center_csv,
-        conservative_charging=conservative_charging,
+        conservative_charging=mode != "current",
     )
+    env.charging_model = mode
     env.configure_recourse_experiment(
         recourse_variant,
         rejection_logit_shift=rejection_logit_shift,
@@ -813,6 +822,7 @@ def run_nyc_solver_benchmark(
     aev_charging_center_count: int = 0,
     aev_charging_center_csv: str | None = None,
     conservative_charging: bool = False,
+    charging_model: str | None = None,
 ):
     trainer = NYCTrainer(
         create_environment=_create_nyc_environment,
@@ -864,6 +874,7 @@ def run_nyc_solver_benchmark(
         aev_charging_center_count=aev_charging_center_count,
         aev_charging_center_csv=aev_charging_center_csv,
         conservative_charging=conservative_charging,
+        charging_model=charging_model,
     )
 
 
@@ -958,6 +969,8 @@ def run_nyc_training(
     aev_charging_center_csv: str | None = None,
     conservative_charging: bool | None = False,
     continuous_evaluation: bool | None = None,
+    charging_model: str | None = None,
+    checkpoint_charging_model: str | None = None,
 ):
     """Compatibility wrapper that delegates NYC training to src.NYCtrainer.NYCTrainer."""
 
@@ -1057,6 +1070,8 @@ def run_nyc_training(
         aev_charging_center_csv=aev_charging_center_csv,
         conservative_charging=conservative_charging,
         continuous_evaluation=continuous_evaluation,
+        charging_model=charging_model,
+        checkpoint_charging_model=checkpoint_charging_model,
     )
 
 
@@ -1088,7 +1103,9 @@ def main(argv=None):
         )
     args.end_year_month = inferred_end_year_month
     zone_distribution_mode = args.learner_variant
-    base_checkpoint_suffix = charging_checkpoint_suffix(args.checkpoint_suffix, args.conservative_charging)
+    args.charging_model = requested_charging_model(args.charging_model, args.conservative_charging)
+    args.conservative_charging = args.charging_model != "current"
+    base_checkpoint_suffix = charging_checkpoint_suffix(args.checkpoint_suffix, charging_model=args.charging_model)
     if args.aev_charging_center_count:
         base_checkpoint_suffix = "_".join(
             part for part in (
@@ -1101,7 +1118,7 @@ def main(argv=None):
     demand_desc = "yellow+hvfhv_nonshared" if args.full_demand else "yellow_only"
 
     print("NYC ADP Training")
-    print(f"  charging model={'conservative' if args.conservative_charging else 'current'}")
+    print(f"  charging model={args.charging_model}")
     print(f"  ADP={args.adp}, episodes={args.episodes}, vehicles={args.num_vehicles}, ev={args.num_ev}")
     print(f"  methods={args.methods}")
     print(f"  gurobi={args.assignment_gurobi}, mcmf={args.usemcmf}, auction={args.useauction}")
@@ -1202,6 +1219,7 @@ def main(argv=None):
             aev_charging_center_count=args.aev_charging_center_count,
             aev_charging_center_csv=args.aev_charging_center_csv,
             conservative_charging=args.conservative_charging,
+            charging_model=args.charging_model,
         )
         print(f"Benchmark complete. Log: {benchmark_result['log_path']}")
         return
@@ -1311,6 +1329,7 @@ def main(argv=None):
             aev_charging_center_count=args.aev_charging_center_count,
             aev_charging_center_csv=args.aev_charging_center_csv,
             conservative_charging=args.conservative_charging,
+            charging_model=args.charging_model,
         )
 
         print(f"\nFinished: {len(results.get('episode_rewards', []))} episodes")

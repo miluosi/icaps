@@ -280,6 +280,8 @@ class ADPTrainer:
             identity["combined_reward"] = payload.get("combined_reward")
             identity["training_run_id"] = payload.get("training_run_id")
             identity["conservative_charging"] = bool(payload.get("conservative_charging", False))
+            if "charging_model" in payload:
+                identity["charging_model"] = payload["charging_model"]
         return identity
 
     @classmethod
@@ -367,6 +369,8 @@ class ADPTrainer:
             "episode": int(episode),
             "checkpoint_tag": checkpoint_tag,
             "conservative_charging": bool(getattr(getattr(value_function, "env", None), "conservative_charging", False)),
+            "charging_model": getattr(getattr(value_function, "env", None), "charging_model",
+                "conservative" if getattr(getattr(value_function, "env", None), "conservative_charging", False) else "current"),
             "training_step": int(getattr(value_function, "training_step", 0)),
             "network_state_dict": value_function.network.state_dict(),
             "extra_value_function_state": value_function.inference_checkpoint_state(),
@@ -490,6 +494,8 @@ class ADPTrainer:
             save_dict = {
                     'episode': episode,
                     'conservative_charging': bool(getattr(getattr(value_function, 'env', None), 'conservative_charging', False)),
+                    'charging_model': getattr(getattr(value_function, 'env', None), 'charging_model',
+                        'conservative' if getattr(getattr(value_function, 'env', None), 'conservative_charging', False) else 'current'),
                     'checkpoint_tag': checkpoint_tag,
                     'training_step': getattr(value_function, 'training_step', 0),
                     'network_state_dict': getattr(value_function.network, 'state_dict', lambda: {})(),

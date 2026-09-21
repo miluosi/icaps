@@ -39,7 +39,8 @@ from src.recourse.config import (
     resolve_method_list_arguments,
 )
 from run_nyctrainer import run_nyc_training
-from src.charging_config import add_conservative_charging_argument, charging_checkpoint_suffix
+from src.charging_config import (add_conservative_charging_argument, charging_checkpoint_suffix,
+    add_nyc_charging_model_argument, requested_charging_model)
 
 
 # Public argparse index.  Testing intentionally exposes the exact same seven
@@ -111,6 +112,8 @@ def _json_dumps(value) -> str:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate trained Q-network checkpoints across ILP, MCMF, and heuristic backends")
     add_conservative_charging_argument(parser, default=None)
+    add_nyc_charging_model_argument(parser)
+    add_nyc_charging_model_argument(parser, checkpoint=True)
     parser.add_argument('--checkpoint-conservative-charging', action=argparse.BooleanOptionalAction,
                         default=False, help='Select the auto-namespaced conservative training checkpoints; independent of the test charging-model override')
     from src.acceptance_features import add_acceptance_arguments
@@ -677,7 +680,10 @@ def main(argv=None):
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     zone_distribution_mode = normalize_distribution_mode(args.distribution_mode)
-    args.checkpoint_suffix = charging_checkpoint_suffix(args.checkpoint_suffix, args.checkpoint_conservative_charging)
+    args.charging_model = requested_charging_model(args.charging_model, args.conservative_charging)
+    args.checkpoint_charging_model = requested_charging_model(args.checkpoint_charging_model, args.checkpoint_conservative_charging)
+    args.checkpoint_conservative_charging = args.checkpoint_charging_model != "current"
+    args.checkpoint_suffix = charging_checkpoint_suffix(args.checkpoint_suffix, charging_model=args.checkpoint_charging_model)
     if args.aev_charging_center_count:
         args.checkpoint_suffix = "_".join(
             part for part in (
@@ -716,8 +722,8 @@ def main(argv=None):
     ifload_bestloss = checkpoint_selection == "best_loss"
     print("=" * 80)
     print("Model Evaluation")
-    print(f"   Checkpoint charging namespace: {'conservative' if args.checkpoint_conservative_charging else 'current'}")
-    print(f"   Test charging model: {'inherit checkpoint (selected training namespace for pure baselines)' if args.conservative_charging is None else ('conservative' if args.conservative_charging else 'current')}")
+    print(f"   Checkpoint charging namespace: {args.checkpoint_charging_model}")
+    print(f"   Test charging model: {args.charging_model or 'inherit checkpoint (selected training namespace for pure baselines)'}")
     print(f"   Strategies: {[s['name'] for s in selected_strategies]}")
     print(f"   ICAPS methods: {args.methods}")
     print(f"   Seeds: {args.seeds}")
@@ -923,6 +929,8 @@ def main(argv=None):
                     post_demand_q_weight=args.post_demand_q_weight,
                     post_demand_head_lr_multiplier=args.post_demand_head_lr_multiplier,
                     masac_target_entropy_ratio=args.masac_target_entropy_ratio,
+                    charging_model=(args.charging_model or (None if strat["load_ckpt"] else args.checkpoint_charging_model)),
+                    checkpoint_charging_model=args.checkpoint_charging_model if strat["load_ckpt"] else None,
                     conservative_charging=(args.conservative_charging if strat['load_ckpt'] or args.conservative_charging is not None
                                            else args.checkpoint_conservative_charging),
                 )
@@ -1095,6 +1103,8 @@ def main(argv=None):
                     "recourse_success_rate_pct": 100 * recourse_completed / recourse_assigned if recourse_assigned else np.nan,
                     "recourse_recovery_share": total_recourse_requests / (total_recourse_requests + total_lost_requests) if total_recourse_requests + total_lost_requests else np.nan,
                     **{key: _mean_detail_metric(detailed, key) for key in ("avg_queue_length_including_reservations", "avg_queue_length_waiting", "avg_queue_length_reservations")},
+                    "charging_model": getattr(env, "charging_model", "conservative" if env.conservative_charging else "current"),
+                    "checkpoint_charging_model": getattr(env, "checkpoint_charging_model", args.checkpoint_charging_model),
                     "conservative_charging": bool(env.conservative_charging),
                     "checkpoint_conservative_charging": env.checkpoint_conservative_charging,
                     "charging_model_source": env.charging_model_source,
@@ -1214,10 +1224,9 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     demand_tag = "_fulldemand" if args.full_demand else ""
     distribution_tag = f"_{zone_distribution_mode}{demand_tag}"
-    if args.checkpoint_conservative_charging or args.conservative_charging is not None:
-        trained_label = 'conservative' if args.checkpoint_conservative_charging else 'current'
-        test_label = ('inherit' if args.conservative_charging is None else
-                      'conservative' if args.conservative_charging else 'current')
+    if args.checkpoint_conservative_charging or args.charging_model is not None:
+        trained_label = args.checkpoint_charging_model
+        test_label = args.charging_model or 'inherit'
         distribution_tag += f"_traincharge-{trained_label}_testcharge-{test_label}"
     if any(r["continuous_evaluation"] for r in all_results):
         distribution_tag += "_continuous"
@@ -1521,6 +1530,8 @@ def main(argv=None):
             "recourse_success_rate": completed_sum / assigned_sum if assigned_sum else np.nan,
             "recourse_success_rate_pct": 100 * completed_sum / assigned_sum if assigned_sum else np.nan,
             **{key: np.mean([r[key] for r in subset]) for key in ("avg_queue_length_including_reservations", "avg_queue_length_waiting", "avg_queue_length_reservations")},
+            "charging_model": subset[0]["charging_model"],
+            "checkpoint_charging_model": subset[0]["checkpoint_charging_model"],
             "conservative_charging": subset[0]["conservative_charging"],
             "checkpoint_conservative_charging": subset[0]["checkpoint_conservative_charging"],
             "strategy": s,
