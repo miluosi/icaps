@@ -1509,7 +1509,7 @@ class NYCTrainer:
                         vehicle_status_count[status] += 1
                     step_reward = sum(rewards.values())
                     avg_step_wall_time = float(np.mean(step_durations)) if step_durations else 0.0
-                    warmup_label = "heuristic" if heuristic_phase else "training"
+                    warmup_label = "heuristic" if heuristic_phase else ("training" if trainnetwork else "evaluation")
                     print(
                         f"  Step {step}: phase={warmup_label}, active_requests={len(env.active_requests)}, "
                         f"new_requests={stats.get('generated_requests_last_step', 0)}, "
@@ -1523,6 +1523,8 @@ class NYCTrainer:
                         f"{info.get('step_rejection_reward_count', 0)}, "
                         f"status={vehicle_status_count}, step_wall={step_wall_time:.3f}s, avg_step_wall={avg_step_wall_time:.3f}s"
                     )
+                    if info.get('physical_motion'):
+                        print(f"    PhysicalMotion: {info['physical_motion']} (this step; status above records task flags, not measured movement)")
                     if rebalance_profile:
                         print(
                             f"    RebalanceTiming: solver={rebalance_profile.get('solver_name', 'n/a')} "

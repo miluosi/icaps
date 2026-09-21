@@ -2702,12 +2702,20 @@ class NYCEnvironment:
     # EV behaviour models (charge / relocation / prior features)
     # ==================================================================
 
+    def _ev_charge_safety_threshold(self) -> float:
+        """Human EVs must seek charging before their service reserve is exhausted."""
+        return max(
+            float(getattr(self, 'min_battery_level', 0.2)),
+            float(getattr(self, 'must_charge_battery_threshold', 0.15)),
+        )
+
     def compute_ev_charge_probability(self, vehicle_id: int) -> Tuple[float, Dict[int, float]]:
         """Zhang et al. (2023) Binary Logit + MNL charge model (same as ChargingIntegrated)."""
         if not self._is_ev(vehicle_id) or not hasattr(self, 'charging_manager'):
             return 0.0, {}
         vehicle = self.vehicles[vehicle_id]
-        if vehicle.get('no_charge_cooldown_until', 0) > self.current_time and vehicle.get('battery', 1.0) > 0.2:
+        if (vehicle.get('no_charge_cooldown_until', 0) > self.current_time
+                and vehicle.get('battery', 1.0) > self._ev_charge_safety_threshold()):
             return 0.0, {}
         soc = float(vehicle.get('battery', 1.0))
         d_deadhead = 1.0 if vehicle.get('total_distance', 0) > 100 else 0.0
@@ -4020,6 +4028,8 @@ class NYCEnvironment:
             vehicle['passenger_onboard'] = None
             vehicle['charging_target'] = station_id
             vehicle['idle_target'] = None
+            vehicle['is_stationary'] = False
+            vehicle['needs_emergency_charging'] = False
             vehicle['charging_station'] = None
             station = self.charging_manager.stations[station_id]
             vehicle['target_location'] = station.location
@@ -4363,12 +4373,23 @@ class NYCEnvironment:
         execute_actions_start = time.time()
         self._epoch_rejection_reward_components = {}
         self._epoch_soc_wait_learning_penalties = {}
+        motion = {fleet: dict(moving_vehicles=0, distance_km=0.0, traction_soc=0.0)
+                  for fleet in ('EV', 'AEV')}
         for vehicle_id, action in actions.items():
             self._epoch_soc_wait_learning_penalties[vehicle_id] = (
                 self._action_soc_wait_learning_penalty(vehicle_id, action)
             )
             reject_before = self.step_rejection_reward_total
+            vehicle = self.vehicles[vehicle_id]
+            distance_before = float(vehicle.get('total_distance', 0.0))
+            battery_before = float(vehicle['battery'])
             reward, dur_reward = self._execute_action(vehicle_id, action)
+            moved = max(0.0, float(vehicle.get('total_distance', 0.0)) - distance_before)
+            fleet_motion = motion['EV' if self._is_ev(vehicle_id) else 'AEV']
+            fleet_motion['moving_vehicles'] += int(moved > 1e-9)
+            fleet_motion['distance_km'] += moved
+            # Charging increments occur in _update_environment, after this sample.
+            fleet_motion['traction_soc'] += max(0.0, battery_before - float(vehicle['battery']))
             self._epoch_rejection_reward_components[vehicle_id] = self.step_rejection_reward_total - reject_before
             rewards[vehicle_id] = reward
             dur_rewards[vehicle_id] = dur_reward
@@ -4477,6 +4498,7 @@ class NYCEnvironment:
             'rebalancing_profile': dict(self._last_rebalancing_profile),
             'simulation_profile': dict(self._last_simulation_profile),
             'step_profile': dict(self._last_step_profile),
+            'physical_motion': motion,
         }
 
     # ==================================================================
@@ -4494,17 +4516,9 @@ class NYCEnvironment:
 
         self.reject_number[self.current_time] = 0
         self.assignmentnumber[self.current_time] = 0
-        actions = {}
-        storeactions = {vid: self.storeactions.get(vid) for vid in self.vehicles}
-        storeactions_ev = {vid: self.storeactions_ev.get(vid) for vid in self.vehicles}
-
-        charging_phase_start = time.time()
-        self._ev_charging_phase(actions, storeactions_ev)
-        leftover = [vid for vid in self.vehicles if vid not in actions]
-
-
-
-        vehicles_to_rebalance = self._build_vehicles_to_rebalance(leftover)
+        # Charging choices belong to simulate_motion's executable action batch.
+        # Making them here used to mutate EV targets and then discard the actions.
+        vehicles_to_rebalance = self._build_vehicles_to_rebalance(list(self.vehicles))
         aev_to_rebalance = [vid for vid in vehicles_to_rebalance if not self._is_ev(vid)]
         aev_to_rebalance_num = len(aev_to_rebalance)
         
@@ -5305,6 +5319,7 @@ class NYCEnvironment:
             and self.vehicles[vid]['assigned_request'] is None
             and self.vehicles[vid]['passenger_onboard'] is None
             and self.vehicles[vid]['charging_station'] is None
+            and not (self._is_ev(vid) and self.vehicles[vid].get('charging_target') is not None)
             and (self._is_ev(vid) or self.vehicles[vid]['target_location'] is None)]
         return vehicles_to_rebalance
 
@@ -5924,53 +5939,63 @@ class NYCEnvironment:
             raise RuntimeError(f"Action generation failed at step {self.current_time} – {len(missing)} missing")
 
     def _ev_charging_phase(self, actions, storeactions_ev):
-        """Pre-assignment EV charging probability decision (same as ChargingIntegrated)."""
+        """Execute committed EV charging trips before selecting new driver actions."""
         for vid, v in self.vehicles.items():
-            if (v.get('is_online', True) and self._is_ev(vid) and v['charging_station'] is None and v['assigned_request'] is None
-                    and v['passenger_onboard'] is None and v['idle_target'] is None and v['target_location'] is None):
-                # The interval controls when a Human EV driver may make the
-                # next stochastic charge decision; it does not alter either
-                # the Binary Logit probability or the station-choice MNL.
-                # SOC <= 0.20 bypasses the interval for charging safety.
-                if (
-                    float(v.get('battery', 1.0)) > 0.2
-                    and float(v.get('no_charge_cooldown_until', 0.0))
-                    > float(self.current_time)
-                ):
-                    continue
-                p_charge, station_probs = self.compute_ev_charge_probability(vid)
-                station_probs = self._reachable_charging_station_probs(vid, station_probs)
-                v['no_charge_cooldown_until'] = (
-                    float(self.current_time)
-                    + int(getattr(
-                        self,
-                        'human_ev_charge_decision_interval_epochs',
-                        5,
-                    ))
-                )
-                must_charge = float(v.get('battery', 1.0)) <= float(
-                    getattr(self, 'must_charge_battery_threshold', self.rebalance_battery_threshold)
-                )
-                if must_charge and not station_probs:
+            if (not v.get('is_online', True) or not self._is_ev(vid)
+                    or v['charging_station'] is not None
+                    or v['assigned_request'] is not None
+                    or v['passenger_onboard'] is not None):
+                continue
+            station_id = v.get('charging_target')
+            if station_id is not None:
+                # Preserve the chosen station through travel and physical queueing.
+                # In particular, low-SOC vehicles must not re-enter the EV solver
+                # and have this trip replaced by its private outside action.
+                v['is_stationary'] = False
+                v['idle_target'] = None
+                actions[vid] = ChargingAction(
+                    [], station_id, self._charge_duration_for_vehicle(vid),
+                    v['location'], v['battery'])
+                continue
+
+            must_charge = float(v.get('battery', 1.0)) <= self._ev_charge_safety_threshold()
+            if not must_charge and (v['idle_target'] is not None or v['target_location'] is not None):
+                continue
+            # Safety charging also interrupts empty relocation and bypasses
+            # the stochastic decision cooldown. Ordinary EV choice is unchanged.
+            if (not must_charge and float(v.get('no_charge_cooldown_until', 0.0))
+                    > float(self.current_time)):
+                continue
+            p_charge, station_probs = self.compute_ev_charge_probability(vid)
+            station_probs = self._reachable_charging_station_probs(vid, station_probs)
+            v['no_charge_cooldown_until'] = (
+                float(self.current_time)
+                + int(getattr(
+                    self,
+                    'human_ev_charge_decision_interval_epochs',
+                    5,
+                ))
+            )
+            if must_charge and not station_probs:
+                v['needs_emergency_charging'] = True
+                continue
+            if station_probs and (must_charge or self._charge_uniform(vid, 'charge_decision') < p_charge):
+                r = self._charge_uniform(vid, 'charge_station')
+                acc = 0.0
+                chosen_station = next(iter(station_probs.keys())) if station_probs else None
+                if chosen_station is None:
                     v['needs_emergency_charging'] = True
                     continue
-                if station_probs and (must_charge or self._charge_uniform(vid, 'charge_decision') < p_charge):
-                    r = self._charge_uniform(vid, 'charge_station')
-                    acc = 0.0
-                    chosen_station = next(iter(station_probs.keys())) if station_probs else None
-                    if chosen_station is None:
-                        v['needs_emergency_charging'] = True
-                        continue
-                    for sid, prob in station_probs.items():
-                        acc += float(prob)
-                        if r <= acc:
-                            chosen_station = int(sid)
-                            break
-                    vloc = v['location']
-                    vbat = v['battery']
-                    self._move_vehicle_to_charging_station(vid, chosen_station)
-                    actions[vid] = ChargingAction([], chosen_station, self._charge_duration_for_vehicle(vid), vloc, vbat)
-                    self._update_storeaction(vid, actions[vid], storeactions_ev, is_ev=True)
+                for sid, prob in station_probs.items():
+                    acc += float(prob)
+                    if r <= acc:
+                        chosen_station = int(sid)
+                        break
+                vloc = v['location']
+                vbat = v['battery']
+                self._move_vehicle_to_charging_station(vid, chosen_station)
+                actions[vid] = ChargingAction([], chosen_station, self._charge_duration_for_vehicle(vid), vloc, vbat)
+                self._update_storeaction(vid, actions[vid], storeactions_ev, is_ev=True)
 
     def _begin_joint_collection(self, mode: str):
         self._ensure_recourse_runtime()
