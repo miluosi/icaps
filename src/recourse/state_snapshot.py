@@ -229,9 +229,9 @@ class StateSnapshotBuilder:
                     pickup_duration = _travel_time(
                         env, vehicle.location, request.pickup
                     )
-                    trip_duration = _travel_time(
-                        env, request.pickup, request.dropoff
-                    )
+                    trip_duration = (float(request.travel_time)
+                                     if hasattr(env, '_request_trip_distance_km')
+                                     else _travel_time(env, request.pickup, request.dropoff))
                     post_duration = pickup_duration + trip_duration
                     resource_type = "request"
                     resource_id = request_id
@@ -252,9 +252,10 @@ class StateSnapshotBuilder:
                     station_travel_duration = _travel_time(
                         env, vehicle.location, station.location
                     )
+                    duration_for_vehicle = getattr(env, '_charge_duration_for_vehicle', None)
                     post_duration = station_travel_duration + float(
-                        getattr(env, "charge_duration", 1.0)
-                    )
+                        duration_for_vehicle(int(vehicle_id)) if callable(duration_for_vehicle)
+                        else getattr(env, "charge_duration", 1.0))
                     resource_type = "station"
                     resource_id = station_id
                     resource_capacity = int(
@@ -272,8 +273,9 @@ class StateSnapshotBuilder:
                         occupied = int(occupancy[arrival]) if arrival < len(occupancy) else 0
                         resource_type = f'station_arrival:{arrival}'
                         resource_capacity = max(0, int(schedule['capacity']) - occupied)
-                        station_travel_duration = float(arrival)
-                        post_duration = float(arrival + int(window['charging_duration']))
+                        # Arrival buckets constrain capacity; the critic uses
+                        # the same travel/session features as live inference.
+                        # Do not replace them with a different rounded window.
                 elif column < num_requests + num_stations + num_zones:
                     local_column = column - num_requests - num_stations
                     if local_column >= len(zone_ids):
@@ -325,6 +327,10 @@ class StateSnapshotBuilder:
                 value_function = _value_function_for_vehicle(
                     env, vehicle.vehicle_type
                 )
+                # NYC's final outside column is encoded as idle/reloc (1)
+                # by the deployed network, including an AEV stationary wait.
+                if action_type == ActionType.WAIT and hasattr(env, '_request_trip_distance_km'):
+                    edge_metadata += (("feature_action_type_id", 1),)
                 queue_feature_builder = getattr(
                     value_function, "_queue_features", None
                 )
@@ -352,15 +358,16 @@ class StateSnapshotBuilder:
                 q_reject = predicted_rejection(env, vehicle_id, request_map[request_id], vehicle=vehicle,
                     context=acceptance_context, snapshot=state) if response_mask else 0.
                 success_score = float(structured_matrix[row, column])
-                expected_anchor = bool(getattr(value_function, 'response_anchor_enabled', False))
-                if expected_anchor:
-                    # Use precisely the live learner's success-score definition,
-                    # not the (different in NYC) plain-MCMF fare-only matrix.
+                anchor_builder = getattr(value_function, 'assignment_anchor', None)
+                learner_anchor = callable(anchor_builder) and not getattr(env, '_structured_only_planning', False)
+                expected_anchor = learner_anchor and bool(getattr(value_function, 'response_anchor_enabled', False))
+                if learner_anchor:
                     action_kind = 2 if action_type == ActionType.SERVICE else (3 if action_type == ActionType.CHARGE else 1)
-                    success_score = value_function._myopic_score(action_kind, request_value, target_distance, post_distance)
-                from src.rejection_anchor import expected_structured_score, rejection_score
-                reject_score = rejection_score(env, request_value=request_value, pickup_distance=target_distance) if response_mask else 0.
-                structured_score = expected_structured_score(success_score, reject_score, q_reject, response_mask) if expected_anchor else success_score
+                    structured_score, success_score, reject_score = anchor_builder(
+                        action_kind, request_value, target_distance, post_distance, q_reject, response_mask)
+                else:
+                    structured_score, reject_score = success_score, 0.0
+                    edge_metadata += (("matrix_anchor_only", True),)
                 edges.append(
                     FeasibleEdgeSnapshot(
                         edge_id=edge_id,

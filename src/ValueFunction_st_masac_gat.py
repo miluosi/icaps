@@ -524,6 +524,18 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             return moving_penalty
         return moving_penalty * max(1.0, dist)
 
+    def assignment_anchor(self, action_type_id, request_value, target_distance,
+                          post_action_distance, rejection_probability=0.0,
+                          human_response_mask=False):
+        """Unquantized learner anchor, shared by live scoring and replay storage."""
+        success = float(np.float32(self._myopic_score(
+            action_type_id, np.float32(request_value), np.float32(target_distance),
+            np.float32(post_action_distance))))
+        expected, rejected = self.response_anchor(
+            success, np.float32(request_value), np.float32(target_distance),
+            rejection_probability, human_response_mask)
+        return float(np.float32(expected)), success, float(rejected)
+
     def _state_features(
         self,
         *,
@@ -843,7 +855,12 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         charge_idx = np.flatnonzero(action_type_ids == 3)
         charge_duration = float(getattr(self.env, "charge_duration", 0.0)) if self.env is not None else 0.0
         post_durations = np.asarray(post_action_durations, dtype=np.float32)
-        travel_durations = np.maximum(0.0, post_durations[charge_idx] - charge_duration)
+        duration_for_vehicle = getattr(self.env, '_charge_duration_for_vehicle', None)
+        session_durations = (
+            np.asarray([duration_for_vehicle(int(vehicle_ids[i])) for i in charge_idx], dtype=np.float32)
+            if callable(duration_for_vehicle) else charge_duration
+        )
+        travel_durations = np.maximum(0.0, post_durations[charge_idx] - session_durations)
         station_ids = None
         if target_station_ids is not None:
             target_station_ids = np.asarray(target_station_ids, dtype=np.int64)
@@ -1490,22 +1507,12 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             post_action_durations=post_action_durations,
             target_station_ids=target_station_ids,
         )
-        g = np.asarray(
-            [
-                self._myopic_score(
-                    action_type_ids[i],
-                    request_values[i],
-                    target_distances[i],
-                    myopic_action_distances[i],
-                )
-                for i in range(size)
-            ],
-            dtype=np.float32,
-        )
-        success_scores = g.copy()
+        anchors = np.empty((size, 3), dtype=np.float32)
         for i in range(size):
-            g[i], _ = self.response_anchor(g[i], request_values[i], target_distances[i],
-                                           rejection_probabilities[i], human_response_masks[i])
+            anchors[i] = self.assignment_anchor(
+                action_type_ids[i], request_values[i], target_distances[i],
+                myopic_action_distances[i], rejection_probabilities[i], human_response_masks[i])
+        g, success_scores = anchors[:, 0], anchors[:, 1]
         if self.planning_objective_mode == "structured_only":
             self._last_adp_score_stats = {
                 "mode": "structured_only",
@@ -2368,7 +2375,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             "vehicle_id": edge.vehicle_id,
             "vehicle_type": edge.vehicle_type,
             "action_type": edge.action_id,
-            "action_type_id": int(edge.action_type),
+            "action_type_id": int(dict(edge.metadata).get("feature_action_type_id", edge.action_type)),
             "vehicle_location": vehicle.location,
             "target_location": edge.target_location,
             "post_action_location": edge.post_action_location,
@@ -2414,11 +2421,14 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         """Build all deployment bounds with at most one queue forward pass."""
 
         if sigma_g is None:
+            fleets = {int(edge.vehicle_type) for edge in edges}
             structured = np.asarray(
-                [float(item.structured_score) for item in graph.edges],
+                [float(item.structured_score) for item in graph.edges
+                 if int(item.vehicle_type) in fleets
+                 and not dict(item.metadata).get('continuing', False)],
                 dtype=np.float32,
             )
-            sigma_g = max(1.0, float(np.std(structured)))
+            sigma_g = max(1.0, float(np.std(structured))) if structured.size else 1.0
         bounds = torch.full(
             (len(edges),),
             float(self.residual_clip_rho) * sigma_g,
@@ -2470,7 +2480,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                 feature_tensor = torch.tensor(
                     feature_rows, dtype=torch.float32, device=self.device
                 )
-                waits = torch.relu(predictor(feature_tensor).squeeze(1))
+                # Live bounds use the normalized feature clipped to five
+                # charging sessions, then convert back to epochs.
+                waits = torch.relu(predictor(feature_tensor).squeeze(1)).clamp_max(5.0 * charge_duration)
                 predicted_waits[
                     torch.tensor(
                         valid_offsets, dtype=torch.long, device=self.device
@@ -2619,17 +2631,22 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
 
         full_scores: dict[str, float] = {}
         correction_scores: dict[str, float] = {}
-        grouped: dict[int, tuple[Any, list[FeasibleEdgeSnapshot]]] = {}
+        grouped: dict[tuple[int, int], tuple[Any, list[FeasibleEdgeSnapshot]]] = {}
         for edge in graph.edges:
             provider = self._provider_for_edge(edge)
             if edge.response_model_hash != provider.response_model_hash:
                 raise ValueError('Replay rejection predictor hash mismatch')
-            grouped.setdefault(id(provider), (provider, []))[1].append(edge)
-
-        sigma_g = max(1.0, float(np.std(np.asarray(
-            [float(edge.structured_score) for edge in graph.edges], dtype=np.float32,
-        )))) if graph.edges else 1.0
+            if dict(edge.metadata).get('matrix_anchor_only', False):
+                full_scores[edge.edge_id] = float(edge.structured_score)
+                correction_scores[edge.edge_id] = 0.0
+                continue
+            grouped.setdefault((id(provider), int(edge.vehicle_type)), (provider, []))[1].append(edge)
         for provider, provider_edges in grouped.values():
+            # NYC dispatch makes a separate batch call for each fleet. Fixed
+            # continuing edges are not candidates in those calls.
+            candidate_anchors = np.asarray([edge.structured_score for edge in provider_edges
+                if not dict(edge.metadata).get('continuing', False)], dtype=np.float32)
+            sigma_g = max(1.0, float(np.std(candidate_anchors))) if candidate_anchors.size else 1.0
             clipping = [0, 0]
             def evaluate(part):
                 # These scores are returned as Python floats, including Bellman

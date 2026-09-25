@@ -7290,12 +7290,9 @@ class NYCEnvironment:
         n = len(vehicles_to_rebalance)
         invalid_q = -1e6
         current_time = float(self.current_time) if hasattr(self, 'current_time') else 0.0
-        other_vehicles = len([
-            vehicle for vehicle in self.vehicles.values()
-            if vehicle['assigned_request'] is None
-            and vehicle['passenger_onboard'] is None
-            and vehicle['charging_station'] is None
-        ])
+        # Match the joint replay observation: other online vehicles, including
+        # busy/charging vehicles, excluding the vehicle being scored.
+        other_vehicles = max(0, sum(v.get('is_online', True) for v in self.vehicles.values()) - 1)
         num_reqs = len(self.active_requests)
 
         # _solve_rebalancing has just built this exact matrix and its layout
