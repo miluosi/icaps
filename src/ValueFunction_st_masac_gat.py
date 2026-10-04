@@ -329,7 +329,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         self.queue_loss_fn = nn.MSELoss()
         self.experience_buffer = deque(maxlen=int(replay_buffer_size))
         self.rejection_buffer = deque(maxlen=int(replay_buffer_size))
-        self.joint_replay_buffer = PrioritizedJointReplayBuffer(
+        from src.recourse.disk_replay import make_joint_replay
+        self.joint_replay_buffer = make_joint_replay(
+            env=env,
             capacity=max(1, int(replay_buffer_size) // 5),
             seed=int(getattr(env, "initial_random_seed", 0) or 0),
         )
@@ -2074,6 +2076,17 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         experience['myopic_score'], experience['rejection_structured_score'] = self.response_anchor(
             experience['myopic_score'], float(experience.get('request_value', 0.) or 0.),
             float(experience.get('target_distance', 0.) or 0.), q, mask)
+        if (str(getattr(self, 'recourse_variant', 'legacy')) in
+                {'r1_structured', 'r2', 'r3', 'r4', 'recourse_macro'}
+                or str(self.learner_variant) in {'optimization_anchored_residual', 'integrated_directq'}):
+            # These critic updates read the joint replay only. Auxiliary rows
+            # need scalar features, not references that pin entire old graphs
+            # in RAM after the joint payload has been spilled to disk.
+            for key in ('state_snapshot', 'feasible_graph_snapshot',
+                        'residual_state_snapshot', 'next_state_snapshot',
+                        'joint_action_snapshot', 'next_feasible_graph_snapshot',
+                        'aev_stage_graph'):
+                experience.pop(key, None)
         self.experience_buffer.append(experience)
         self._replay_collection_context = None
 
@@ -2751,6 +2764,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         if component_cache is None:
             component_cache = {}
             self._target_component_cache = component_cache
+        if getattr(self, '_target_component_model_signature', None) != model_signature:
+            # Results from earlier weights can never be cache hits again.
+            component_cache.clear()
+            self._target_component_model_signature = model_signature
         cached = component_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -3111,10 +3128,13 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         next_id = transition.next_transition_id
         return bool(
             next_id
-            and self.joint_replay_buffer.get_by_transition_id(next_id) is not None
+            and self.joint_replay_buffer.has_transition(next_id)
         )
 
     def has_trainable_joint_rows(self, *, ifEV: bool) -> bool:
+        has_ready = getattr(self.joint_replay_buffer, 'has_ready', None)
+        if has_ready is not None:
+            return has_ready(ifEV=ifEV)
         return any(
             self._joint_row_ready(transition, ifEV=ifEV)
             for transition in self.joint_replay_buffer
@@ -3133,6 +3153,7 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             return 0.0
         sample = self.joint_replay_buffer.sample_ready(
             min(batch_size, len(self.joint_replay_buffer)),
+            ready_fleet=ifEV,
             predicate=lambda transition: self._joint_row_ready(
                 transition, ifEV=ifEV
             ),
@@ -3353,6 +3374,15 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
                     / max(1, self.next_transition_link_lookups)
                 ),
             })
+            if getattr(self.joint_replay_buffer, 'storage', 'memory') == 'disk':
+                # The exact IDs remain in the disk transition. Keeping 10,000
+                # copies of fleet-sized ID tuples defeats RAM-bounded replay.
+                from src.memory_lifecycle import JsonArrayDigest
+                trace = JsonArrayDigest()
+                trace.extend(action.selected_edge_ids)
+                diagnostics[-1].pop('rollout_selected_edge_ids')
+                diagnostics[-1]['rollout_selected_edge_count'] = trace.count
+                diagnostics[-1]['rollout_selected_edge_hash'] = trace.hexdigest()
         if not losses:
             return 0.0
         loss = torch.stack(losses).mean()
@@ -3709,6 +3739,10 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
             ),
             recent_count=self.checkpoint_replay_recent,
         )
+        if joint_replay_state.get('disk_replay_archive'):
+            self.checkpoint_artifact_paths = list(dict.fromkeys([
+                *getattr(self, 'checkpoint_artifact_paths', ()),
+                joint_replay_state['disk_replay_archive']]))
         return {
             "critic2_state_dict": self.critic2.state_dict(),
             "ev_response": self.acceptance_checkpoint_state(),

@@ -233,6 +233,8 @@ def _effective_replay_hyperparameters(
                 field: _json_safe(getattr(replay, field))
                 for field in (
                     "capacity",
+                    "storage",
+                    "cache_rows",
                     "alpha",
                     "beta_start",
                     "beta_end",

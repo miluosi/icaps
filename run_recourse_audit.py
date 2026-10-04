@@ -16,6 +16,7 @@ import time
 
 import numpy as np
 import torch
+from src.memory_lifecycle import JsonArrayDigest, check_training_memory, release_training_caches
 
 from run_acceptance_ablation import seed_everything, weight_hash, save_pair, json_default, attach_pair
 from train_acceptance_model import make_environment, parse_args as environment_args
@@ -226,11 +227,12 @@ def rollout(
     observation_node_counts = []
     episode_ordinary_displacement = 0
     demand = {}
-    action_trace = []
+    action_trace = JsonArrayDigest()
     for value in pair:
         value.deployment_edges_scored = value.deployment_edges_clipped = 0
     started = time.perf_counter()
     for step in range(min(env.episode_length, args.max_steps or env.episode_length)):
+        check_training_memory(step, *pair)
         for req in env.active_requests.values():
             demand[req.request_id] = (req.request_id, req.pickup, req.dropoff, req.created_time)
         actions, stored, stored_ev = motion(current_requests=list(env.active_requests.values()))
@@ -330,9 +332,7 @@ def rollout(
     if not np.isclose(reward, sum(fleet_rewards.values())):
         raise AssertionError('Fleet rewards do not reconcile with the system return')
     stats['demand_hash'] = hashlib.sha256(json.dumps(sorted(demand.values())).encode()).hexdigest()
-    stats['selected_action_trace_hash'] = hashlib.sha256(
-        json.dumps(action_trace).encode()
-    ).hexdigest()
+    stats['selected_action_trace_hash'] = action_trace.hexdigest()
     random_rows = sorted(
         (tuple(key), tuple(sorted(value.items())))
         for key, value in getattr(env, '_last_offer_realizations', {}).items()
@@ -380,25 +380,32 @@ def rollout(
             for row in diagnostics
         )
         stats['follower_target_query_count'] = stats['nested_leader_target_count']
-        rows = list(pair[0].joint_replay_buffer)
-        stats['aev_stage_graph_count'] = sum(row.aev_stage_graph is not None for row in rows)
-        stats['aev_learned_score_difference_count'] = sum(
-            abs(edge.collection_score - edge.structured_score) > 1e-8
-            for row in rows if row.aev_stage_graph is not None
-            for edge in row.aev_stage_graph.edges
-        )
+        rows = pair[0].joint_replay_buffer
+        stats['aev_stage_graph_count'] = 0
+        stats['aev_learned_score_difference_count'] = 0
+        stats['reward_ledgers'] = []
+        recourse_rows = displacement = 0
+        ledger_sums = dict.fromkeys(('aev_charging', 'aev_waiting', 'ev_rejection_penalty', 'request_expiry_penalty'), 0.)
+        for row in rows:
+            stats['aev_stage_graph_count'] += int(row.aev_stage_graph is not None)
+            if row.aev_stage_graph is not None:
+                stats['aev_learned_score_difference_count'] += sum(
+                    abs(edge.collection_score - edge.structured_score) > 1e-8
+                    for edge in row.aev_stage_graph.edges)
+            stats['reward_ledgers'].append(dict(transition_id=row.transition_id, reward_ev=row.reward_ev,
+                reward_aev=row.reward_aev, reward_system=row.reward_system,
+                ledger=asdict(row.reward_ledger) if row.reward_ledger else None))
+            recourse_rows += int(any(is_true_same_epoch_recourse(e) for e in row.outcome_summary.events))
+            displacement += ordinary_service_displacement(row.stage2_graph)
+            if row.reward_ledger:
+                for key in ledger_sums:
+                    ledger_sums[key] += getattr(row.reward_ledger, key)
         stats.update(summarize_joint_targets([row for v in pair for row in v.joint_training_diagnostics]))
         stats['gradient_clipping_rate'] = sum(getattr(v, 'joint_gradient_clip_count', 0) for v in pair) / max(1, sum(v.optimizer_steps_joint for v in pair))
-        stats['reward_ledgers'] = [dict(transition_id=r.transition_id, reward_ev=r.reward_ev,
-            reward_aev=r.reward_aev, reward_system=r.reward_system,
-            ledger=asdict(r.reward_ledger) if r.reward_ledger else None) for r in rows]
         stats['reward_ledger_scope'] = 'retained_replay_window'
-        stats['replay_true_recourse_fraction'] = sum(any(is_true_same_epoch_recourse(e) for e in r.outcome_summary.events) for r in rows) / max(1, len(rows))
-        stats['retained_replay_ordinary_aev_service_displacement_fixed_graph'] = sum(
-            ordinary_service_displacement(r.stage2_graph) for r in rows
-        )
-        stats['charging_wait_reward_ledger'] = {key: sum(getattr(r.reward_ledger, key) for r in rows if r.reward_ledger)
-            for key in ('aev_charging', 'aev_waiting', 'ev_rejection_penalty', 'request_expiry_penalty')}
+        stats['replay_true_recourse_fraction'] = recourse_rows / max(1, len(rows))
+        stats['retained_replay_ordinary_aev_service_displacement_fixed_graph'] = displacement
+        stats['charging_wait_reward_ledger'] = ledger_sums
         modules = ('network', 'critic2', 'graph_encoder', 'mixer', 'actor')
         stats['model_parameter_count'] = int(sum(
             parameter.numel()
@@ -417,6 +424,7 @@ def rollout(
     stats['method'] = method
     stats['configuration'] = method_metadata(spec.operating_mode, spec.variant)
     stats['ev_response_feature'] = 'off'
+    release_training_caches(*pair)
     return stats
 
 

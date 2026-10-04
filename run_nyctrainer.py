@@ -1392,6 +1392,12 @@ def main(argv=None):
             )
             print(f"Manifest: {manifest_path}")
 
+        # Otherwise the previous model/env stays alive while the next RHS
+        # constructs another fleet and replay. Drop cyclic owners between runs.
+        del env, results
+        from src.memory_lifecycle import release_training_caches
+        release_training_caches()
+
 
 if __name__ == "__main__":
     main()

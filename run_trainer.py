@@ -410,6 +410,10 @@ def main():
                 )
                 print(f"Manifest saved to: {manifest_path}")
 
+            del env, results
+            from src.memory_lifecycle import release_training_caches
+            release_training_caches()
+
 
 if __name__ == "__main__":
     main()

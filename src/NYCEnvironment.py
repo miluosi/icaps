@@ -912,6 +912,8 @@ class NYCEnvironment:
                 columns=yellow_columns,
                 filters=yellow_filters,
             )
+        except MemoryError:
+            raise  # Do not start a second large read while handling RAM OOM.
         except Exception:
             hvfhv_columns = [
                 'request_datetime',
@@ -996,6 +998,7 @@ class NYCEnvironment:
                 for single_path in path
             ]
             df = pd.concat(frames, ignore_index=True)
+            del frames  # release unfiltered input frames before cleaning copies
         else:
             df = self._read_normalized_demand_file(
                 path,
@@ -1041,6 +1044,10 @@ class NYCEnvironment:
         # duration and energy consumption consistently under that speed.
         cleaned = df.sort_values('pickup_datetime').reset_index(drop=True)
         demand_cache[cache_key] = cleaned
+        # Active environments retain their own DataFrame. Do not pin every
+        # historical date/scope combination in this class-level reuse cache.
+        while len(demand_cache) > 2:
+            demand_cache.pop(next(iter(demand_cache)))
         NYCEnvironment._demand_data_cache = demand_cache
         return cleaned.copy(deep=False)
 
@@ -7504,6 +7511,14 @@ class NYCEnvironment:
         post_action_distances = np.concatenate(edge_post_action_distance_parts)
         post_action_durations = np.concatenate(edge_post_action_duration_parts)
         post_action_zoneids = np.concatenate(edge_post_action_zoneid_parts)
+
+        for parts in (edge_row_parts, edge_col_parts, edge_action_parts,
+                      edge_target_location_parts, edge_request_value_parts,
+                      edge_target_distance_parts, edge_target_zoneid_parts,
+                      edge_target_station_id_parts, edge_post_action_location_parts,
+                      edge_post_action_distance_parts, edge_post_action_duration_parts,
+                      edge_post_action_zoneid_parts):
+            parts.clear()  # concatenated vectors now own these values
 
         q_vals = np.zeros(edge_rows.shape, dtype=np.float32)
         ev_edge_mask = is_ev_rows[edge_rows]

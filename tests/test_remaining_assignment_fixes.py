@@ -56,13 +56,15 @@ def test_actual_graph_scorer_receives_strict_masked_state(monkeypatch):
     value.state_variant = "strict_fleet_local_separate_critics"
     value._joint_critic_router = {1: value, 2: value}
     seen = []
-    original = value._edge_tensor_from_experience
+    original = value._graph_context
 
-    def capture(exp, *args, **kwargs):
-        seen.append(kwargs.get("state_snapshot"))
-        return original(exp, *args, **kwargs)
+    def capture(snapshot=None, *args, **kwargs):
+        seen.append(snapshot)
+        return original(snapshot, *args, **kwargs)
 
-    monkeypatch.setattr(value, "_edge_tensor_from_experience", capture)
+    # The production scorer uses the batch path; inspect the state actually
+    # delivered to its encoder, not the retired scalar helper.
+    monkeypatch.setattr(value, "_graph_context", capture)
     value._graph_edge_scores(graph, target_context=False)
     assert seen
     assert all(len(snapshot.vehicles) == 1 for snapshot in seen)

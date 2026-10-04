@@ -16,7 +16,7 @@ from .types import REPLAY_SCHEMA_VERSION, RecourseTransition, is_true_same_epoch
 
 @dataclass(frozen=True)
 class ReplaySample:
-    transitions: tuple[RecourseTransition, ...]
+    transitions: Sequence[RecourseTransition]
     indices: tuple[int, ...]
     weights: tuple[float, ...]
     probabilities: tuple[float, ...]
@@ -24,6 +24,8 @@ class ReplaySample:
 
 class PrioritizedJointReplayBuffer:
     """One typed source of truth for integrated and recourse transitions."""
+
+    storage = 'memory'
 
     def __init__(
         self,
@@ -79,6 +81,9 @@ class PrioritizedJointReplayBuffer:
             else None
         )
 
+    def has_transition(self, transition_id: str) -> bool:
+        return str(transition_id) in self._transition_index
+
     def add(self, transition: RecourseTransition, *, td_error: float | None = None) -> int:
         self._validate(transition)
         if transition.transition_id in self._transition_index:
@@ -116,6 +121,7 @@ class PrioritizedJointReplayBuffer:
         *,
         predicate: Callable[[RecourseTransition], bool] | None = None,
         rng: np.random.Generator | None = None,
+        ready_fleet: bool | None = None,
     ) -> ReplaySample:
         """Sample only trainable rows without advancing the beta schedule."""
 
@@ -235,13 +241,16 @@ class PrioritizedJointReplayBuffer:
             "checkpoint_mode": mode,
             "items": items,
             "priorities": priorities,
-            "next_index": len(items) % self.capacity,
+            "next_index": (self._next_index if items and len(items) == len(self._items)
+                           else len(items) % self.capacity),
             "seed": self.seed,
             "rng_state": self.rng.bit_generator.state,
             "content_hash": content_hash,
         }
 
     def load_state_dict(self, state: dict) -> None:
+        if 'disk_replay_schema' in state:
+            raise ValueError('This checkpoint has disk replay; restore with ICAPS_REPLAY_STORAGE=disk')
         version = int(state.get("schema_version", -1))
         if version != REPLAY_SCHEMA_VERSION:
             raise ValueError(
@@ -357,7 +366,13 @@ class PrioritizedJointReplayBuffer:
     def load(cls, path: str | Path) -> "PrioritizedJointReplayBuffer":
         with Path(path).open("rb") as handle:
             state = pickle.load(handle)
-        replay = cls(capacity=int(state.get("capacity", 1)))
+        if 'disk_replay_schema' in state or getattr(cls, 'storage', 'memory') == 'disk':
+            import os
+            from .disk_replay import DiskPrioritizedJointReplayBuffer
+            replay = DiskPrioritizedJointReplayBuffer(capacity=int(state.get('capacity', 1)),
+                directory=os.environ.get('ICAPS_REPLAY_DIR', str(Path(path).parent / '.replay_cache')))
+        else:
+            replay = cls(capacity=int(state.get("capacity", 1)))
         replay.load_state_dict(state)
         return replay
 

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from src.ADPtrainer import ADPTrainer
+from src.memory_lifecycle import release_training_caches, check_training_memory
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import aggregate_wait_metrics
 from src.recourse.critics import (
@@ -1440,6 +1441,7 @@ class NYCTrainer:
             step_durations = []
 
             for step in range(env.episode_length):
+                check_training_memory(global_step, value_function, value_function_ev)
                 step_start = time.time()
                 decision_date = str(env._current_date_label().date()) if evaluation_days > 1 else None
                 current_requests = list(env.active_requests.values())
@@ -1900,7 +1902,7 @@ class NYCTrainer:
                 f"| sim_epoch_time={avg_step_time:.4f}s ({avg_step_time * 1000.0:.1f}ms)"
             )
 
-            torch.cuda.empty_cache()
+            release_training_caches(value_function, value_function_ev)
 
         print("\n=== NYC Training Complete ===")
         print(f"Rollouts: {num_episodes}, Avg daily reward: {np.mean(results['episode_rewards']) / evaluation_days:.2f}")

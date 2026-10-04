@@ -31,6 +31,7 @@ from .Action import Action, ChargingAction, ServiceAction
 from .Request import Request
 from .charging_station import ChargingStationManager, ChargingStation
 from .charging_wait_metrics import aggregate_wait_metrics
+from .memory_lifecycle import release_training_caches, check_training_memory
 from .CentralAgent import CentralAgent
 from .SpatialVisualization import SpatialVisualization
 from .recourse.critics import (
@@ -1682,6 +1683,7 @@ class ADPTrainer:
             Idle_list = []
 
             for step in range(env.episode_length):
+                check_training_memory(step, value_function, value_function_ev)
                 if step == 0:
                     log_progress(f"Episode {episode + 1} entering step loop")
                 actions = {}
@@ -2196,7 +2198,7 @@ class ADPTrainer:
 
             vehicle_visit_stats = self._analyze_vehicle_visit_patterns(env)
             results['vehicle_visit_stats'].append(vehicle_visit_stats)
-            torch.cuda.empty_cache()
+            release_training_caches(value_function, value_function_ev)
 
         if save_checkpoints and use_neural_network and value_function is not None and value_function_ev is not None:
             episode = num_episodes - 1  # 最后一个episode的索引

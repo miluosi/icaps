@@ -344,7 +344,7 @@ class SystemSnapshot:
         return replace(self, vehicles=masked_vehicles)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FeasibleEdgeSnapshot:
     edge_id: str
     vehicle_id: int
@@ -375,6 +375,26 @@ class FeasibleEdgeSnapshot:
     expected_response_anchor: bool = False
     response_model_hash: str | None = None
     metadata: tuple[tuple[str, float | int | str | bool | None], ...] = ()
+
+    def __setstate__(self, state):
+        # Load both historical dictionary-backed pickles and new slotted ones.
+        if isinstance(state, dict):
+            from dataclasses import fields, MISSING
+            for item in fields(self):
+                value = state.get(item.name, item.default)
+                if value is MISSING:
+                    raise ValueError(f'Missing replay edge field: {item.name}')
+                object.__setattr__(self, item.name, value)
+        else:
+            if len(state) != len(self.__slots__):
+                raise ValueError('Incompatible replay edge field count')
+            for name, value in zip(self.__slots__, state):
+                object.__setattr__(self, name, value)
+
+    def __deepcopy__(self, memo):
+        # Every declared field is immutable (scalars or tuples of scalars).
+        memo[id(self)] = self
+        return self
 
     def __post_init__(self):
         from src.rejection_anchor import expected_structured_score
