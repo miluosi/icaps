@@ -168,6 +168,17 @@ class StateSnapshotBuilder:
             and float(charge_expansion.get('current_time', env.current_time)) == float(env.current_time)
         ):
             arrival_expansion = charge_expansion
+        conservative_windows = {}
+        if (
+            getattr(env, 'conservative_charging', False)
+            and isinstance(charge_expansion, dict)
+            and charge_expansion.get('capacity_scope') == 'full_window'
+        ):
+            conservative_windows = _certified_conservative_windows(
+                env, vehicle_ids, station_ids,
+                np.asarray(action_matrix)[:, num_requests:num_requests + num_stations],
+                charge_expansion,
+            )
         zone_indices = list(getattr(env, "_last_matrix_zone_indices", ()))[:num_zones]
         zone_ids = list(getattr(env, "_last_matrix_zone_target_ids", ()))[:num_zones]
         vehicle_map = {vehicle.vehicle_id: vehicle for vehicle in state.vehicles}
@@ -261,7 +272,19 @@ class StateSnapshotBuilder:
                     resource_capacity = int(
                         station.remaining_admission_capacity
                     )
-                    if arrival_expansion is not None:
+                    if conservative_windows:
+                        window = conservative_windows[(int(vehicle_id), station_id)]
+                        # All retained candidates fit together over their full
+                        # intervals. Any assignment subset therefore fits too.
+                        # Match the live solver's nonbinding station column;
+                        # current vacancy is not a future reservation quota.
+                        resource_type = 'station_admitted'
+                        resource_capacity = len(vehicle_ids)
+                        edge_metadata += tuple(
+                            (f'conservative_{key}', int(window[key]))
+                            for key in ('arrival_offset', 'end_offset', 'plug_index')
+                        )
+                    elif arrival_expansion is not None:
                         window = arrival_expansion['candidate_windows'].get(
                             (int(vehicle_id), station_id)
                         )
@@ -775,6 +798,63 @@ class StateSnapshotBuilder:
                     metadata=tuple(sorted(metadata.items())),
                 )
             )
+
+
+def _certified_conservative_windows(env, vehicle_ids, station_ids, mask, expansion):
+    """Validate the admitted superset once, then freeze its independent edges.
+
+    This avoids both a stale current-vacancy quota and a dense private action
+    column for every reservation. No live calendar is needed during replay.
+    """
+    from src.expected_charging import charging_capacity_epochs
+
+    if not np.any(mask > 0):
+        return {}
+    admission = getattr(env, '_last_conservative_charge', None)
+    ids = tuple(map(int, vehicle_ids))
+    if (
+        not isinstance(admission, dict)
+        or tuple(expansion.get('vehicle_ids', ())) != ids
+        or tuple(admission.get('vehicle_ids', ())) != ids
+        or float(expansion.get('current_time', -1)) != float(env.current_time)
+    ):
+        raise ValueError('Missing or stale conservative admission certificate')
+    certified = {}
+    for col, station_id in enumerate(station_ids):
+        intervals = []
+        for row in np.flatnonzero(mask[:, col] > 0):
+            key = (ids[row], int(station_id))
+            virtual = admission.get('virtual_windows', {}).get(key)
+            candidate = expansion.get('candidate_windows', {}).get(key)
+            if not virtual or not candidate or not virtual.get('kept'):
+                raise ValueError('Feasible charge edge has no conservative admission certificate')
+            epochs = charging_capacity_epochs(candidate, 'full_window')
+            if (
+                virtual.get('wait_offset') != 0
+                or virtual.get('arrival_offset') != epochs.start
+                or virtual.get('start_offset') != epochs.start
+                or virtual.get('end_offset') != epochs.stop
+            ):
+                raise ValueError('Conservative admission window disagrees with solver window')
+            intervals.append((epochs.start, epochs.stop))
+            certified[key] = dict(virtual)
+        if not intervals:
+            continue
+        schedule = expansion.get('station_schedules', {}).get(int(station_id))
+        if schedule is None:
+            raise ValueError('Missing conservative station schedule')
+        horizon = max(end for _, end in intervals)
+        delta = np.zeros(horizon + 1, dtype=np.int64)
+        for start, end in intervals:
+            delta[start] += 1
+            delta[end] -= 1
+        admitted_occupancy = np.cumsum(delta[:-1])
+        total = admitted_occupancy.copy()
+        background = np.asarray(schedule.get('occupancy', ()), dtype=np.int64)[:horizon]
+        total[:len(background)] += background
+        if np.any((admitted_occupancy > 0) & (total > int(schedule['capacity']))):
+            raise ValueError('Conservative admitted windows exceed station capacity')
+    return certified
 
 
 def _distance(env: Any, origin: int, destination: int) -> float:
