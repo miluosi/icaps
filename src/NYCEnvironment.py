@@ -34,6 +34,7 @@ from src.Action import Action, ChargingAction, IdleAction, ServiceAction
 from src.charging_station import ChargingStation, ChargingStationManager
 from src.charging_metrics import charging_session_metrics
 from src.charging_wait_metrics import positive_wait_metrics
+from src.compact_history import PositionHistory
 from src.expected_charging import (
     build_charge_action_epoch_expansion,
     build_expected_station_schedule,
@@ -3747,9 +3748,7 @@ class NYCEnvironment:
             vehicle['needs_emergency_charging'] = True
             self._clear_vehicle_assignments(vehicle_id)
         # track
-        if vehicle_id not in self.vehicle_position_history:
-            self.vehicle_position_history[vehicle_id] = []
-        self.vehicle_position_history[vehicle_id].append({
+        self._record_vehicle_position(vehicle_id, {
             'zone': int(mapped_zone),
             'coordinates': vehicle['coordinates'],
             'time': self.current_time,
@@ -3807,12 +3806,17 @@ class NYCEnvironment:
             vehicle['needs_emergency_charging'] = True
             self._clear_vehicle_assignments(vehicle_id)
 
-        self.vehicle_position_history.setdefault(vehicle_id, []).append({
+        self._record_vehicle_position(vehicle_id, {
             'zone': int(mapped_zone),
             'coordinates': vehicle['coordinates'],
             'time': self.current_time,
         })
         return moved_km
+
+    def _record_vehicle_position(self, vehicle_id, row):
+        if vehicle_id not in self.vehicle_position_history:
+            self.vehicle_position_history[vehicle_id] = PositionHistory()
+        self.vehicle_position_history[vehicle_id].append(row)
 
     def _execute_movement_towards_target(self, vehicle_id: int) -> float:
         vehicle = self.vehicles[vehicle_id]
@@ -4208,10 +4212,14 @@ class NYCEnvironment:
         vehicle = self.vehicles[vehicle_id]
         if not vehicle.get('is_online', True):
             return 0.0, 0.0
-        if vehicle_id not in self.storeactions or self.storeactions[vehicle_id] is None:
-            self.storeactions[vehicle_id] = action
-            self.storeactions[vehicle_id].dur_reward = 0
-            self.storeactions[vehicle_id].current_time = self.current_time
+        # EV actions belong only to the EV cache. Storing the first EV action
+        # in the AEV cache rooted its entire next_action chain for the episode,
+        # including training graph snapshots, even during frozen evaluation.
+        action_store = self.storeactions_ev if self._is_ev(vehicle_id) else self.storeactions
+        if action_store.get(vehicle_id) is None:
+            action_store[vehicle_id] = action
+            action.dur_reward = 0
+            action.current_time = self.current_time
 
         reward = 0.0
         dur_reward = 0.0
@@ -6780,6 +6788,7 @@ class NYCEnvironment:
                 station_schedules={},
                 candidate_windows={},
                 capacity_scope=capacity_scope,
+                materialize_epoch_arrays=False,
             )
             self._last_expected_charge_expansion['current_time'] = float(
                 getattr(self, 'current_time', 0.0)
@@ -6847,6 +6856,7 @@ class NYCEnvironment:
             station_schedules=expected_schedules,
             candidate_windows=expected_windows,
             capacity_scope=capacity_scope,
+            materialize_epoch_arrays=False,
         )
         self._last_expected_charge_expansion['current_time'] = float(
             getattr(self, 'current_time', 0.0)
@@ -6998,6 +7008,7 @@ class NYCEnvironment:
                 vehicle_ids=vehicle_ids, station_ids=[], feasibility=charge_mat,
                 station_schedules={}, candidate_windows={},
                 capacity_scope=('full_window' if getattr(self, 'conservative_charging', False) else 'arrival'),
+                materialize_epoch_arrays=False,
             )
             self._last_expected_charge_expansion['current_time'] = float(self.current_time)
         else:

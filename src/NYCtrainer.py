@@ -11,6 +11,7 @@ import torch
 
 from src.ADPtrainer import ADPTrainer
 from src.memory_lifecycle import release_training_caches, check_training_memory
+from src.compact_history import ChargingEventHistory
 from src.GurobiOptimizer import GurobiOptimizer
 from src.charging_wait_metrics import aggregate_wait_metrics
 from src.recourse.critics import (
@@ -1372,7 +1373,7 @@ class NYCTrainer:
             "episode_rewards_aev": [],
             "episode_rewards_ev": [],
             "drop_off_rates": [],
-            "charging_events": [],
+            "charging_events": ChargingEventHistory(),
             "episode_detailed_stats": [],
             "episode_rejected_requests": [],
             "episode_recourse_requests": [],
@@ -1430,7 +1431,7 @@ class NYCTrainer:
             episode_reward = 0
             episode_reward_aev = 0
             episode_reward_ev = 0
-            episode_charging_events = []
+            episode_charging_events = ChargingEventHistory()
             episode_losses = []
             episode_losses_ev = []
             episode_norm_td_losses = []

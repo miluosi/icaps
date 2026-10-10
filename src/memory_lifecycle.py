@@ -4,6 +4,46 @@ import os
 import sys
 
 
+def load_checkpoint_on_cpu(path):
+    """Map tensor storage when supported; keep legacy pickle files readable."""
+    import torch
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+    except TypeError:
+        # Older PyTorch releases do not accept mmap or weights_only.
+        try:
+            return torch.load(path, map_location='cpu', weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location='cpu')
+    except RuntimeError as error:
+        if 'mmap' not in str(error):
+            raise
+        return torch.load(path, map_location='cpu', weights_only=False)
+
+
+def discard_checkpoint_training_payload(checkpoint):
+    """Drop only training buffers/history/optimizers, preserving inference state.
+
+    Legacy Python replay objects still have to be unpickled on initial load;
+    use an inference checkpoint to avoid that transient host-memory cost.
+    """
+    if not isinstance(checkpoint, dict) or 'network_state_dict' not in checkpoint:
+        return checkpoint
+    history_keys = {
+        'training_losses', 'normalized_td_losses', 'q_values_history',
+        'rejection_training_losses', 'queue_training_losses',
+        'queue_training_mse_losses', 'joint_training_diagnostics',
+        'experience_buffer', 'rejection_buffer', 'queue_experience_buffer',
+        'joint_replay_state_dict',
+    }
+    for state in (checkpoint, checkpoint.get('extra_value_function_state', {})):
+        if isinstance(state, dict):
+            for key in tuple(state):
+                if key in history_keys or 'optimizer' in key and key.endswith('_state_dict'):
+                    del state[key]
+    return checkpoint
+
+
 class JsonArrayDigest:
     """Hash json.dumps(list_of_values) without retaining the history or JSON."""
     def __init__(self):
@@ -90,6 +130,12 @@ def check_training_memory(step, *value_functions):
     replays = {id(r): r for v in value_functions
                if (r := getattr(v, 'joint_replay_buffer', None)) is not None}
     detail = ', '.join(f'{getattr(r, "storage", "memory")}:{len(r)} rows' for r in replays.values())
+    import torch
+    gpu = ''
+    if torch.cuda.is_initialized():
+        gpu = (f'; CUDA allocated={torch.cuda.memory_allocated()/1024**3:.2f} GiB'
+               f' reserved={torch.cuda.memory_reserved()/1024**3:.2f} GiB'
+               f' peak_allocated={torch.cuda.max_memory_allocated()/1024**3:.2f} GiB')
     if rss is not None:
-        print(f'[RAM] step={step} RSS={rss:.2f} GiB; joint replay {detail or "none"}', flush=True)
+        print(f'[RAM] step={step} RSS={rss:.2f} GiB; joint replay {detail or "none"}{gpu}', flush=True)
     return rss

@@ -76,6 +76,14 @@ def test_default_charge_matrix_checks_only_arrival_and_retains_physical_duration
 
     assert charge_matrix.shape == (1, 1)
     assert charge_matrix.tolist() == [[1.0]]
+    # Live NYC keeps intervals only; diagnostic tensors can still be explicitly
+    # reconstructed and must describe exactly the same feasibility window.
+    assert 'action_epoch_mask' not in expansion
+    from src.expected_charging import build_charge_action_epoch_expansion
+    expansion = build_charge_action_epoch_expansion(
+        vehicle_ids=expansion['vehicle_ids'], station_ids=expansion['station_ids'],
+        feasibility=charge_matrix, station_schedules=expansion['station_schedules'],
+        candidate_windows=expansion['candidate_windows'], capacity_scope=expansion['capacity_scope'])
     assert expansion["action_epoch_mask"].shape == (1, 1, 7)
     assert expansion["action_epoch_mask"][0, 0].tolist() == [
         0, 0, 0, 1, 0, 0, 0

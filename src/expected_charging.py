@@ -129,6 +129,7 @@ def build_charge_action_epoch_expansion(
     station_schedules: Mapping,
     candidate_windows: Mapping,
     capacity_scope: str = "full_window",
+    materialize_epoch_arrays: bool = True,
 ) -> dict:
     """Expand the legacy 2-D charge matrix into per-epoch resource masks.
 
@@ -151,6 +152,15 @@ def build_charge_action_epoch_expansion(
         ]
         + [0]
     )
+    if not materialize_epoch_arrays:
+        # NYC solvers and replay snapshots consume interval metadata directly.
+        # Avoid the unused vehicles x stations x future-epochs allocation.
+        return {
+            'vehicle_ids': vehicle_ids, 'station_ids': station_ids,
+            'capacity_scope': capacity_scope, 'horizon': int(horizon),
+            'candidate_windows': dict(candidate_windows),
+            'station_schedules': dict(station_schedules),
+        }
     action_epoch_mask = np.zeros(
         (len(vehicle_ids), len(station_ids), horizon), dtype=np.uint8
     )

@@ -28,6 +28,7 @@ from datetime import date, datetime
 
 from src.ADPtrainer import ADPTrainer
 from src.NYCtrainer import NYCTrainer
+from src.memory_lifecycle import release_training_caches
 from src.charging_wait_metrics import aggregate_wait_metrics
 from src.recourse.types import LEARNER_VARIANTS, STATE_VARIANTS
 from src.recourse.config import (
@@ -1182,6 +1183,15 @@ def main(argv=None):
                         f"ChargeTime: {mean_charge_duration_all:.2f} min  "
                         f"DropOff: {mean_drop_off_rate:.4f}  "
                         f"MaxPressure: {mean_max_station_pressure:.2f}")
+
+                # The next run must not coexist with the preceding 3-day
+                # environment, networks and per-step histories. Exported rows
+                # above are plain statistics and remain in all_results.
+                release_training_caches(getattr(env, 'value_function', None),
+                                        getattr(env, 'value_function_ev', None))
+                del env, results, detailed
+                episode_detail = None
+                release_training_caches()
 
     if not all_results:
         raise SystemExit(

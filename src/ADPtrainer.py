@@ -31,7 +31,8 @@ from .Action import Action, ChargingAction, ServiceAction
 from .Request import Request
 from .charging_station import ChargingStationManager, ChargingStation
 from .charging_wait_metrics import aggregate_wait_metrics
-from .memory_lifecycle import release_training_caches, check_training_memory
+from .memory_lifecycle import (release_training_caches, check_training_memory,
+                               load_checkpoint_on_cpu, discard_checkpoint_training_payload)
 from .CentralAgent import CentralAgent
 from .SpatialVisualization import SpatialVisualization
 from .recourse.critics import (
@@ -270,10 +271,7 @@ class ADPTrainer:
         identity = {"episode": episode, "checkpoint_tag": tag, "pair_id": None}
         if "full_state" not in path.name:
             return identity
-        try:
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(path, map_location="cpu")
+        payload = load_checkpoint_on_cpu(path)
         if isinstance(payload, dict):
             identity["episode"] = int(payload.get("episode", episode))
             identity["checkpoint_tag"] = str(payload.get("checkpoint_tag", tag))
@@ -860,16 +858,20 @@ class ADPTrainer:
             artifacts = getattr(value_function, "checkpoint_artifact_paths", [])
             artifacts.append(str(checkpoint_path))
             value_function.checkpoint_artifact_paths = list(dict.fromkeys(artifacts))
-            try:
-                checkpoint = torch.load(
-                    checkpoint_path,
-                    map_location=value_function.device,
-                    weights_only=False,
-                )
-            except TypeError:
-                checkpoint = torch.load(
-                    checkpoint_path, map_location=value_function.device
-                )
+            if bool(getattr(getattr(value_function, 'env', None), 'evaluatemode', False)):
+                checkpoint = discard_checkpoint_training_payload(
+                    load_checkpoint_on_cpu(checkpoint_path))
+            else:
+                try:
+                    checkpoint = torch.load(
+                        checkpoint_path,
+                        map_location=value_function.device,
+                        weights_only=False,
+                    )
+                except TypeError:
+                    checkpoint = torch.load(
+                        checkpoint_path, map_location=value_function.device
+                    )
             
             if hasattr(value_function, 'load_acceptance_checkpoint_state'):
                 value_function.load_acceptance_checkpoint_state(

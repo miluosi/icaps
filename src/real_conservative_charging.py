@@ -255,7 +255,7 @@ class RealConservativeNYCEnvironment(NYCEnvironment):
             if v['location'] < 0:
                 v['location'] = self._nearest_zone(*coords, prefer_polygon=False)
             v['zone_id'] = v['location']
-            self.vehicle_position_history.setdefault(vehicle_id, []).append(
+            self._record_vehicle_position(vehicle_id,
                 dict(zone=v['location'], coordinates=coords, time=self.current_time))
             if arrived:
                 if self.current_time != r.arrival:
