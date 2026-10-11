@@ -1284,6 +1284,9 @@ class NYCTrainer:
               f"reference={env.learning_soc_wait_reference:.2f}, "
               f"rate={env.learning_soc_wait_penalty_per_hour:g}/hour, "
               f"exponent={env.learning_soc_wait_exponent:g}; system reward unchanged")
+        if not trainnetwork and float(adpvalue) == 0.0:
+            print("Myopic evaluation: AEV wait score includes the same immediate "
+                  "SoC penalty as the training reward; reported system reward unchanged")
         if effective_zone_distribution_mode == "bayes_simple_pretrain" and value_function is not None:
             self._configure_pretrained_zone_distributors(
                 value_function=value_function,

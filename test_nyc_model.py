@@ -1093,6 +1093,7 @@ def main(argv=None):
                 recourse_assigned = sum(d.get("recourse_assigned_requests", 0) for d in detailed)
                 recourse_completed = sum(d.get("recourse_completed_requests", 0) for d in detailed)
                 entry = {
+                    "myopic_soc_wait_shaping": bool(getattr(env, "myopic_wait_shaping_enabled", False)),
                     "continuous_evaluation": continuous,
                     "rollouts": len(rewards),
                     "statistics_scope": "counts: full date range; reward: per calendar day; queues: time mean of network total",

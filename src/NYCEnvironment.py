@@ -4192,6 +4192,17 @@ class NYCEnvironment:
         hours = max(0.0, float(duration_epochs)) * float(self.EPOCH_LENGTH) / 3600.0
         return rate * hours * deficit ** exponent
 
+    @property
+    def myopic_wait_shaping_enabled(self) -> bool:
+        """Align pure-myopic evaluation with the immediate training wait cost.
+
+        Learned dispatch and its structured anchors must not receive the cost
+        again: the training reward already contains it. Economic reward remains
+        separate in _execute_action for every policy.
+        """
+        return (bool(getattr(self, 'evaluatemode', False))
+                and float(getattr(self, 'adp_value', 1.0)) == 0.0)
+
     def _action_soc_wait_learning_penalty(self, vehicle_id: int, action) -> float:
         vehicle = self.vehicles[vehicle_id]
         if (int(vehicle.get('type', 1)) != 2
@@ -7260,6 +7271,8 @@ class NYCEnvironment:
                         - self.idle_penalty * relocation_epochs
                     )
                 q[i, -1] = -self.idle_penalty
+                if self.myopic_wait_shaping_enabled and self.vehicles[vid].get('is_online', True):
+                    q[i, -1] -= self.soc_wait_learning_penalty(self.vehicles[vid]['battery'])
             else:
                 wait_target = self._sample_ev_default_relocation_target(int(vid))
                 wait_distance = self.get_distance_km(vloc, wait_target)

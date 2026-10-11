@@ -142,3 +142,78 @@ def test_real_nyc_step_freezes_shaping_in_joint_replay(variant):
     assert row.aev_soc_wait_learning_penalty == pytest.approx(expected)
     if variant == 'macro':
         assert pair[1]._joint_stage_payload(row, ifEV=True)[2] == pytest.approx(row.reward_system - expected)
+
+
+@pytest.mark.parametrize('battery', [.8, .3, .2, .1, 0.])
+@pytest.mark.parametrize('epoch_length', [30., 60.])
+def test_myopic_evaluation_wait_matches_immediate_learning_reward(battery, epoch_length):
+    env, action = idle_env(battery)
+    env.EPOCH_LENGTH = epoch_length
+    env.idle_penalty = 4. * epoch_length / 3600.
+    env.vehicles[1]['passenger_onboard'] = None
+    env.evaluatemode, env.adp_value = True, 0.
+    score = env.generate_vehicle_qvalue_withoutqnetwork([1])[0, -1]
+    economic, _ = env._execute_action(1, action)
+    learning = economic - env._action_soc_wait_learning_penalty(1, action)
+    assert economic == pytest.approx(-env.idle_penalty)
+    # Same quantization as all assignment coefficients.
+    assert score == pytest.approx(round(learning * 10000) / 10000, abs=1e-7)
+    assert env.generate_vehicle_wait([1]).tolist() == [[1.]]
+
+
+@pytest.mark.parametrize('evaluation,adp', [(False, 0.), (False, 1.), (True, 1.)])
+def test_training_and_learned_anchors_do_not_double_count_wait_shaping(evaluation, adp):
+    env, _ = idle_env(.1)
+    env.vehicles[1]['passenger_onboard'] = None
+    env.evaluatemode, env.adp_value = evaluation, adp
+    assert not env.myopic_wait_shaping_enabled
+    score = env.generate_vehicle_qvalue_withoutqnetwork([1])[0, -1]
+    assert score == pytest.approx(round(-env.idle_penalty * 10000) / 10000, abs=1e-7)
+
+
+def test_myopic_shaping_does_not_change_ev_relocation_or_other_aev_scores():
+    env, _ = idle_env(.1)
+    env.vehicles[1]['passenger_onboard'] = None
+    env.vehicles[2] = dict(env.vehicles[1], type=1)
+    env._last_matrix_charge_station_ids = [100]
+    env._last_matrix_zone_target_ids = [1]
+    env.charging_manager = SimpleNamespace(stations={100: SimpleNamespace(location=2)})
+    env.charging_penalty = 2/120
+    env._charge_duration_for_vehicle = lambda vid: 2
+    env._sample_ev_default_relocation_target = lambda vid: 1
+    env._movement_cost = lambda distance: -distance
+    env.evaluatemode, env.adp_value = False, 0.
+    before = env.generate_vehicle_qvalue_withoutqnetwork([1, 2])
+    env.evaluatemode = True
+    after = env.generate_vehicle_qvalue_withoutqnetwork([1, 2])
+    assert np.array_equal(before[1], after[1])
+    assert np.array_equal(before[0, :-1], after[0, :-1])
+    assert after[0, -1] < before[0, -1]
+
+
+@pytest.mark.parametrize('variant', ['r1', 'r2'])
+def test_myopic_r1_r2_exact_dispatch_records_shaped_wait_score(variant):
+    from train_acceptance_model import make_environment, parse_args
+    from src.recourse.types import ActionType
+    env = make_environment(parse_args([
+        '--environment', 'nyc', '--num-vehicles', '2', '--num-ev', '1',
+        '--stop-hour', '8.05',
+    ]), 901)
+    env.evaluatemode, env.adp_value = True, 0.
+    env.configure_recourse_experiment(variant, common_random_numbers=True)
+    env.value_function = env.value_function_ev = None
+    env._should_consider_ev_charging = lambda vid: False
+    env._charging_station_ids_for_vehicle = lambda vid: []
+    env.active_requests = {}
+    aev = next(vid for vid, v in env.vehicles.items() if v['type'] == 2)
+    for v in env.vehicles.values():
+        v.update(battery=.1, assigned_request=None, passenger_onboard=None,
+                 charging_station=None, charging_target=None, target_location=None,
+                 idle_target=None, penalty_timer=0, is_online=True)
+    actions, _, _ = env.simulate_motion_evfirst()
+    graph = env._last_feasible_graph_snapshot
+    edge = next(e for e in graph.edges if e.vehicle_id == aev and e.action_type == ActionType.WAIT)
+    assert isinstance(actions[aev], IdleAction)
+    assert edge.collection_score == pytest.approx(-.3, abs=1e-6)
+    assert edge.structured_score == pytest.approx(-.3, abs=1e-6)
+    assert env._execute_action(aev, actions[aev])[0] == pytest.approx(-env.idle_penalty)
