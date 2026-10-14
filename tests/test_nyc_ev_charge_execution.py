@@ -140,3 +140,57 @@ def test_real_movement_consumes_battery_but_local_wait_does_not(env):
     assert v['battery'] == before['battery']
     assert v['total_distance'] == before['total_distance']
     assert v['coordinates'] == before['coordinates']
+
+
+@pytest.mark.parametrize('mode', ['current', 'conservative', 'real_conservative'])
+@pytest.mark.parametrize('midnight', [2880, 5760])
+def test_aev_selected_charging_survives_both_daily_boundaries(env, monkeypatch, mode, midnight):
+    """A selected AEV charge must arrive and finish on day two and day three."""
+    env.end_date = '2025-12-17'
+    env.configure_continuous_evaluation()
+    env.current_time = midnight - 2
+    env.vehicles[0]['is_online'] = False
+    v = env.vehicles[1]
+    v['type'], v['type_name'] = 2, 'AEV'
+    env.storeactions[1] = None
+    sid = env.aev_charging_station_ids[0]
+    station = env.charging_manager.stations[sid]
+    station.max_capacity = station.available_slots = 1
+    origin = min((z for z in env.manhattan_zone_ids if z != station.location),
+                 key=lambda z: env.get_distance_km(z, station.location))
+    v.update(location=origin, zone_id=origin, coordinates=env.zone_coords[origin], battery=.2)
+    if mode == 'conservative':
+        env.conservative_charging = True
+    elif mode == 'real_conservative':
+        env.__class__ = RealConservativeNYCEnvironment
+        env._reset_reservations()
+        env.real_conservative_active = env.conservative_charging = True
+    monkeypatch.setattr(env, '_charging_station_ids_for_vehicle', lambda vid: [sid])
+    original = env.generate_vehicle_qvalue_withoutqnetwork
+    def prefer_charge(ids):
+        scores = original(ids)
+        nr = env._last_matrix_num_requests
+        ns = env._last_matrix_num_stations
+        scores[:, nr:nr+ns] = 1000.
+        return scores
+    monkeypatch.setattr(env, 'generate_vehicle_qvalue_withoutqnetwork', prefer_charge)
+    saw_start = False
+    for _ in range(120):
+        actions, aev, ev = env.simulate_motion_evfirst(agents=[], current_requests=[], rebalance=True)
+        assert isinstance(actions[1], ChargingAction)
+        assert actions[1].charging_station_id == sid
+        env.step(actions, aev, ev)
+        saw_start |= v['charging_station'] == sid
+        if v['completed_charging_durations_minutes']:
+            break
+    assert saw_start and v['completed_charging_durations_minutes']
+    assert v['battery'] >= .8 - 1e-6
+    assert env.current_time > midnight
+    assert str(env._current_date_label().date()) == ('2025-12-16' if midnight == 2880 else '2025-12-17')
+    assert not station.charging_queue
+    assert v['charging_target'] is None and v['charging_station'] is None
+    if mode == 'real_conservative':
+        starts = [e for e in env.real_execution_events if e['event'] == 'arrival_start']
+        assert starts and all(e['wait'] == 0 for e in starts)
+        assert any(e['event'] == 'complete' for e in env.real_execution_events)
+        assert not env.real_reservations
