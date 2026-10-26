@@ -213,6 +213,27 @@ python run_nyctrainer.py \
 
 The main causal ladder is structured no-repair (C0) → Repair Only (R2) → Repair Learning (R3) → Macro → nested Q2 (R4). Learned R1 remains a diagnostic control. Macro uses the sampled two-stage system return; R4 substitutes a learned follower bootstrap without changing the physical inference path. Checkpoint namespaces include recourse, state, learner, hold, energy, solver, and rejection-stress settings. `--checkpoint-replay {none,recent,full}` controls replay persistence (`recent` stores the newest 5,000 transitions by default). Replay/checkpoint files use Python pickle through `torch.save`/`pickle`; load only artifacts created by a trusted local run.
 
+### External baseline: NeurADP
+
+`--methods neuradp` runs NeurADP ([Shah, Lowalekar & Varakantham, AAAI 2020](https://arxiv.org/abs/1911.08842); [official code](https://github.com/sanketkshah/NeurADP-for-Ride-Pooling)) in `src/ValueFunction_neuradp.py`. It is selected by name only and is not part of `--methods all`. The method fixes its own learner, so `--learner-variant` is ignored for it.
+
+The model keeps NeurADP's assumptions and adds only what this simulator needs:
+
+- **One-shot dispatch.** HEVs and AEVs are assigned jointly in a single stage (integrated mode). HEV offers are assumed to be accepted, and there is no same-epoch repair.
+- **Shared value network.** Every vehicle's post-decision value comes from one network: a path LSTM over location embeddings, a time embedding and fleet context, extended with post-decision SoC and the vehicle type.
+- **Scoring.** Each edge is scored as `r(a) + gamma * V(post)`, and the same exact assignment oracle as the other methods picks the joint action.
+- **Per-vehicle TD learning.** The target is the vehicle's next-epoch score under a target-network re-solve.
+- **Training defaults (from NeurADP).** Supervised MSE with minibatch 32, a soft target update with tau 0.1, 3 replay samples per update, and decaying additive exploration noise.
+
+Configure it with `--neuradp-{gamma,learning-rate,target-tau,samples-per-update,fit-batch-size,noise-scale}`. `--neuradp-response-aware` enables the NeurADP+p variant: HEV offers are weighted by the acceptance probability, with no recourse. It needs the acceptance feature (`--ev-acceptance-feature predicted --ev-acceptance-model ...`); without it q = 0 and the variant behaves like plain NeurADP. Use the same `--checkpoint-suffix`, charging model and dates for training and testing:
+
+```bash
+python run_nyctrainer.py --methods neuradp --episodes 3 --start-date 2025-12-08 --use-mcmf
+python test_nyc_model.py --methods neuradp --strategies ADP-MCMF --seeds 64 128 256 \
+  --start-date 2025-12-15 --end-date 2025-12-17 \
+  --load-model-start-date 2025-12-08 --load-model-end-date 2025-12-10
+```
+
 Formal NYC experiments use `run_recourse_multiday_panel.py`, which trains one checkpoint on a date window and reloads it independently on every held-out day. The companion runners are `run_assignment_learner_experiment.py`, `run_assignment_state_experiment.py`, `run_assignment_scalability_experiment.py`, `run_recourse_sensitivity.py`, `run_samitha_hold_ablation.py`, and `run_recourse_spatiotemporal_analysis.py`. Each formal training runner requires an explicit `--energy-model general_charging`. `fixed_swap` fails closed because it would require a different physical environment. Integrated and Samitha currently use their exact shared stage-0 adapter; auction/heuristic labels are not accepted for those architectures.
 
 ## Synthetic training

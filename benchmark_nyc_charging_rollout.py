@@ -148,7 +148,7 @@ def summarize(records, rows, fleet, capacity, horizon, epoch_minutes=.5):
         no_arrival_queue_observed=not bool(waited))
 
 
-def run_case(args, seed, scenario, conservative, output):
+def run_case(args, seed, scenario, conservative, output, observer=None):
     policy = conservative if isinstance(conservative, str) else ('conservative' if conservative else 'current')
     horizon=int(round(args.hours*120)); env=build_environment(args,seed,policy)
     records=install_workload(env,seed,scenario,horizon)
@@ -157,6 +157,8 @@ def run_case(args, seed, scenario, conservative, output):
     env.conservative_charging=policy != 'current'
     if policy == 'real_conservative':
         env.enable_real_conservative()
+    if observer is not None:
+        observer.initialize(env, records, horizon, scenario, seed, policy)
     events=[]; rows=[]; station_rows=[]; admissions=[]
     original_arrival=env._mark_charging_queue_arrival
     def arrival(vid,sid):
@@ -229,6 +231,8 @@ def run_case(args, seed, scenario, conservative, output):
             env._last_matrix_num_requests=0;env._last_matrix_num_stations=len(sids)
             env._last_matrix_num_zones=0;env._last_matrix_layout_ready=True
             mask=np.column_stack((charge,np.ones(len(ids),dtype=np.float32)))
+            if observer is not None:
+                observer.before_assignment(env, ids, sids, charge, epoch)
             if np.any(charge):
                 travel=np.array([[env.get_travel_time(env.vehicles[vid]['location'],env.charging_manager.stations[sid].location) for sid in sids] for vid in ids])
                 benefit=(len(ids)+1)*(float(travel.max())+1)
@@ -258,6 +262,8 @@ def run_case(args, seed, scenario, conservative, output):
             else:
                 actions[vid]=IdleAction([],v['coordinates'],v['coordinates'],v['location'],v['battery'])
         env.step(actions,{}, {})
+        if observer is not None:
+            observer.after_step(env, records, actions, epoch)
         if epoch%120==0: print(f'epoch={epoch}/{horizon} completed={sum(r["completion_epoch"] is not None for r in records.values())}',flush=True)
     summary=[dict(scenario=scenario,seed=seed,policy=policy,
                   initial_state_sha256=fingerprint,wall_seconds=time.perf_counter()-wall,
@@ -277,6 +283,8 @@ def run_case(args, seed, scenario, conservative, output):
         aev_arrivals = [r for r in records.values() if r['fleet']=='AEV' and
                         r['arrival_epoch'] is not None and not r['initial_charging']]
         assert all(not r['ever_queued'] and r['start_epoch']==r['arrival_epoch'] for r in aev_arrivals)
+    if observer is not None:
+        observer.finish(env, records, horizon)
     (output/'summary.json').write_text(json.dumps(summary,indent=2))
     return summary
 

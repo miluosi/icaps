@@ -39,6 +39,9 @@ from src.recourse.config import (
     add_method_list_arguments,
     canonical_method,
     method_checkpoint_suffix,
+    method_learner_variant,
+    method_spec,
+    neuradp_options,
     resolve_method_list_arguments,
 )
 from src.recourse.manifest import write_experiment_manifest
@@ -971,6 +974,7 @@ def run_nyc_training(
     continuous_evaluation: bool | None = None,
     charging_model: str | None = None,
     checkpoint_charging_model: str | None = None,
+    neuradp_options: dict | None = None,
 ):
     """Compatibility wrapper that delegates NYC training to src.NYCtrainer.NYCTrainer."""
 
@@ -1072,6 +1076,7 @@ def run_nyc_training(
         continuous_evaluation=continuous_evaluation,
         charging_model=charging_model,
         checkpoint_charging_model=checkpoint_charging_model,
+        neuradp_options=neuradp_options,
     )
 
 
@@ -1227,14 +1232,16 @@ def main(argv=None):
 
     for method in args.methods:
         canonical_name = canonical_method(method)
-        spec = METHODS[canonical_name]
+        spec = method_spec(canonical_name)
         mode = spec.operating_mode
         recourse_variant = spec.variant
+        # External baselines (neuradp) fix their own learner.
+        method_learner = method_learner_variant(method, args.learner_variant)
         checkpoint_suffix = method_checkpoint_suffix(
             base_checkpoint_suffix,
             method,
             state_variant=args.state_variant,
-            learner_variant=args.learner_variant,
+            learner_variant=method_learner,
             rejection_logit_shift=args.rejection_logit_shift,
         )
         print(
@@ -1284,7 +1291,7 @@ def main(argv=None):
             start_hour=args.start_hour,
             stop_hour=args.stop_hour,
             epoch_length=args.epoch_length,
-            zone_distribution_mode=zone_distribution_mode,
+            zone_distribution_mode=method_learner,
             daily_drop_off=args.daily_drop_off,
             ifreject=args.ifreject,
             ifdropoff=args.ifdropoff,
@@ -1316,7 +1323,7 @@ def main(argv=None):
             integrated_repair_hold_enabled=args.integrated_repair_hold_enabled,
             target_solver_policy=args.target_solver_policy,
             state_variant=args.state_variant,
-            learner_variant=args.learner_variant,
+            learner_variant=method_learner,
             ev_acceptance_feature=args.ev_acceptance_feature,
             ev_acceptance_model=args.ev_acceptance_model,
                 ev_response_anchor=args.ev_response_anchor,
@@ -1330,6 +1337,7 @@ def main(argv=None):
             aev_charging_center_csv=args.aev_charging_center_csv,
             conservative_charging=args.conservative_charging,
             charging_model=args.charging_model,
+            neuradp_options=neuradp_options(args),
         )
 
         print(f"\nFinished: {len(results.get('episode_rewards', []))} episodes")
@@ -1362,7 +1370,8 @@ def main(argv=None):
                 recourse_variant=recourse_variant,
                 checkpoint_suffix=checkpoint_suffix,
             )
-            manifest_arguments["resolved_distribution_mode"] = zone_distribution_mode
+            manifest_arguments["learner_variant"] = method_learner
+            manifest_arguments["resolved_distribution_mode"] = method_learner
             manifest_path = Path(results["excel_path"]).with_suffix(
                 ".manifest.json"
             )

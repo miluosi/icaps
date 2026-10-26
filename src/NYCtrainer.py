@@ -932,6 +932,7 @@ class NYCTrainer:
         continuous_evaluation: bool | None = None,
         charging_model: str | None = None,
         checkpoint_charging_model: str | None = None,
+        neuradp_options: dict | None = None,
     ):
         self._set_random_seeds(random_seed)
         if useauction:
@@ -1030,6 +1031,10 @@ class NYCTrainer:
         env.evaluatemode = not trainnetwork
         env.state_variant = str(state_variant)
         env.learner_variant = str(learner_variant)
+        for option, value in (neuradp_options or {}).items():
+            if not str(option).startswith("neuradp_"):
+                raise ValueError(f"unknown NeurADP option: {option}")
+            setattr(env, str(option), value)
         from src.acceptance_features import configure_acceptance_feature
         configure_acceptance_feature(env, ev_acceptance_feature, ev_acceptance_model,
                                      anchor=ev_response_anchor, critic_input=ev_response_critic_input)

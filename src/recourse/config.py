@@ -80,6 +80,19 @@ METHODS = {
 if tuple(METHODS) != PAPER_METHODS:
     raise RuntimeError("PAPER_METHODS and METHODS must have identical order")
 
+# External literature baselines.  They are selectable by name in the NYC
+# train/test entrypoints but are deliberately excluded from the paper method
+# registry and from ``--methods all``.
+EXTERNAL_BASELINE_METHODS = ("neuradp",)
+EXTERNAL_METHODS = {
+    # NeurADP (Shah et al., AAAI 2020): one-shot joint HEV+AEV assignment,
+    # offers assumed accepted, no same-epoch repair, per-agent TD learner.
+    "neuradp": RecourseMethod("integrated", "legacy", "none", "uncoupled"),
+}
+# Methods whose learner is fixed by the method itself, not by --learner-variant.
+METHOD_LEARNER_VARIANTS = {"neuradp": "neuradp"}
+PUBLIC_METHODS = (*ICAPS_METHODS, *EXTERNAL_BASELINE_METHODS)
+
 METHOD_ALIASES = {
     "recourse_aware": "recourse_macro",
     "recourse-aware": "recourse_macro",
@@ -152,9 +165,22 @@ class AssignmentOracleConfig:
 def canonical_method(name: str) -> str:
     value = str(name).strip().lower().replace("-", "_")
     value = METHOD_ALIASES.get(value, value)
-    if value not in METHODS:
+    if value not in METHODS and value not in EXTERNAL_METHODS:
         raise ValueError(f"unknown recourse method: {name}")
     return value
+
+
+def method_spec(name: str) -> RecourseMethod:
+    """Execution preset of a paper method or an external baseline."""
+
+    canonical_name = canonical_method(name)
+    return METHODS.get(canonical_name) or EXTERNAL_METHODS[canonical_name]
+
+
+def method_learner_variant(method: str, default: str) -> str:
+    """Learner for ``method``; external baselines fix their own learner."""
+
+    return METHOD_LEARNER_VARIANTS.get(str(method).strip().lower(), default)
 
 
 def canonical_variant(variant):
@@ -237,14 +263,52 @@ def add_method_list_arguments(parser, *, method_choices=ICAPS_METHODS):
         "--methods", "--models", "--recourse-method",
         dest="methods",
         nargs="+",
-        choices=("all", *method_choices),
+        choices=("all", *method_choices, *EXTERNAL_BASELINE_METHODS),
         default=["r0"],
         help=(
             "One or more ICAPS assignment methods. Use 'all' for the complete "
-            "ICAPS train/test list."
+            "ICAPS train/test list. External baselines (neuradp) are selected "
+            "by name only and are not part of 'all'."
         ),
     )
     _add_method_policy_arguments(parser)
+    _add_external_baseline_arguments(parser)
+
+
+def _add_external_baseline_arguments(parser):
+    """NeurADP hyperparameters; defaults follow the original paper/code."""
+
+    group = parser.add_argument_group(
+        "NeurADP external baseline (only used by --methods neuradp)"
+    )
+    group.add_argument("--neuradp-gamma", type=float, default=None,
+                       help="Per-epoch discount (default 0.95, shared with the paper learners)")
+    group.add_argument("--neuradp-learning-rate", type=float, default=None,
+                       help="Adam learning rate (default 1e-3, as in NeurADP)")
+    group.add_argument("--neuradp-target-tau", type=float, default=None,
+                       help="Soft target-network update rate (default 0.1, as in NeurADP)")
+    group.add_argument("--neuradp-samples-per-update", type=int, default=None,
+                       help="Replay transitions per update (default 3, as in NeurADP)")
+    group.add_argument("--neuradp-fit-batch-size", type=int, default=None,
+                       help="Supervised minibatch over agent rows (default 32, as in NeurADP)")
+    group.add_argument("--neuradp-noise-scale", type=float, default=None,
+                       help="Scale of NeurADP's additive exploration noise in reward units (default 1.0; 0 disables)")
+    group.add_argument("--neuradp-response-aware", action=argparse.BooleanOptionalAction,
+                       default=None,
+                       help="NeurADP+p variant: weight HEV offers by acceptance probability (default off)")
+
+
+def neuradp_options(args) -> dict:
+    """Collect explicit NeurADP CLI overrides as environment attributes."""
+
+    return {
+        f"neuradp_{key}": getattr(args, f"neuradp_{key}", None)
+        for key in (
+            "gamma", "learning_rate", "target_tau", "samples_per_update",
+            "fit_batch_size", "noise_scale", "response_aware",
+        )
+        if getattr(args, f"neuradp_{key}", None) is not None
+    }
 
 
 def resolve_method_list_arguments(methods):
@@ -255,10 +319,10 @@ def resolve_method_list_arguments(methods):
         if len(requested) != 1:
             raise ValueError("'all' cannot be combined with another ICAPS method")
         return list(ICAPS_METHODS)
-    invalid = [method for method in requested if method not in ICAPS_METHODS]
+    invalid = [method for method in requested if method not in PUBLIC_METHODS]
     if invalid:
         raise ValueError(
-            f"unknown ICAPS method(s): {invalid}; choose from {ICAPS_METHODS}"
+            f"unknown ICAPS method(s): {invalid}; choose from {PUBLIC_METHODS}"
         )
     if len(set(requested)) != len(requested):
         raise ValueError("duplicate ICAPS methods are not allowed")
@@ -276,10 +340,9 @@ def method_checkpoint_suffix(
     """Build the shared train/test checkpoint namespace for an ICAPS method."""
 
     public_method = str(method).strip().lower()
-    if public_method not in ICAPS_METHODS:
+    if public_method not in PUBLIC_METHODS:
         raise ValueError(f"unknown ICAPS method: {method}")
-    canonical_name = canonical_method(public_method)
-    variant = METHODS[canonical_name].variant
+    variant = method_spec(public_method).variant
     namespace = (
         f"method-{public_method}_rec-{variant}_state-{state_variant}_"
         f"learner-{learner_variant}_shift-{float(rejection_logit_shift):g}"

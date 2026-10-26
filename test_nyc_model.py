@@ -37,6 +37,9 @@ from src.recourse.config import (
     add_method_list_arguments,
     canonical_method,
     method_checkpoint_suffix,
+    method_learner_variant,
+    method_spec,
+    neuradp_options,
     resolve_method_list_arguments,
 )
 from run_nyctrainer import run_nyc_training
@@ -289,9 +292,13 @@ def get_distribution_suffix(distribution_mode: str) -> str:
     return NYCTrainer._distribution_suffix(normalize_distribution_mode(distribution_mode))
 
 
+# Learners fixed by an external-baseline method (see METHOD_LEARNER_VARIANTS).
+EXTERNAL_LEARNER_VARIANTS = ("neuradp",)
+
+
 def normalize_distribution_mode(distribution_mode: str | None) -> str:
     mode = distribution_mode or "optimization_anchored_residual"
-    if mode not in LEARNER_VARIANTS:
+    if mode not in LEARNER_VARIANTS and mode not in EXTERNAL_LEARNER_VARIANTS:
         raise ValueError(f"unsupported learner {mode!r}; choose one of {LEARNER_VARIANTS}")
     return mode
 
@@ -769,13 +776,14 @@ def main(argv=None):
         )
         for method in args.methods:
             canonical_name = canonical_method(method)
-            spec = METHODS[canonical_name]
+            spec = method_spec(canonical_name)
             internal_mode = spec.operating_mode
+            method_learner = method_learner_variant(method, zone_distribution_mode)
             method_suffix = method_checkpoint_suffix(
                 args.checkpoint_suffix,
                 method,
                 state_variant=args.state_variant,
-                learner_variant=zone_distribution_mode,
+                learner_variant=method_learner,
                 rejection_logit_shift=args.rejection_logit_shift,
             )
             for checkpoint_tag in checkpoint_tags:
@@ -789,7 +797,7 @@ def main(argv=None):
                         vtype,
                         checkpoint_start_date,
                         checkpoint_end_date,
-                        zone_distribution_mode,
+                        method_learner,
                         args.only_manhattan_zones,
                         args.full_demand,
                         checkpoint_suffix=(method_suffix + acceptance_lookup_suffix),
@@ -824,14 +832,15 @@ def main(argv=None):
 
     for method in args.methods:
         canonical_name = canonical_method(method)
-        spec = METHODS[canonical_name]
+        spec = method_spec(canonical_name)
         internal_mode = spec.operating_mode
         recourse_variant = spec.variant
+        method_learner = method_learner_variant(method, zone_distribution_mode)
         method_suffix = method_checkpoint_suffix(
             args.checkpoint_suffix,
             method,
             state_variant=args.state_variant,
-            learner_variant=zone_distribution_mode,
+            learner_variant=method_learner,
             rejection_logit_shift=args.rejection_logit_shift,
         )
         for strat in selected_strategies:
@@ -899,8 +908,8 @@ def main(argv=None):
                     start_hour=args.start_hour,
                     stop_hour=args.stop_hour,
                     epoch_length=args.epoch_length,
-                    zone_distribution_mode=zone_distribution_mode,
-                    learner_variant=zone_distribution_mode,
+                    zone_distribution_mode=method_learner,
+                    learner_variant=method_learner,
                     ev_acceptance_feature=args.ev_acceptance_feature,
                     ev_acceptance_model=args.ev_acceptance_model,
                     ev_response_anchor=args.ev_response_anchor,
@@ -934,6 +943,7 @@ def main(argv=None):
                     checkpoint_charging_model=args.checkpoint_charging_model if strat["load_ckpt"] else None,
                     conservative_charging=(args.conservative_charging if strat['load_ckpt'] or args.conservative_charging is not None
                                            else args.checkpoint_conservative_charging),
+                    neuradp_options=neuradp_options(args),
                 )
 
                 rewards = results.get("episode_rewards", [])
@@ -1234,7 +1244,9 @@ def main(argv=None):
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     demand_tag = "_fulldemand" if args.full_demand else ""
-    distribution_tag = f"_{zone_distribution_mode}{demand_tag}"
+    result_learners = {method_learner_variant(m, zone_distribution_mode) for m in args.methods}
+    result_learner = result_learners.pop() if len(result_learners) == 1 else zone_distribution_mode
+    distribution_tag = f"_{result_learner}{demand_tag}"
     if args.checkpoint_conservative_charging or args.charging_model is not None:
         trained_label = args.checkpoint_charging_model
         test_label = args.charging_model or 'inherit'

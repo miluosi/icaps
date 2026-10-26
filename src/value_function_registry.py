@@ -27,6 +27,9 @@ VALUE_FUNCTION_REGISTRY: dict[str, ValueFunctionSpec] = {
         "src.ValueFunction_optimization_anchored_residual"
     ),
     "integrated_directq": ValueFunctionSpec("src.ValueFunction_integrated_directq"),
+    # External baseline learner. It is selected only by ``--methods neuradp``
+    # and is not a public --learner-variant choice for the paper methods.
+    "neuradp": ValueFunctionSpec("src.ValueFunction_neuradp", public=False),
     # Internal ADP=0 compatibility sentinel. It is deliberately not a public
     # learning choice; public CLIs expose only the two learners above.
     "none": ValueFunctionSpec("src.ValueFunction_pytorch_bayes", public=False),
