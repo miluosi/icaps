@@ -91,6 +91,12 @@ def test_nyc_relocation_executor_receives_hotspot_index_not_zone_id():
     assert impl._action_target(SimpleNamespace(hotspot_locations=[43, 161, 237]), edge) == 'idle_at_1'
 
 
+def test_nyc_human_outside_action_keeps_destination_outside_hotspots():
+    edge = replace(_graph('g', stage=0, vehicle_id=1, vehicle_type=1).edges[0],
+                   action_type=ActionType.RELOCATE, target_location=119)
+    assert impl._action_target(SimpleNamespace(hotspot_locations=[43, 161, 237]), edge) == 'reloc_to_119'
+
+
 @pytest.mark.parametrize('environment', ['synthetic', 'nyc'])
 def test_no_residual_matches_existing_integrated_with_identical_initial_plan(environment, monkeypatch):
     """Run both real execution paths; pin only the common initial assignment."""

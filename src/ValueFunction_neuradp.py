@@ -109,6 +109,7 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     learner_variant = "neuradp"
     direct_q = True
     uses_solver_consistent_targets = True
+    collects_legacy_experiences = False
 
     def __init__(self, *args, **kwargs):
         overrides = {

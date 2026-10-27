@@ -4676,6 +4676,13 @@ class NYCEnvironment:
         valuefunction_ev = self.value_function_ev
         if valuefunction is None or not hasattr(valuefunction, 'experience_buffer'):
             return
+        if not any(
+            getattr(vf, 'collects_legacy_experiences', True)
+            for vf in (valuefunction, valuefunction_ev) if vf is not None
+        ):
+            # NeurADP learns exclusively from joint replay. Constructing unused
+            # per-vehicle rows also retains entire historical graph snapshots.
+            return
 
         if ifev:
             offlinsedatalen = valuefunction_ev.experience_buffer.__len__() if valuefunction_ev and hasattr(valuefunction_ev, 'experience_buffer') else 0
@@ -4704,6 +4711,8 @@ class NYCEnvironment:
             current_value_function = (
                 self.value_function_ev if veh_type == 1 else self.value_function
             )
+            if not getattr(current_value_function, 'collects_legacy_experiences', True):
+                continue
             bind_context = getattr(
                 current_value_function, "set_replay_collection_context", None
             )
@@ -5697,7 +5706,7 @@ class NYCEnvironment:
     def _process_integrated_assignments(self, rebalancing_assignments, actions,
                                          storeactions, storeactions_ev):
         """Process rebalancing_assignments dict for integrated / AEV-phase mode.
-        Handles charge_X, Request, waiting, idle_at_, reloc, None."""
+        Handles charge_X, Request, waiting, idle_at_, reloc_to_, reloc, None."""
         new_assignments = 0
         charging_assignments = 0
         quest_num_now = len(self.active_requests)
@@ -5790,10 +5799,13 @@ class NYCEnvironment:
                                               vehicle_location, vehicle_battery, req_num=quest_num_now)
                     self._update_storeaction_full(vid, actions[vid], storeactions, self.storeactions, target_loc=vehicle_location)
 
-                elif isinstance(target_request, str) and target_request.startswith("idle_at_"):
+                elif isinstance(target_request, str) and target_request.startswith(("idle_at_", "reloc_to_")):
                     vehicle['is_stationary'] = False
-                    zone_idx = int(target_request.replace("idle_at_", ""))
-                    hotspot_zone = self.hotspot_locations[zone_idx]  # zone_id (int)
+                    if target_request.startswith("reloc_to_"):
+                        hotspot_zone = int(target_request.removeprefix("reloc_to_"))
+                    else:
+                        zone_idx = int(target_request.replace("idle_at_", ""))
+                        hotspot_zone = self.hotspot_locations[zone_idx]  # zone_id (int)
                     idle_target = hotspot_zone
                     vehicle['assigned_request'] = None
                     vehicle['passenger_onboard'] = None
@@ -5804,8 +5816,13 @@ class NYCEnvironment:
                     target_coords = self.zone_coords.get(hotspot_zone, current_coords)
                     actions[vid] = IdleAction([], current_coords, target_coords,
                                               vehicle_location, vehicle_battery, req_num=quest_num_now)
-                    self._update_storeaction_full(vid, actions[vid], storeactions, self.storeactions,
-                                                  target_loc=vehicle['target_location'])
+                    if self._is_ev(vid):
+                        actions[vid].learning_action_type = 'reloc'
+                        self._update_storeaction_full(vid, actions[vid], storeactions_ev, self.storeactions_ev,
+                                                      target_loc=vehicle['target_location'])
+                    else:
+                        self._update_storeaction_full(vid, actions[vid], storeactions, self.storeactions,
+                                                      target_loc=vehicle['target_location'])
 
                 elif isinstance(target_request, str) and target_request.startswith("reloc"):
                     vehicle['is_stationary'] = False

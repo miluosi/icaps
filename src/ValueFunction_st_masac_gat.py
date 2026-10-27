@@ -700,6 +700,8 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         ]
 
     def store_queue_experience(self, **kwargs):
+        if not getattr(self, 'collects_legacy_experiences', True):
+            return
         observed_wait = float(kwargs.get("observed_wait", kwargs.get("wait_time", 0.0)) or 0.0)
         station_id = kwargs.get("station_id", None)
         features = kwargs.get("features")
@@ -1981,6 +1983,9 @@ class PyTorchChargingValueFunction(AcceptanceFeatureMixin):
         return previous
 
     def store_experience(self, **kwargs):
+        if not getattr(self, 'collects_legacy_experiences', True):
+            self._replay_collection_context = None
+            return
         if bool(getattr(self.env, "evaluatemode", False)):
             return
         experience = copy.deepcopy(dict(kwargs))

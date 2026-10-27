@@ -218,3 +218,126 @@ def test_neuradp_checkpoint_round_trip(nyc_learning_run, tmp_path):
         env.evaluatemode = False
     assert actual == pytest.approx(online)
     assert restored_target == pytest.approx(actual)
+
+
+def test_neuradp_uses_joint_replay_without_unused_legacy_graph_roots(nyc_learning_run):
+    _env, value_function, _scored = nyc_learning_run
+    assert len(value_function.joint_replay_buffer) >= 2
+    assert not value_function.experience_buffer
+    assert not value_function.queue_experience_buffer
+
+    # Direct legacy callers must not retain the graph through the bound action
+    # either (the simulator skips these calls before constructing any rows).
+    from src.Action import IdleAction
+    action = IdleAction([], (0., 0.), (0., 0.), 0, .8)
+    action.metadata.feasible_graph_snapshot = _scored[-1][0]
+    value_function.set_replay_collection_context(action)
+    value_function.store_experience(vehicle_id=0, vehicle_location=0, battery_level=.8)
+    assert not value_function.experience_buffer
+    assert value_function._replay_collection_context is None
+
+
+@pytest.mark.parametrize('mode', ['current', 'real_conservative'])
+@pytest.mark.parametrize('battery', [.2, .8])
+def test_neuradp_executes_human_outside_action_with_non_manhattan_target(
+    monkeypatch, tmp_path, mode, battery,
+):
+    import pandas as pd
+    from src.NYCEnvironment import NYCEnvironment
+    from src.real_conservative_charging import RealConservativeNYCEnvironment
+    from src.recourse.state_snapshot import StateSnapshotBuilder
+
+    demand = pd.DataFrame({
+        'pickup_date': pd.to_datetime([]),
+        'pickup_second_of_day': pd.Series(dtype=float),
+        'PULocationID': pd.Series(dtype=int), 'DOLocationID': pd.Series(dtype=int),
+    })
+    monkeypatch.setattr(NYCEnvironment, '_load_demand_data', lambda self: demand.copy())
+    monkeypatch.setenv('ICAPS_REPLAY_STORAGE', 'disk')
+    monkeypatch.setenv('ICAPS_REPLAY_DIR', str(tmp_path))
+    env_cls = RealConservativeNYCEnvironment if mode == 'real_conservative' else NYCEnvironment
+    env = env_cls(num_vehicles=2, ev_num_vehicles=1, random_seed=301,
+                  start_date='2025-12-08', end_date='2025-12-08',
+                  start_hour=8, stop_hour=8.1, aev_charging_center_count=3,
+                  usemcmf=True, mcmf_solver='exact', mcmf_backend='ortools',
+                  daily_drop_off=False, ifreject=False)
+    env.reset()
+    env.evaluatemode = False
+    env.adp_value = 1.0
+    env.learner_variant = 'neuradp'
+    env.state_variant = 'joint_state_shared_critic'
+    env.configure_recourse_experiment('legacy')
+    value_function = NeurADP(grid_size=env.grid_size, num_vehicles=2, device='cpu',
+                             episode_length=env.episode_length, env=env,
+                             neuradp_noise_scale=0.)
+    value_function.state_variant = 'joint_state_shared_critic'
+    env.set_value_function(value_function)
+    env.set_value_function_ev(value_function)
+    monkeypatch.setattr(env, '_ev_charging_phase', lambda actions, stores: None)
+    monkeypatch.setattr(env, 'compute_ev_relocation_probability', lambda vid: (119, {119: 1.}))
+    human_id = next(vid for vid in env.vehicles if env._is_ev(vid))
+    vehicle = env.vehicles[human_id]
+    # At the service floor the outside action stays in its current non-hotspot
+    # zone; otherwise its cached sampled destination is that same valid zone.
+    origin = 119 if battery == .2 else 161
+    vehicle.update(location=origin, zone_id=origin, coordinates=env.zone_coords[origin],
+                   battery=battery, target_location=None, idle_target=None)
+    assert 119 not in env.hotspot_locations
+    for _ in range(4):
+        actions, stores, stores_ev = env.simulate_motion_integrated_control()
+        graph = env._last_integrated_repair_graphs[0]
+        selected = next(edge for edge in graph.edges
+                        if edge.vehicle_id == human_id and edge.edge_id in graph.selected_edge_ids)
+        assert selected.action_type == ActionType.RELOCATE
+        assert selected.target_location == vehicle['target_location'] == 119
+        assert actions[human_id].target_coords == tuple(env.zone_coords[119])
+        assert env.storeactions[human_id] is None
+        assert env.storeactions_ev[human_id] is actions[human_id]
+        assert selected.edge_id in StateSnapshotBuilder.selected_edge_ids(graph, {human_id: 'reloc_to_119'})
+        env.step(actions, stores, stores_ev)
+    assert len(value_function.joint_replay_buffer) == 4
+    assert not value_function.experience_buffer
+    assert value_function.train_step(batch_size=2) > 0
+
+
+def test_neuradp_real_conservative_trainer_saves_and_reloads_without_legacy_replay(
+    tmp_path, monkeypatch,
+):
+    import pandas as pd
+    from src.NYCEnvironment import NYCEnvironment
+    from src.real_conservative_charging import RealConservativeNYCEnvironment
+    from test_real_conservative_nyc_cli import base_kwargs
+
+    demand = pd.DataFrame([
+        dict(pickup_date=pd.Timestamp('2025-12-15'), pickup_second_of_day=second,
+             PULocationID=161, DOLocationID=162, fare_amount=15., trip_distance=.1)
+        for second in range(0, 360, 30)
+    ])
+    monkeypatch.setattr(NYCEnvironment, '_load_demand_data', lambda self: demand.copy())
+    monkeypatch.setattr(run_nyctrainer, 'resolve_nyc_parquet_paths', lambda *a, **k: [])
+    monkeypatch.setattr(ADPTrainer, '_save_episode_stats_to_excel', lambda *a, **k: (None, None))
+    monkeypatch.setenv('ICAPS_REPLAY_STORAGE', 'disk')
+    monkeypatch.setenv('ICAPS_REPLAY_DIR', str(tmp_path / 'replay'))
+    monkeypatch.chdir(tmp_path)
+    kwargs = base_kwargs()
+    kwargs.update(transportation_mode='integrated', recourse_variant='legacy',
+                  learner_variant='neuradp', zone_distribution_mode='neuradp',
+                  state_variant='joint_state_separate_critics', mcmf_backend='ortools',
+                  mcmf_graph_reduction=True, neuradp_options={'neuradp_noise_scale': 0.})
+    trained, env = run_nyctrainer.run_nyc_training(**kwargs)
+    assert isinstance(env, RealConservativeNYCEnvironment)
+    assert trained['optimizer_budget']['optimizer_steps_total'] > 0
+    assert len(env.value_function.joint_replay_buffer) == 12
+    for vf in (env.value_function, env.value_function_ev):
+        assert not vf.experience_buffer and not vf.queue_experience_buffer
+    paths = list((tmp_path / 'checkpoints' / 'charge-real-conservative').glob('*/best_full_state_episode_1.pth'))
+    assert len(paths) == 2
+    kwargs.update(trainnetwork=False, ifloadcheckpoint=True, charging_model=None,
+                  conservative_charging=None, checkpoint_charging_model='real_conservative',
+                  checkpoint_selection='best_reward')
+    evaluated, restored = run_nyctrainer.run_nyc_training(**kwargs)
+    assert evaluated['charging_model'] == 'real_conservative'
+    assert evaluated['optimizer_budget']['optimizer_steps_total'] == 0
+    assert not restored.value_function.joint_replay_buffer
+    for name, tensor in env.value_function.network.state_dict().items():
+        assert torch.equal(tensor, restored.value_function.network.state_dict()[name])

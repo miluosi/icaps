@@ -218,6 +218,11 @@ def _action_target(env, edge):
         return f'charge_{edge.station_id}'
     if edge.action_type == ActionType.WAIT:
         return 'waiting'
+    if edge.vehicle_type == 1:
+        # The HEV outside action has a sampled concrete destination, which can
+        # also be its current zone outside the AEV relocation hotspot set.
+        # Execute the serialized destination without looking up or resampling it.
+        return f'reloc_to_{edge.target_location}'
     # The NYC executor's legacy string contains an index in hotspot_locations,
     # not a TLC zone ID. The serialized graph always uses the actual location.
     return f'idle_at_{list(env.hotspot_locations).index(edge.target_location)}'
