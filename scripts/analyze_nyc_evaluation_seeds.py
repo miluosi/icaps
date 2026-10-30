@@ -11,6 +11,10 @@ import re
 import numpy as np
 import pandas as pd
 from scipy.stats import t
+if __package__:
+    from .nyc_completed_charging import completed_aev_charging_metrics
+else:
+    from nyc_completed_charging import completed_aev_charging_metrics
 
 DEFAULT_DATA = Path(__file__).resolve().parents[1] / 'results/nyc_result_1013'
 METHODS = {'r1': 'Learning r1', 'r3': 'Decoupled r3', 'macro': 'Recourse'}
@@ -28,6 +32,7 @@ METRICS = {
     'recourse_completed_per_day': 'requests/day',
     'recourse_coverage_pct': '% (difference: percentage points)',
     'recourse_success_pct': '% (difference: percentage points)',
+    'aev_completed_session_slot_time_pct': '% of dedicated plug-time (completed sessions only)',
 }
 PRIMARY = tuple(METRICS)[:3]
 
@@ -116,6 +121,7 @@ def read_method_results_seed(method, data_dir=DEFAULT_DATA, seeds=SEEDS):
             recourse_coverage_pct=float(100 * r.recourse_requests / r.rejected_requests) if r.rejected_requests else np.nan,
             recourse_success_pct=float(100 * r.recourse_completed_requests / r.recourse_requests) if r.recourse_requests else np.nan,
             total_orders=int(r.total_orders), completed_total=int(r.complete), source=path.name,
+            **completed_aev_charging_metrics(r, days=days),
         ))
         daily_rows.append(d.rename_axis('date').reset_index().assign(mode=mode, method=method, seed=seed))
         sources.append(dict(file=path.name, method=method, mode=mode, seed=seed,
@@ -210,13 +216,14 @@ def make_full_policy_latex(result, data_dir=DEFAULT_DATA):
     stats = result['summary'].set_index(['mode', 'method', 'metric'])
     columns = [('reward_per_day', 1e6, 3), ('hev_completed_per_day', 1e3, 2),
                ('aev_completed_per_day', 1e3, 2), ('hev_reward_per_day', 1e6, 3),
-               ('aev_reward_per_day', 1e6, 3), ('service_daily_mean_pct', 1, 2)]
+               ('aev_reward_per_day', 1e6, 3), ('service_daily_mean_pct', 1, 2),
+               ('aev_completed_session_slot_time_pct', 1, 2)]
     lines = [r'\begin{table*}[!t]', r'\centering', r'\footnotesize',
              rf'\caption{{NYC continuous-day evaluation, December 15--17, 2025. Learning r1, Decoupled r3, and Recourse report mean $\pm$ sample standard deviation across evaluation seeds {", ".join(map(str, seeds))} ($n={len(seeds)}$). Myopic r1/r2 and Learning r2 report single values from seed 256 ($n=1$). Within each rollout, rewards and completed orders are daily means, and service is the mean of daily rates. HEV denotes the human-driven fleet.}}',
              r'\label{tab:nyc-combined-policy-comparison-seeds}',
-             r'\setlength{\tabcolsep}{2pt}', r'\begin{tabular}{@{}rllrrrrrr@{}}', r'\toprule',
-             r' & & & Reward & HEV completed & AEV completed & HEV reward & AEV reward & Service \\',
-             r'ID & Charging mode & Method & ($10^6$ \$/day) & ($10^3$/day) & ($10^3$/day) & ($10^6$ \$/day) & ($10^6$ \$/day) & (\%) \\',
+             r'\setlength{\tabcolsep}{1.9pt}', r'\begin{tabular}{@{}rllrrrrrrr@{}}', r'\toprule',
+             r' & & & Reward & HEV completed & AEV completed & HEV reward & AEV reward & Service & $U_A^{\mathrm{cmp}}$ \\',
+             r'ID & Charging mode & Method & ($10^6$ \$/day) & ($10^3$/day) & ($10^3$/day) & ($10^6$ \$/day) & ($10^6$ \$/day) & (\%) & (\%) \\',
              r'\midrule']
     num = 0
     all_methods = [('myopic_r1', 'Myopic r1'), ('myopic_r2', 'Myopic r2'),
@@ -251,7 +258,8 @@ def make_full_policy_latex(result, data_dir=DEFAULT_DATA):
                 single = dict(reward_per_day=r.avg_reward, hev_completed_per_day=r.mean_ev_completed_orders,
                               aev_completed_per_day=r.mean_aev_completed_orders, hev_reward_per_day=r.episode_reward_ev,
                               aev_reward_per_day=r.episode_reward_aev,
-                              service_daily_mean_pct=(100*d.completed_requests/d.generated_requests).mean())
+                              service_daily_mean_pct=(100*d.completed_requests/d.generated_requests).mean(),
+                              **completed_aev_charging_metrics(r))
                 single_sources.append(dict(file=path.name, seed=256, method=method, mode=mode,
                                            sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
             for metric, scale, digits in columns:
@@ -267,6 +275,7 @@ def make_full_policy_latex(result, data_dir=DEFAULT_DATA):
     lines += [r'\bottomrule', r'\end{tabular}', r'\par\smallskip',
               r'\begin{minipage}{\textwidth}', r'\footnotesize',
               r'\textit{Notes.} Each evaluation seed contributes one continuous three-day rollout; days are not independent replicates. The reported dispersion is sample standard deviation, not a confidence interval. Entries without $\pm$ are single-seed reference results; their cross-seed variability is not estimated. Vehicle and station states carry over across days. These are evaluation-seed repeats, not independent training runs. Learned policies are trained and evaluated with the charging mode indicated in each row. Policy definitions follow Table~\ref{tab:nyc-combined-policy-comparison}.',
+              r'$U_A^{\mathrm{cmp}}=100\,T_A^{\mathrm{cmp}}/(C_A H)$, where $T_A^{\mathrm{cmp}}$ sums durations of completed AEV charging sessions, $C_A=150$ plugs, and $H=4320$ minutes. Sessions unfinished at the horizon are excluded; this is a lower bound on charging utilization, not energy delivered. Charging starts empty. Ratios are computed per rollout before averaging across seeds.',
               r'\end{minipage}', r'\end{table*}']
     result['fleet_sources'] = result['sources'] + single_sources
     return '\n'.join(lines)
