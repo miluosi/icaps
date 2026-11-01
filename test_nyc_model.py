@@ -1180,6 +1180,10 @@ def main(argv=None):
                     "peak_completed_hour": peak_completed_hour,
                     "peak_completed_orders": peak_completed_orders,
                 }
+                if hasattr(getattr(env, 'value_function', None), 'neuradp_implementation_version'):
+                    entry['neuradp_implementation_version'] = env.value_function.neuradp_implementation_version
+                    entry['neuradp_config_json'] = _json_dumps(env.value_function.neuradp_config)
+                    entry['neuradp_backup'] = 'saved_current_state_one_nyc_epoch'
                 all_results.append(entry)
 
                 print(f"   Avg reward: {avg_reward:.2f}  "

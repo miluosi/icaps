@@ -358,6 +358,8 @@ class StateSnapshotBuilder:
                 if callable(metadata_builder):
                     edge_metadata += metadata_builder(
                         vehicle=vehicle, action_type=action_type, station_id=station_id,
+                        target_location=target_location, request_id=request_id,
+                        continuing=False,
                         post_action_distance=post_distance, post_action_duration=post_duration)
                 queue_feature_builder = getattr(
                     value_function, "_queue_features", None
@@ -745,6 +747,8 @@ class StateSnapshotBuilder:
             if callable(metadata_builder):
                 metadata.update(metadata_builder(
                     vehicle=vehicle, action_type=action_type, station_id=station_id,
+                    target_location=target, request_id=vehicle.service_request_id,
+                    continuing=True,
                     post_action_distance=post_distance, post_action_duration=post_duration))
             score_builder = getattr(value_function, "_myopic_score", None)
             if callable(score_builder):

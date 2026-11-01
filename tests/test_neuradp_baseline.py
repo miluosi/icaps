@@ -137,15 +137,13 @@ def test_rollout_scores_are_reward_plus_discounted_post_decision_value(nyc_learn
     assert set(scores) == {edge.edge_id for edge in graph.edges}
     values = value_function._values(graph, list(graph.edges), target=False).numpy()
     for edge, value in zip(graph.edges, values):
-        continuing = value_function._is_continuing(edge)
-        reward = (
-            edge.structured_score if (not continuing or edge.action_type == ActionType.WAIT)
-            else 0.0
-        )
-        if not continuing and edge.success_structured_score is not None and (
-                edge.expected_response_anchor or edge.human_response_mask):
-            reward = edge.success_structured_score
-        assert scores[edge.edge_id] == pytest.approx(reward + 0.95 * float(value), rel=1e-5, abs=1e-5)
+        terminal, outcomes = value_function._outcomes(edge)
+        rows = [(edge.vehicle_id, x[1]) for x in outcomes]
+        with torch.no_grad():
+            arrays = value_function._record_rows(graph, rows, next_epoch=True)
+            next_values = value_function.network(*(torch.as_tensor(a) for a in arrays)).numpy()
+        expected = sum(x[0]*(x[2]-x[3]+.95*v*(not terminal)) for x, v in zip(outcomes, next_values))
+        assert scores[edge.edge_id] == pytest.approx(expected, rel=1e-5, abs=1e-5)
 
 
 def test_per_agent_td_update_uses_target_resolve_and_changes_weights(nyc_learning_run):
@@ -156,7 +154,7 @@ def test_per_agent_td_update_uses_target_resolve_and_changes_weights(nyc_learnin
     assert ready and all(row.mode == "integrated" and row.learner_variant == "neuradp" for row in ready)
     row = next(item for item in ready if not item.done)
     next_graph = value_function._temporal_successor_graph(row)
-    targets = value_function._next_epoch_targets(next_graph)
+    targets = value_function._saved_graph_targets(next_graph)
     online_vehicles = {vehicle.vehicle_id for vehicle in next_graph.state.vehicles if vehicle.online}
     assert set(targets) <= {edge.vehicle_id for edge in next_graph.edges}
     assert set(targets) == online_vehicles & {edge.vehicle_id for edge in next_graph.edges}
@@ -182,20 +180,21 @@ def test_response_aware_variant_takes_acceptance_expectation(nyc_learning_run):
         and not value_function._is_continuing(e) for e in g.edges))
     offer = next(e for e in graph.edges if e.vehicle_type == 1
                  and e.action_type == ActionType.SERVICE and not value_function._is_continuing(e))
-    success = float(offer.success_structured_score
-                    if offer.success_structured_score is not None else offer.structured_score)
-    offer = replace(offer, human_response_mask=True, rejection_probability=0.3,
-                    rejection_structured_score=-2.0, success_structured_score=success,
-                    expected_response_anchor=True, structured_score=0.7 * success + 0.3 * -2.0)
+    import json
+    metadata = dict(offer.metadata)
+    terminal, outcomes = value_function._outcomes(offer)
+    first = outcomes[0]
+    metadata['neuradp_epoch_outcomes'] = json.dumps([terminal, [
+        [.7, first[1], first[2], first[3], False],
+        [.3, first[1], -2., 0., True]]])
+    offer = replace(offer, metadata=tuple(metadata.items()))
     graph = replace(graph, edges=tuple(offer if e.edge_id == offer.edge_id else e for e in graph.edges))
+    value_function.neuradp_config['response_aware'] = False
     plain = value_function._neuradp_scores(graph, target=False)[offer.edge_id]
-    value_function.neuradp_config["response_aware"] = True
-    try:
-        aware = value_function._neuradp_scores(graph, target=False)[offer.edge_id]
-    finally:
-        value_function.neuradp_config["response_aware"] = False
+    value_function.neuradp_config['response_aware'] = True
+    aware = value_function._neuradp_scores(graph, target=False)[offer.edge_id]
     stay = float(value_function._values(graph, [offer], target=False, stay=True)[0])
-    assert aware == pytest.approx(0.7 * plain + 0.3 * (-2.0 + 0.95 * stay), rel=1e-5)
+    assert aware == pytest.approx(.7*plain+.3*(-2.+.95*stay*(not terminal)), rel=1e-5)
 
 
 def test_neuradp_checkpoint_round_trip(nyc_learning_run, tmp_path):

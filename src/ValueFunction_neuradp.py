@@ -1,37 +1,21 @@
-"""NeurADP external baseline (Shah, Lowalekar & Varakantham, AAAI 2020).
+"""NeurADP's author-code fitted state-value iteration, adapted to NYC.
 
-Reference: "Neural Approximate Dynamic Programming for On-Demand Ride-Pooling",
-https://arxiv.org/abs/1911.08842, official code
-https://github.com/sanketkshah/NeurADP-for-Ride-Pooling.
-
-This is a mixed-fleet electric adaptation of the paper's per-agent value
-learning and joint assignment, using compact route features:
-
-* every vehicle has a post-decision value ``V(post_i)`` given by one shared
-  network (path LSTM over location embeddings, time embedding, and fleet
-  context), extended with post-decision SoC and a vehicle-type indicator;
-* the joint action maximizes ``sum_i r(a_i) + gamma * V(post_i(a_i))`` with
-  the same exact assignment oracle used by every other method (the paper uses
-  an ILP; both return the same optimum);
-* HEV offers are scored as if they will be accepted, as in the original model,
-  so there is no recourse and no same-epoch repair.  ``response_aware=True``
-  gives the "NeurADP + p" variant, which takes the expectation over the
-  acceptance probability without any recourse;
-* learning is per-agent TD.  The target for ``V(post_i,t)`` is the score of
-  vehicle ``i``'s action in the next epoch's joint solution, re-solved with the
-  target network, then one supervised MSE epoch (minibatch 32), a soft target
-  update (tau = 0.1), prioritized replay, and decaying additive Gaussian
-  exploration noise on the assignment scores.
-
-Non-wait immediate rewards use the structured action score, credited at the
-decision. Waiting uses the simulator's per-epoch idle cost and the project's
-learning-only low-SoC penalty. Neither changes the reported system reward.
-Continuing actions earn zero, except the per-epoch waiting cost.
+Author: https://github.com/sanketkshah/NeurADP-for-Ride-Pooling
+For each saved current graph, recompute r_NYC + gamma*U_target(next epoch),
+solve its exact joint assignment, and regress U_online(current vehicle state)
+on the selected per-vehicle scores. Candidate outcomes use one physical NYC
+30s epoch, not whole-action completion. A shared path LSTM includes current
+location, remaining route, actual SoC, time and fleet context. NYC's actual
+costs/fare timing and learning-only SoC wait shaping enter the model reward.
+Reward/response randomness is integrated without consuming simulator RNG.
+Current and real_conservative admission/execution and OR-Tools+SSG are kept.
+Gamma defaults to this project's .95 (not the author's epoch-dependent default).
 """
 
 from __future__ import annotations
 
 from collections import Counter
+import json
 import math
 from typing import Any
 
@@ -41,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from src.neuradp_nyc_transition import freeze_epoch_outcomes, vehicle_record
 from src.recourse.types import ActionType
 from src.qvalue_inference import bounded_edge_inference
 from src.ValueFunction_st_masac_gat import (
@@ -55,12 +40,12 @@ NEURADP_DEFAULTS = {
     "samples_per_update": 3,
     "fit_batch_size": 32,
     "noise_scale": 1.0,
-    "response_aware": False,
+    "response_aware": True,
     "num_locations": 1024,
 }
 NEURADP_CONFIG_KEYS = tuple(NEURADP_DEFAULTS)
-_SCALAR_DIM = 9
-NEURADP_IMPLEMENTATION_VERSION = 2
+_SCALAR_DIM = 10
+NEURADP_IMPLEMENTATION_VERSION = 3
 _WAIT_CONFIG_KEYS = (
     "learning_soc_wait_threshold", "learning_soc_wait_reference",
     "learning_soc_wait_penalty_per_hour", "learning_soc_wait_exponent",
@@ -88,7 +73,7 @@ def _validated_config(config):
 
 
 class NeurADPNetwork(nn.Module):
-    """Post-decision value network following NeurADP's PathBasedNN."""
+    """Current vehicle-state value network following NeurADP PathBasedNN."""
 
     def __init__(
         self,
@@ -187,6 +172,13 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     # Features
     # ------------------------------------------------------------------
 
+    def _time_norm(self, current_time):
+        # One physical epoch means +30s in both independent-day training and
+        # continuous testing. Demand's legacy t-1 indexing is not state time.
+        if self.env is not None and hasattr(self.env, 'START_EPOCH'):
+            return ((self.env.START_EPOCH+float(current_time)*self.env.EPOCH_LENGTH) % 86400)/86400
+        return super()._time_norm(current_time)
+
     def _location_token(self, location: Any) -> int:
         try:
             value = int(location)
@@ -203,119 +195,87 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     def _is_anchor_only(edge) -> bool:
         return bool(dict(edge.metadata).get("matrix_anchor_only", False))
 
-    def _post_battery(self, battery, action_type_id, distance):
-        """Use NYC's target and timeout instead of adding a fixed full session."""
-        if int(action_type_id) != ActionType.CHARGE or not callable(
-            getattr(self.env, "_charge_duration_for_battery", None)
-        ):
-            return super()._post_battery(battery, action_type_id, distance)
-        arrival = float(battery) - float(distance) * float(self.env.battery_consum)
-        duration = self.env._charge_duration_for_battery(arrival)
-        target = self.env._charge_target_for_battery(arrival)
-        return float(np.clip(min(target, arrival + duration*self.env.chargeincrease_per_epoch), 0, 1))
-
     def snapshot_action_metadata(self, *, vehicle, action_type, station_id,
+                                 target_location, request_id, continuing,
                                  post_action_distance, post_action_duration):
-        """Freeze charge outcomes at collection, never consult live cars in TD."""
-        if action_type != ActionType.CHARGE or not callable(
-            getattr(self.env, "_charge_duration_for_battery", None)
-        ):
-            return ()
-        if vehicle.charging_station is not None:
-            arrival = float(vehicle.battery)
-            duration = float(vehicle.charging_time_left)
-            target = float(self.env.vehicles[vehicle.vehicle_id].get(
-                "charge_target_soc", self.env.charge_target_soc))
-            travel = 0.
-        else:
-            expansion = getattr(self.env, "_last_expected_charge_expansion", None) or {}
-            if float(expansion.get("current_time", -1)) != float(self.env.current_time):
-                expansion = {}
-            window = expansion.get("candidate_windows", {}).get((vehicle.vehicle_id, station_id))
-            if window is None:
-                window = self.env.calculate_expected_entercharge_station_time_battery(
-                    vehicle.vehicle_id, station_id)
-            if window is None:
-                raise ValueError("NeurADP charge edge has no reachable charging outcome")
-            arrival = float(window["expected_battery_after_travel"])
-            duration = float(window["charging_duration"])
-            travel = float(window["travel_epochs"])
-            target = float(self.env._charge_target_for_battery(arrival))
-        post_soc = min(1., target, arrival + duration*self.env.chargeincrease_per_epoch)
-        return (("neuradp_post_charge_soc", max(0., float(post_soc))),
-                ("neuradp_charge_duration", travel + duration))
+        del post_action_distance, post_action_duration
+        if self.env is None or not hasattr(self.env, '_advance_charging_progress'):
+            raise ValueError('NeurADP v3 requires the NYC one-epoch transition model')
+        key = (self.env.current_time, id(getattr(self.env, '_active_stage_state_snapshot', None)))
+        if key != getattr(self, '_preview_cache_key', None):
+            self._preview_cache_key = key
+            self._preview_relocation_cache = {}
+        return freeze_epoch_outcomes(self.env, vehicle=vehicle, action_type=action_type,
+            target_location=target_location, request_id=request_id,
+            station_id=station_id, continuing=continuing,
+            relocation_cache=self._preview_relocation_cache)
 
     def _post_context(self, graph):
         vehicles = {vehicle.vehicle_id: vehicle for vehicle in graph.state.vehicles}
         online = [vehicle for vehicle in graph.state.vehicles if vehicle.online]
         return vehicles, max(1, len(online)), Counter(int(v.location) for v in online)
 
-    def _post_rows(self, graph, edges, *, stay: bool = False, context=None):
-        """Feature arrays of each edge's post-decision state.
+    @staticmethod
+    def _outcomes(edge):
+        encoded = dict(edge.metadata).get('neuradp_epoch_outcomes')
+        if encoded is None:
+            raise ValueError('NeurADP replay lacks v3 NYC one-epoch outcomes; recollect replay')
+        return json.loads(encoded)
 
-        ``stay=True`` describes the state after a rejected HEV offer: the
-        vehicle stays at its current location for one epoch.
-        """
-        state = graph.state
+    def _record_rows(self, graph, vehicles_and_records, *, next_epoch, context=None):
         vehicles, online_count, zone_counts = context or self._post_context(graph)
-        fleet_size = max(1.0, float(self.num_vehicles))
-        request_norm = float(len(state.requests)) / fleet_size
-        online_norm = float(sum(zone_counts.values())) / fleet_size
-        time_norm = self._time_norm(float(state.current_time))
-        angle = time_norm * 2.0 * np.pi
-        count = len(edges)
-        path_locations = np.zeros((count, 2), dtype=np.int64)
-        path_delays = np.zeros((count, 2), dtype=np.float32)
-        time_features = np.tile(
-            np.asarray([time_norm, np.sin(angle), np.cos(angle)], dtype=np.float32),
-            (count, 1),
-        )
+        fleet_size = max(1., float(self.num_vehicles))
+        request_norm = len(graph.state.requests)/fleet_size
+        time_norm = self._time_norm(float(graph.state.current_time)+int(next_epoch))
+        angle = time_norm*2*np.pi
+        count = len(vehicles_and_records)
+        paths = np.zeros((count, 3), dtype=np.int64)
+        delays = np.zeros((count, 3), dtype=np.float32)
+        times = np.tile(np.asarray([time_norm, np.sin(angle), np.cos(angle)], dtype=np.float32), (count, 1))
         scalars = np.zeros((count, _SCALAR_DIM), dtype=np.float32)
-        horizon = max(1., float(getattr(self, "aligned_inference_episode_length",
-                                       getattr(self.env, "model_episode_length", self.episode_length))))
-        for row, edge in enumerate(edges):
-            vehicle = vehicles.get(edge.vehicle_id)
-            location = vehicle.location if vehicle is not None else edge.target_location
-            battery = float(vehicle.battery) if vehicle is not None else 0.0
-            if stay:
-                target, post = location, location
-                target_distance = post_distance = 0.0
-                duration = 1.0
-                post_soc = battery
+        horizon = max(1., float(getattr(self, 'aligned_inference_episode_length',
+            getattr(self.env, 'model_episode_length', self.episode_length))))
+        station_locations = {s.station_id: s.location for s in graph.state.stations}
+        for row, (vid, record) in enumerate(vehicles_and_records):
+            (loc, soc, pickup, dropoff, pickup_time, trip_time, charge_left,
+             reloc, reloc_time, idle_left, online, station, charge_target,
+             target, service_distance, deadline, request_value) = record
+            own = vehicles[vid]
+            if pickup is not None:
+                route = [loc, pickup, dropoff]
+                duration = pickup_time+trip_time
+            elif dropoff is not None:
+                route = [loc, dropoff, None]
+                duration = trip_time
+            elif station is not None or charge_target is not None:
+                sid = station if station is not None else charge_target
+                route = [loc, station_locations.get(sid, target), None]
+                duration = charge_left
             else:
-                target, post = edge.target_location, edge.post_action_location
-                target_distance = float(edge.target_distance)
-                post_distance = float(edge.post_action_distance)
-                duration = float(edge.post_action_duration)
-                action_type_id = int(
-                    dict(edge.metadata).get("feature_action_type_id", edge.action_type)
-                )
-                metadata = dict(edge.metadata)
-                if "neuradp_post_charge_soc" in metadata:
-                    post_soc = float(metadata["neuradp_post_charge_soc"])
-                    duration = float(metadata["neuradp_charge_duration"])
-                else:
-                    post_soc = self._post_battery(battery, action_type_id, post_distance)
-            path_locations[row] = (self._location_token(target), self._location_token(post))
-            path_delays[row] = (
-                np.clip(target_distance / 30.0, 0.0, 5.0),
-                np.clip(duration / horizon, 0.0, 2.0),
-            )
-            nearby = zone_counts.get(int(post), 0) - int(
-                vehicle is not None and vehicle.online and int(location) == int(post)
-            )
-            scalars[row] = (
-                np.clip(post_soc, 0.0, 1.2),
-                1.0 if int(edge.vehicle_type) == 1 else 0.0,
-                1.0 if int(edge.vehicle_type) == 2 else 0.0,
-                np.clip(max(0, nearby) / online_count, 0.0, 1.0),
-                np.clip(request_norm, 0.0, 5.0),
-                np.clip(online_norm, 0.0, 2.0),
-                np.clip(duration / horizon, 0.0, 2.0),
-                np.clip(post_distance / 50.0, 0.0, 5.0),
-                1.0 if self._is_continuing(edge) else 0.0,
-            )
-        return path_locations, path_delays, time_features, scalars
+                route = [loc, reloc if reloc is not None else target, None]
+                duration = max(reloc_time, idle_left)
+            paths[row] = [0 if x is None else self._location_token(x) for x in route]
+            delays[row] = [1., np.clip(deadline/horizon, 0, 2), np.clip(duration/horizon, 0, 2)]
+            nearby = max(0, zone_counts.get(int(loc), 0)-int(own.online and own.location == loc))
+            scalars[row] = (np.clip(soc, 0, 1.2), own.vehicle_type == 1,
+                own.vehicle_type == 2, nearby/online_count, np.clip(request_norm, 0, 5),
+                online_count/fleet_size, np.clip(duration/horizon, 0, 2),
+                np.clip(service_distance/50, 0, 5),
+                (-1. if not online else float(dropoff is not None or station is not None or charge_target is not None)),
+                np.clip(request_value/100., 0, 10))
+        return paths, delays, times, scalars
+
+    def _current_rows(self, graph, vehicle_ids):
+        vehicles = {v.vehicle_id: v for v in graph.state.vehicles}
+        return self._record_rows(graph, [(vid, vehicle_record(vehicles[vid])) for vid in vehicle_ids], next_epoch=False)
+
+    def _post_rows(self, graph, edges, *, stay=False, context=None):
+        rows = []
+        for edge in edges:
+            _, outcomes = self._outcomes(edge)
+            outcome = next((x for x in outcomes if bool(x[4]) == bool(stay)), outcomes[0])
+            rows.append((edge.vehicle_id, outcome[1]))
+        return self._record_rows(graph, rows, next_epoch=True, context=context)
 
     def _values(self, graph, edges, *, target: bool, stay: bool = False, grad: bool = False):
         if not edges:
@@ -351,63 +311,54 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
         return values
 
     # ------------------------------------------------------------------
-    # Scoring (r(a) + gamma * V(post))
+    # Scoring (expected NYC epoch reward + gamma * U(next epoch))
     # ------------------------------------------------------------------
 
-    def _immediate_reward(self, edge, *, rejected: bool = False) -> float:
-        if self._is_continuing(edge):
-            return float(edge.structured_score) if edge.action_type == ActionType.WAIT else 0.0
-        if rejected:
-            return float(edge.rejection_structured_score)
-        if edge.success_structured_score is not None and (
-            edge.expected_response_anchor or edge.human_response_mask
-        ):
-            return float(edge.success_structured_score)
-        return float(edge.structured_score)
+    def _immediate_reward(self, edge, *, rejected=False):
+        _, outcomes = self._outcomes(edge)
+        eligible = [x for x in outcomes if bool(x[4]) == bool(rejected)]
+        mass = sum(x[0] for x in eligible)
+        return sum(x[0]*(x[2]-x[3]) for x in eligible)/mass if mass else 0.
 
-    def _offer_rejection_probability(self, edge) -> float:
-        # Only unanswered human offers carry a response model (q > 0 requires
-        # the acceptance feature, e.g. --ev-acceptance-feature predicted).
-        if (
-            not self.neuradp_config["response_aware"]
-            or not edge.human_response_mask
-            or int(edge.vehicle_type) != 1
-            or edge.action_type != ActionType.SERVICE
-            or self._is_continuing(edge)
-        ):
-            return 0.0
-        return float(np.clip(edge.rejection_probability, 0.0, 1.0))
-
-    def _neuradp_scores(self, graph, *, target: bool) -> dict[str, float]:
-        scores: dict[str, float] = {}
-        learned = [edge for edge in graph.edges if not self._is_anchor_only(edge)]
-        for edge in graph.edges:
-            if self._is_anchor_only(edge):
-                scores[edge.edge_id] = float(edge.structured_score)
-        values = self._values(graph, learned, target=target).detach().cpu().numpy()
-        gamma = self.neuradp_config["gamma"]
-        vehicles = {v.vehicle_id: v for v in graph.state.vehicles}
-        offers = [index for index, edge in enumerate(learned)
-                  if self._offer_rejection_probability(edge) > 0.0]
-        stay_values = {}
-        if offers:
-            stay = self._values(graph, [learned[i] for i in offers], target=target, stay=True)
-            stay_values = dict(zip(offers, stay.detach().cpu().numpy().tolist()))
-        for index, (edge, value) in enumerate(zip(learned, values)):
-            immediate = self._immediate_reward(edge)
-            if edge.action_type == ActionType.WAIT and self.env is not None:
-                immediate = -float(getattr(self.env, "idle_penalty", -immediate))
-                vehicle = vehicles.get(edge.vehicle_id)
-                penalty = getattr(self.env, "soc_wait_learning_penalty", None)
-                if vehicle is not None and vehicle.online and vehicle.vehicle_type == 2 and callable(penalty):
-                    immediate -= float(penalty(vehicle.battery))
-            score = immediate + gamma * float(value)
-            q = self._offer_rejection_probability(edge)
-            if q > 0.0:
-                rejected = self._immediate_reward(edge, rejected=True) + gamma * stay_values[index]
-                score = (1.0 - q) * score + q * rejected
-            scores[edge.edge_id] = float(score)
+    def _neuradp_scores(self, graph, *, target):
+        # Both rollout and replay re-solve use r_NYC + gamma*U(next state).
+        learned = [e for e in graph.edges if not self._is_anchor_only(e)]
+        scores = {e.edge_id: float(e.structured_score) for e in graph.edges if self._is_anchor_only(e)}
+        context = self._post_context(graph)
+        def evaluate(part):
+            edges = learned[part]
+            rows, owners, probabilities, rewards, terminals = [], [], [], [], []
+            for owner, edge in enumerate(edges):
+                terminal, outcomes = self._outcomes(edge)
+                if not self.neuradp_config['response_aware']:
+                    outcomes = [x for x in outcomes if not x[4]]
+                    mass = sum(x[0] for x in outcomes)
+                    if mass <= 0:
+                        outcomes = [[1., *outcomes[0][1:]]]
+                    else:
+                        outcomes = [[x[0]/mass, *x[1:]] for x in outcomes]
+                for probability, record, physical, shaping, _ in outcomes:
+                    rows.append((edge.vehicle_id, record)); owners.append(owner)
+                    probabilities.append(probability); rewards.append(physical-shaping); terminals.append(terminal)
+            # Bound inference by actual outcome rows, including rejection branches.
+            values, inference_stats = bounded_edge_inference(len(rows),
+                min(self.qvalue_inference_batch_size,
+                    getattr(self, '_neuradp_safe_batch_size', self.qvalue_inference_batch_size)),
+                lambda sub: self._network_records(graph, rows[sub], target, context), device=self.device)
+            if inference_stats['oom_retries']:
+                self._neuradp_safe_batch_size = inference_stats['effective_batch_size']
+            q = np.asarray(probabilities)*(np.asarray(rewards)+self.gamma*values*(1-np.asarray(terminals, dtype=float)))
+            return np.bincount(owners, weights=q, minlength=len(edges)).astype(np.float32)
+        with torch.no_grad():
+            values, self._last_qvalue_inference_stats = bounded_edge_inference(
+                len(learned), self.qvalue_inference_batch_size, evaluate, device=self.device)
+        scores.update((edge.edge_id, float(value)) for edge, value in zip(learned, values))
         return scores
+
+    def _network_records(self, graph, rows, target, context):
+        arrays = self._record_rows(graph, rows, next_epoch=True, context=context)
+        network = self.target_network if target else self.network
+        return network(*(torch.as_tensor(x, device=self.device) for x in arrays)).cpu().numpy()
 
     def _exploration_noise(self, graph) -> dict[str, float]:
         """NeurADP's decaying |N(0, sd)| bonus; zero for in-progress actions."""
@@ -441,13 +392,13 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     # Per-agent TD learning
     # ------------------------------------------------------------------
 
-    def _next_epoch_targets(self, next_graph) -> dict[int, float]:
-        """Score of each vehicle's action in the target-network re-solve."""
-        scores = self._neuradp_scores(next_graph, target=True)
-        selection = self.target_builder.project(next_graph, scores)
+    def _saved_graph_targets(self, graph) -> dict[int, float]:
+        """Re-solve this saved current graph, not its successor."""
+        scores = self._neuradp_scores(graph, target=True)
+        selection = self.target_builder.project(graph, scores)
         selected = set(selection)
         targets: dict[int, float] = {}
-        for edge in next_graph.edges:
+        for edge in graph.edges:
             if edge.edge_id in selected:
                 targets[int(edge.vehicle_id)] = float(scores[edge.edge_id])
         return targets
@@ -461,6 +412,11 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
 
     def _train_joint_step(self, batch_size: int, *, ifEV: bool) -> float:
         return self.train_step(batch_size=batch_size, ifEV=ifEV)
+
+    def _joint_row_ready(self, transition, *, ifEV):
+        return (not ifEV and transition.mode == 'integrated'
+                and transition.ev_stage_graph is not None
+                and bool(transition.ev_stage_graph.edges))
 
     def _train_neuradp(self, batch_size: int) -> float:
         if self.env is not None and bool(getattr(self.env, "evaluatemode", False)):
@@ -476,75 +432,48 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
         )
         if not sample.transitions:
             return 0.0
-        graphs, target_rows, weight_rows, owners = [], [], [], []
-        used_indices = []
-        for transition, replay_index, weight in zip(
-            sample.transitions, sample.indices, sample.weights
-        ):
+        losses, priorities, used_indices = [], [], []
+        steps = 0
+        # Author code updates each sampled scenario sequentially, including a
+        # target-network soft update before resolving the next scenario.
+        for transition, replay_index, weight in zip(sample.transitions, sample.indices, sample.weights):
             if transition.learner_variant != self.learner_variant:
-                raise ValueError(
-                    "joint replay learner variant mismatch: "
-                    f"row={transition.learner_variant}, learner={self.learner_variant}"
-                )
-            payload = self._joint_stage_payload(transition, ifEV=False)
-            if payload is None:
+                raise ValueError('joint replay learner variant mismatch')
+            graph = transition.ev_stage_graph
+            targets = self._saved_graph_targets(graph)
+            vids = sorted(targets)
+            if not vids:
                 continue
-            graph, action, _reward, _phase = payload
-            if graph is None or action is None or not action.selected_edge_ids:
-                continue
-            chosen = set(action.selected_edge_ids)
-            edges = [edge for edge in graph.edges
-                     if edge.edge_id in chosen and not self._is_anchor_only(edge)]
-            if transition.done:
-                targets = {int(edge.vehicle_id): 0.0 for edge in edges}
-            else:
-                next_graph = self._temporal_successor_graph(transition)
-                if next_graph is None:
-                    continue
-                targets = self._next_epoch_targets(next_graph)
-            edges = [edge for edge in edges if int(edge.vehicle_id) in targets]
-            if not edges:
-                continue
-            owner = len(used_indices)
+            arrays = self._current_rows(graph, vids)
+            target_values = np.asarray([targets[vid] for vid in vids], dtype=np.float32)
+            order = self._noise_rng.permutation(len(vids))
+            fit_batch = self.neuradp_config['fit_batch_size']
+            self.network.train()
+            for start in range(0, len(vids), fit_batch):
+                index = order[start:start+fit_batch]
+                prediction = self.network(*(torch.as_tensor(array[index], device=self.device) for array in arrays))
+                target_batch = torch.as_tensor(target_values[index], device=self.device)
+                loss = float(weight)*F.mse_loss(prediction, target_batch)
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.gradient_clip_norm)
+                self.optimizer.step()
+                losses.append(float(loss.detach().item()))
+                steps += 1
+            # Original replay priority is mean squared error, not mean absolute TD.
+            error = target_values-self._predict_arrays(arrays)
+            priorities.append(float(np.mean(error**2)+1e-6))
             used_indices.append(int(replay_index))
-            graphs.append((graph, edges))
-            target_rows.extend(targets[int(edge.vehicle_id)] for edge in edges)
-            weight_rows.extend(float(weight) for _ in edges)
-            owners.extend(owner for _ in edges)
-        if not graphs:
-            return 0.0
-        batches = [self._post_rows(graph, edges) for graph, edges in graphs]
-        arrays = [np.concatenate([item[index] for item in batches]) for index in range(4)]
-        targets = np.asarray(target_rows, dtype=np.float32)
-        weights = np.asarray(weight_rows, dtype=np.float32)
-        rows = len(targets)
-        fit_batch = self.neuradp_config["fit_batch_size"]
-        order = self._noise_rng.permutation(rows)
-        losses = []
-        self.network.train()
-        for start in range(0, rows, fit_batch):
-            index = order[start:start + fit_batch]
-            prediction = self.network(*(torch.as_tensor(array[index], device=self.device) for array in arrays))
-            target_batch = torch.as_tensor(targets[index], device=self.device)
-            weight_batch = torch.as_tensor(weights[index], device=self.device)
-            loss = (weight_batch * F.mse_loss(prediction, target_batch, reduction="none")).mean()
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.gradient_clip_norm)
-            self.optimizer.step()
-            losses.append(float(loss.detach().item()))
-        self._soft_update(self.network, self.target_network, self.tau)
-        td = np.abs(targets - self._predict_arrays(arrays))
-        owner_array = np.asarray(owners)
-        td_errors = [float(td[owner_array == owner].mean()) for owner in range(len(used_indices))]
-        self.joint_replay_buffer.update_priorities(used_indices, td_errors)
+            self._soft_update(self.network, self.target_network, self.tau)
+        if not losses:
+            return 0.
+        self.joint_replay_buffer.update_priorities(used_indices, priorities)
         self.joint_replay_buffer.advance_beta()
         mean_loss = float(np.mean(losses))
         self.training_losses.append(mean_loss)
-        self.neuradp_td_errors.append(float(np.mean(td_errors)))
+        self.neuradp_td_errors.append(float(np.mean(priorities)))
         if len(self.neuradp_td_errors) > 10_000:
             del self.neuradp_td_errors[:-10_000]
-        steps = len(losses)
         self.training_step += 1
         self.joint_training_step += 1
         self.optimizer_steps_joint += steps
@@ -575,8 +504,8 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
 
     def load_extra_checkpoint_state(self, state: dict[str, Any]) -> None:
         version = int(state.get("neuradp_implementation_version", 1))
-        if not 1 <= version <= NEURADP_IMPLEMENTATION_VERSION:
-            raise ValueError(f"Unsupported NeurADP checkpoint implementation version: {version}")
+        if version != NEURADP_IMPLEMENTATION_VERSION:
+            raise ValueError(f"NeurADP checkpoint version {version} uses different value-state semantics; retrain with implementation v{NEURADP_IMPLEMENTATION_VERSION}")
         stored = dict(state.get("neuradp_config", {}) or {})
         restored = _validated_config({**self.neuradp_config, **stored})
         if restored["num_locations"] != self.neuradp_config["num_locations"]:
@@ -590,8 +519,6 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
         for key, value in dict(state.get("neuradp_wait_shaping", {}) or {}).items():
             if key in _WAIT_CONFIG_KEYS and self.env is not None:
                 setattr(self.env, key, float(value))
-        if version < NEURADP_IMPLEMENTATION_VERSION:
-            print("NeurADP legacy weights loaded; corrected charging features and wait rewards require retraining for a corrected baseline.", flush=True)
         self.neuradp_td_errors = list(state.get("neuradp_td_errors", self.neuradp_td_errors))
         target_state = state.get("neuradp_target_network_state_dict")
         # Inference checkpoints store only the online network.

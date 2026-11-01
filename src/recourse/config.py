@@ -276,13 +276,13 @@ def add_method_list_arguments(parser, *, method_choices=ICAPS_METHODS):
 
 
 def _add_external_baseline_arguments(parser):
-    """NeurADP hyperparameters; defaults follow the original paper/code."""
+    """Author-style NeurADP updates with NYC dynamics and project discount."""
 
     group = parser.add_argument_group(
         "NeurADP external baseline (only used by --methods neuradp)"
     )
     group.add_argument("--neuradp-gamma", type=float, default=None,
-                       help="Per-epoch discount (default 0.95, shared with the paper learners)")
+                       help="Per-epoch discount (project default 0.95; author's code uses an epoch-dependent default)")
     group.add_argument("--neuradp-learning-rate", type=float, default=None,
                        help="Adam learning rate (default 1e-3, as in NeurADP)")
     group.add_argument("--neuradp-target-tau", type=float, default=None,
@@ -295,7 +295,7 @@ def _add_external_baseline_arguments(parser):
                        help="Scale of NeurADP's additive exploration noise in reward units (default 1.0; 0 disables)")
     group.add_argument("--neuradp-response-aware", action=argparse.BooleanOptionalAction,
                        default=None,
-                       help="NeurADP+p variant: weight HEV offers by acceptance probability (default off)")
+                       help="Integrate NYC HEV acceptance/rejection outcomes (default on; disable for an assume-accept variant)")
 
 
 def neuradp_options(args) -> dict:
@@ -347,6 +347,10 @@ def method_checkpoint_suffix(
         f"method-{public_method}_rec-{variant}_state-{state_variant}_"
         f"learner-{learner_variant}_shift-{float(rejection_logit_shift):g}"
     )
+    if public_method == "neuradp":
+        # v1/v2 learned selected-post-state values; v3 learns current values.
+        # Both CLI entrypoints must select the same new, isolated namespace.
+        namespace += "_neuradp-v3"
     return "_".join(part for part in (str(base or ""), namespace) if part)
 
 

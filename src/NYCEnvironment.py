@@ -4566,7 +4566,25 @@ class NYCEnvironment:
             if v['penalty_timer'] > 0:
                 v['penalty_timer'] -= 1
 
-        # Charging progress
+        self._advance_charging_progress()
+
+        self.current_online = sum(1 for v in self.vehicles.values() if v.get('is_online', True))
+
+        # Expire old requests
+        expired = [rid for rid, r in self.active_requests.items() if self.current_time > r.pickup_deadline]
+        for rid in expired:
+            being_served = any(
+                v['assigned_request'] == rid or v['passenger_onboard'] == rid
+                for v in self.vehicles.values()
+            )
+            if not being_served:
+                self.active_requests.pop(rid, None)
+                self.expired_request_ids.add(int(rid))
+                self._ensure_recourse_runtime()
+                self.request_lifecycle.record_expiry(int(rid))
+
+    def _advance_charging_progress(self):
+        """End-of-epoch charging kernel, also used by isolated NeurADP previews."""
         for vid, v in self.vehicles.items():
             if not v.get('is_online', True):
                 continue
@@ -4610,21 +4628,6 @@ class NYCEnvironment:
                         self._set_vehicle_charging_session(cvid)
                         v['charging_count'] = int(v.get('charging_count', 0)) + 1
             self.idle_charging_num[sid] = station.max_capacity - len(station.current_vehicles)
-
-        self.current_online = sum(1 for v in self.vehicles.values() if v.get('is_online', True))
-
-        # Expire old requests
-        expired = [rid for rid, r in self.active_requests.items() if self.current_time > r.pickup_deadline]
-        for rid in expired:
-            being_served = any(
-                v['assigned_request'] == rid or v['passenger_onboard'] == rid
-                for v in self.vehicles.values()
-            )
-            if not being_served:
-                self.active_requests.pop(rid, None)
-                self.expired_request_ids.add(int(rid))
-                self._ensure_recourse_runtime()
-                self.request_lifecycle.record_expiry(int(rid))
 
     # ==================================================================
     # Charging / battery helpers
