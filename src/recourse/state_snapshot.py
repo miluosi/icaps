@@ -354,6 +354,11 @@ class StateSnapshotBuilder:
                 # by the deployed network, including an AEV stationary wait.
                 if action_type == ActionType.WAIT and hasattr(env, '_request_trip_distance_km'):
                     edge_metadata += (("feature_action_type_id", 1),)
+                metadata_builder = getattr(value_function, 'snapshot_action_metadata', None)
+                if callable(metadata_builder):
+                    edge_metadata += metadata_builder(
+                        vehicle=vehicle, action_type=action_type, station_id=station_id,
+                        post_action_distance=post_distance, post_action_duration=post_duration)
                 queue_feature_builder = getattr(
                     value_function, "_queue_features", None
                 )
@@ -736,6 +741,11 @@ class StateSnapshotBuilder:
             value_function = _value_function_for_vehicle(
                 env, vehicle.vehicle_type
             )
+            metadata_builder = getattr(value_function, 'snapshot_action_metadata', None)
+            if callable(metadata_builder):
+                metadata.update(metadata_builder(
+                    vehicle=vehicle, action_type=action_type, station_id=station_id,
+                    post_action_distance=post_distance, post_action_duration=post_duration))
             score_builder = getattr(value_function, "_myopic_score", None)
             if callable(score_builder):
                 try:

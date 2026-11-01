@@ -4,8 +4,8 @@ Reference: "Neural Approximate Dynamic Programming for On-Demand Ride-Pooling",
 https://arxiv.org/abs/1911.08842, official code
 https://github.com/sanketkshah/NeurADP-for-Ride-Pooling.
 
-The algorithm is kept as in the paper; only the inputs needed by this
-mixed-fleet electric simulator are added:
+This is a mixed-fleet electric adaptation of the paper's per-agent value
+learning and joint assignment, using compact route features:
 
 * every vehicle has a post-decision value ``V(post_i)`` given by one shared
   network (path LSTM over location embeddings, time embedding, and fleet
@@ -23,14 +23,16 @@ mixed-fleet electric simulator are added:
   update (tau = 0.1), prioritized replay, and decaying additive Gaussian
   exploration noise on the assignment scores.
 
-The immediate reward ``r(a)`` is the edge's structured (myopic) score, credited
-at the decision.  Continuing (in-progress) actions earn zero, except the
-per-epoch waiting cost.
+Non-wait immediate rewards use the structured action score, credited at the
+decision. Waiting uses the simulator's per-epoch idle cost and the project's
+learning-only low-SoC penalty. Neither changes the reported system reward.
+Continuing actions earn zero, except the per-epoch waiting cost.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+import math
 from typing import Any
 
 import numpy as np
@@ -40,6 +42,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from src.recourse.types import ActionType
+from src.qvalue_inference import bounded_edge_inference
 from src.ValueFunction_st_masac_gat import (
     PyTorchChargingValueFunction as _GraphValueFunctionBase,
 )
@@ -57,6 +60,31 @@ NEURADP_DEFAULTS = {
 }
 NEURADP_CONFIG_KEYS = tuple(NEURADP_DEFAULTS)
 _SCALAR_DIM = 9
+NEURADP_IMPLEMENTATION_VERSION = 2
+_WAIT_CONFIG_KEYS = (
+    "learning_soc_wait_threshold", "learning_soc_wait_reference",
+    "learning_soc_wait_penalty_per_hour", "learning_soc_wait_exponent",
+)
+
+
+def _validated_config(config):
+    result = {key: config[key] for key in NEURADP_DEFAULTS}
+    for key in ("gamma", "learning_rate", "target_tau", "noise_scale"):
+        result[key] = float(result[key])
+        if not math.isfinite(result[key]):
+            raise ValueError(f"NeurADP {key} must be finite")
+    if not 0 < result["gamma"] <= 1:
+        raise ValueError("NeurADP gamma must be in (0, 1]")
+    if result["learning_rate"] <= 0 or not 0 <= result["target_tau"] <= 1 or result["noise_scale"] < 0:
+        raise ValueError("Invalid NeurADP learning rate, target tau or noise scale")
+    for key in ("samples_per_update", "fit_batch_size", "num_locations"):
+        value = float(result[key])
+        minimum = 2 if key == "num_locations" else 1
+        if not math.isfinite(value) or not value.is_integer() or value < minimum:
+            raise ValueError(f"NeurADP {key} must be an integer >= {minimum}")
+        result[key] = int(value)
+    result["response_aware"] = bool(result["response_aware"])
+    return result
 
 
 class NeurADPNetwork(nn.Module):
@@ -107,6 +135,7 @@ class NeurADPNetwork(nn.Module):
 
 class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     learner_variant = "neuradp"
+    neuradp_implementation_version = NEURADP_IMPLEMENTATION_VERSION
     direct_q = True
     uses_solver_consistent_targets = True
     collects_legacy_experiences = False
@@ -128,25 +157,14 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
             kwargs.pop(key, None)
         kwargs["zone_distribution_mode"] = "neuradp"
         super().__init__(*args, **kwargs)
-        env = kwargs.get("env")
+        env = self.env
         config = dict(NEURADP_DEFAULTS)
         for key in NEURADP_CONFIG_KEYS:
             env_value = getattr(env, f"neuradp_{key}", None) if env is not None else None
             if env_value is not None:
                 config[key] = env_value
         config.update(overrides)
-        self.neuradp_config = {
-            "gamma": float(config["gamma"]),
-            "learning_rate": float(config["learning_rate"]),
-            "target_tau": float(config["target_tau"]),
-            "samples_per_update": max(1, int(config["samples_per_update"])),
-            "fit_batch_size": max(1, int(config["fit_batch_size"])),
-            "noise_scale": max(0.0, float(config["noise_scale"])),
-            "response_aware": bool(config["response_aware"]),
-            "num_locations": max(2, int(config["num_locations"])),
-        }
-        if not 0.0 < self.neuradp_config["gamma"] <= 1.0:
-            raise ValueError("NeurADP gamma must be in (0, 1]")
+        self.neuradp_config = _validated_config(config)
         self.gamma = self.neuradp_config["gamma"]
         self.tau = self.neuradp_config["target_tau"]
         self.learning_rate = self.neuradp_config["learning_rate"]
@@ -185,20 +203,64 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     def _is_anchor_only(edge) -> bool:
         return bool(dict(edge.metadata).get("matrix_anchor_only", False))
 
-    def _post_rows(self, graph, edges, *, stay: bool = False):
+    def _post_battery(self, battery, action_type_id, distance):
+        """Use NYC's target and timeout instead of adding a fixed full session."""
+        if int(action_type_id) != ActionType.CHARGE or not callable(
+            getattr(self.env, "_charge_duration_for_battery", None)
+        ):
+            return super()._post_battery(battery, action_type_id, distance)
+        arrival = float(battery) - float(distance) * float(self.env.battery_consum)
+        duration = self.env._charge_duration_for_battery(arrival)
+        target = self.env._charge_target_for_battery(arrival)
+        return float(np.clip(min(target, arrival + duration*self.env.chargeincrease_per_epoch), 0, 1))
+
+    def snapshot_action_metadata(self, *, vehicle, action_type, station_id,
+                                 post_action_distance, post_action_duration):
+        """Freeze charge outcomes at collection, never consult live cars in TD."""
+        if action_type != ActionType.CHARGE or not callable(
+            getattr(self.env, "_charge_duration_for_battery", None)
+        ):
+            return ()
+        if vehicle.charging_station is not None:
+            arrival = float(vehicle.battery)
+            duration = float(vehicle.charging_time_left)
+            target = float(self.env.vehicles[vehicle.vehicle_id].get(
+                "charge_target_soc", self.env.charge_target_soc))
+            travel = 0.
+        else:
+            expansion = getattr(self.env, "_last_expected_charge_expansion", None) or {}
+            if float(expansion.get("current_time", -1)) != float(self.env.current_time):
+                expansion = {}
+            window = expansion.get("candidate_windows", {}).get((vehicle.vehicle_id, station_id))
+            if window is None:
+                window = self.env.calculate_expected_entercharge_station_time_battery(
+                    vehicle.vehicle_id, station_id)
+            if window is None:
+                raise ValueError("NeurADP charge edge has no reachable charging outcome")
+            arrival = float(window["expected_battery_after_travel"])
+            duration = float(window["charging_duration"])
+            travel = float(window["travel_epochs"])
+            target = float(self.env._charge_target_for_battery(arrival))
+        post_soc = min(1., target, arrival + duration*self.env.chargeincrease_per_epoch)
+        return (("neuradp_post_charge_soc", max(0., float(post_soc))),
+                ("neuradp_charge_duration", travel + duration))
+
+    def _post_context(self, graph):
+        vehicles = {vehicle.vehicle_id: vehicle for vehicle in graph.state.vehicles}
+        online = [vehicle for vehicle in graph.state.vehicles if vehicle.online]
+        return vehicles, max(1, len(online)), Counter(int(v.location) for v in online)
+
+    def _post_rows(self, graph, edges, *, stay: bool = False, context=None):
         """Feature arrays of each edge's post-decision state.
 
         ``stay=True`` describes the state after a rejected HEV offer: the
         vehicle stays at its current location for one epoch.
         """
         state = graph.state
-        vehicles = {vehicle.vehicle_id: vehicle for vehicle in state.vehicles}
-        online = [vehicle for vehicle in state.vehicles if vehicle.online]
-        online_count = max(1, len(online))
-        zone_counts = Counter(int(vehicle.location) for vehicle in online)
+        vehicles, online_count, zone_counts = context or self._post_context(graph)
         fleet_size = max(1.0, float(self.num_vehicles))
         request_norm = float(len(state.requests)) / fleet_size
-        online_norm = float(len(online)) / fleet_size
+        online_norm = float(sum(zone_counts.values())) / fleet_size
         time_norm = self._time_norm(float(state.current_time))
         angle = time_norm * 2.0 * np.pi
         count = len(edges)
@@ -209,7 +271,8 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
             (count, 1),
         )
         scalars = np.zeros((count, _SCALAR_DIM), dtype=np.float32)
-        horizon = max(1.0, float(self.episode_length))
+        horizon = max(1., float(getattr(self, "aligned_inference_episode_length",
+                                       getattr(self.env, "model_episode_length", self.episode_length))))
         for row, edge in enumerate(edges):
             vehicle = vehicles.get(edge.vehicle_id)
             location = vehicle.location if vehicle is not None else edge.target_location
@@ -227,7 +290,12 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
                 action_type_id = int(
                     dict(edge.metadata).get("feature_action_type_id", edge.action_type)
                 )
-                post_soc = self._post_battery(battery, action_type_id, post_distance)
+                metadata = dict(edge.metadata)
+                if "neuradp_post_charge_soc" in metadata:
+                    post_soc = float(metadata["neuradp_post_charge_soc"])
+                    duration = float(metadata["neuradp_charge_duration"])
+                else:
+                    post_soc = self._post_battery(battery, action_type_id, post_distance)
             path_locations[row] = (self._location_token(target), self._location_token(post))
             path_delays[row] = (
                 np.clip(target_distance / 30.0, 0.0, 5.0),
@@ -251,23 +319,36 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
 
     def _values(self, graph, edges, *, target: bool, stay: bool = False, grad: bool = False):
         if not edges:
-            return torch.zeros(0, device=self.device)
-        arrays = self._post_rows(graph, edges, stay=stay)
+            return torch.zeros(0, device=self.device if grad else "cpu")
         network = self.target_network if target else self.network
-        tensors = (
-            torch.as_tensor(arrays[0], device=self.device),
-            torch.as_tensor(arrays[1], device=self.device),
-            torch.as_tensor(arrays[2], device=self.device),
-            torch.as_tensor(arrays[3], device=self.device),
-        )
         if grad:
-            return network(*tensors)
-        chunk = max(1, int(getattr(self, "qvalue_inference_batch_size", 8192) or 8192))
+            arrays = self._post_rows(graph, edges, stay=stay)
+            return network(*(torch.as_tensor(array, device=self.device) for array in arrays))
+        context = self._post_context(graph)
+        def evaluate(part):
+            arrays = self._post_rows(graph, edges[part], stay=stay, context=context)
+            return network(*(torch.as_tensor(array, device=self.device) for array in arrays)).cpu().numpy()
         with torch.no_grad():
-            return torch.cat([
-                network(*(tensor[start:start + chunk] for tensor in tensors))
-                for start in range(0, len(edges), chunk)
-            ])
+            values, self._last_qvalue_inference_stats = bounded_edge_inference(
+                len(edges), min(self.qvalue_inference_batch_size,
+                                getattr(self, '_neuradp_safe_batch_size', self.qvalue_inference_batch_size)),
+                evaluate, device=self.device)
+        if self._last_qvalue_inference_stats['oom_retries']:
+            self._neuradp_safe_batch_size = self._last_qvalue_inference_stats['effective_batch_size']
+        return torch.from_numpy(values)
+
+    def _predict_arrays(self, arrays):
+        def evaluate(part):
+            return self.network(*(torch.as_tensor(array[part], device=self.device)
+                                  for array in arrays)).cpu().numpy()
+        with torch.no_grad():
+            values, self._last_neuradp_td_inference_stats = bounded_edge_inference(
+                len(arrays[0]), min(self.qvalue_inference_batch_size,
+                                   getattr(self, '_neuradp_safe_batch_size', self.qvalue_inference_batch_size)),
+                evaluate, device=self.device)
+        if self._last_neuradp_td_inference_stats['oom_retries']:
+            self._neuradp_safe_batch_size = self._last_neuradp_td_inference_stats['effective_batch_size']
+        return values
 
     # ------------------------------------------------------------------
     # Scoring (r(a) + gamma * V(post))
@@ -305,6 +386,7 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
                 scores[edge.edge_id] = float(edge.structured_score)
         values = self._values(graph, learned, target=target).detach().cpu().numpy()
         gamma = self.neuradp_config["gamma"]
+        vehicles = {v.vehicle_id: v for v in graph.state.vehicles}
         offers = [index for index, edge in enumerate(learned)
                   if self._offer_rejection_probability(edge) > 0.0]
         stay_values = {}
@@ -312,7 +394,14 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
             stay = self._values(graph, [learned[i] for i in offers], target=target, stay=True)
             stay_values = dict(zip(offers, stay.detach().cpu().numpy().tolist()))
         for index, (edge, value) in enumerate(zip(learned, values)):
-            score = self._immediate_reward(edge) + gamma * float(value)
+            immediate = self._immediate_reward(edge)
+            if edge.action_type == ActionType.WAIT and self.env is not None:
+                immediate = -float(getattr(self.env, "idle_penalty", -immediate))
+                vehicle = vehicles.get(edge.vehicle_id)
+                penalty = getattr(self.env, "soc_wait_learning_penalty", None)
+                if vehicle is not None and vehicle.online and vehicle.vehicle_type == 2 and callable(penalty):
+                    immediate -= float(penalty(vehicle.battery))
+            score = immediate + gamma * float(value)
             q = self._offer_rejection_probability(edge)
             if q > 0.0:
                 rejected = self._immediate_reward(edge, rejected=True) + gamma * stay_values[index]
@@ -374,6 +463,8 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
         return self.train_step(batch_size=batch_size, ifEV=ifEV)
 
     def _train_neuradp(self, batch_size: int) -> float:
+        if self.env is not None and bool(getattr(self.env, "evaluatemode", False)):
+            return 0.0
         if len(self.joint_replay_buffer) == 0:
             return 0.0
         count = min(int(batch_size), self.neuradp_config["samples_per_update"],
@@ -385,7 +476,7 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
         )
         if not sample.transitions:
             return 0.0
-        graphs, edge_rows, target_rows, weight_rows, owners = [], [], [], [], []
+        graphs, target_rows, weight_rows, owners = [], [], [], []
         used_indices = []
         for transition, replay_index, weight in zip(
             sample.transitions, sample.indices, sample.weights
@@ -420,34 +511,30 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
             target_rows.extend(targets[int(edge.vehicle_id)] for edge in edges)
             weight_rows.extend(float(weight) for _ in edges)
             owners.extend(owner for _ in edges)
-            edge_rows.extend(range(len(edges)))
         if not graphs:
             return 0.0
-        arrays = [self._post_rows(graph, edges) for graph, edges in graphs]
-        tensors = [
-            torch.as_tensor(np.concatenate([item[index] for item in arrays]), device=self.device)
-            for index in range(4)
-        ]
-        targets = torch.as_tensor(target_rows, dtype=torch.float32, device=self.device)
-        weights = torch.as_tensor(weight_rows, dtype=torch.float32, device=self.device)
-        rows = targets.numel()
+        batches = [self._post_rows(graph, edges) for graph, edges in graphs]
+        arrays = [np.concatenate([item[index] for item in batches]) for index in range(4)]
+        targets = np.asarray(target_rows, dtype=np.float32)
+        weights = np.asarray(weight_rows, dtype=np.float32)
+        rows = len(targets)
         fit_batch = self.neuradp_config["fit_batch_size"]
-        order = torch.as_tensor(self._noise_rng.permutation(rows), device=self.device)
+        order = self._noise_rng.permutation(rows)
         losses = []
         self.network.train()
         for start in range(0, rows, fit_batch):
             index = order[start:start + fit_batch]
-            prediction = self.network(*(tensor.index_select(0, index) for tensor in tensors))
-            loss = (weights.index_select(0, index)
-                    * F.mse_loss(prediction, targets.index_select(0, index), reduction="none")).mean()
+            prediction = self.network(*(torch.as_tensor(array[index], device=self.device) for array in arrays))
+            target_batch = torch.as_tensor(targets[index], device=self.device)
+            weight_batch = torch.as_tensor(weights[index], device=self.device)
+            loss = (weight_batch * F.mse_loss(prediction, target_batch, reduction="none")).mean()
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.gradient_clip_norm)
             self.optimizer.step()
             losses.append(float(loss.detach().item()))
         self._soft_update(self.network, self.target_network, self.tau)
-        with torch.no_grad():
-            td = (targets - self.network(*tensors)).abs().cpu().numpy()
+        td = np.abs(targets - self._predict_arrays(arrays))
         owner_array = np.asarray(owners)
         td_errors = [float(td[owner_array == owner].mean()) for owner in range(len(used_indices))]
         self.joint_replay_buffer.update_priorities(used_indices, td_errors)
@@ -471,20 +558,40 @@ class PyTorchChargingValueFunction(_GraphValueFunctionBase):
     def inference_checkpoint_state(self) -> dict[str, Any]:
         state = super().inference_checkpoint_state()
         state["neuradp_config"] = dict(self.neuradp_config)
+        state["neuradp_implementation_version"] = NEURADP_IMPLEMENTATION_VERSION
+        state["neuradp_wait_shaping"] = {key: getattr(self.env, key) for key in _WAIT_CONFIG_KEYS
+                                         if hasattr(self.env, key)}
         return state
 
     def extra_checkpoint_state(self) -> dict[str, Any]:
         state = super().extra_checkpoint_state()
         state["neuradp_config"] = dict(self.neuradp_config)
+        state["neuradp_implementation_version"] = NEURADP_IMPLEMENTATION_VERSION
+        state["neuradp_wait_shaping"] = {key: getattr(self.env, key) for key in _WAIT_CONFIG_KEYS
+                                         if hasattr(self.env, key)}
         state["neuradp_td_errors"] = list(self.neuradp_td_errors)
         state["neuradp_target_network_state_dict"] = self.target_network.state_dict()
         return state
 
     def load_extra_checkpoint_state(self, state: dict[str, Any]) -> None:
+        version = int(state.get("neuradp_implementation_version", 1))
+        if not 1 <= version <= NEURADP_IMPLEMENTATION_VERSION:
+            raise ValueError(f"Unsupported NeurADP checkpoint implementation version: {version}")
         stored = dict(state.get("neuradp_config", {}) or {})
-        if stored and int(stored.get("num_locations", -1)) != self.neuradp_config["num_locations"]:
+        restored = _validated_config({**self.neuradp_config, **stored})
+        if restored["num_locations"] != self.neuradp_config["num_locations"]:
             raise ValueError("NeurADP checkpoint location-embedding size mismatch")
         super().load_extra_checkpoint_state(state)
+        self.neuradp_config = restored
+        self.gamma, self.tau = restored["gamma"], restored["target_tau"]
+        self.learning_rate = restored["learning_rate"]
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.learning_rate
+        for key, value in dict(state.get("neuradp_wait_shaping", {}) or {}).items():
+            if key in _WAIT_CONFIG_KEYS and self.env is not None:
+                setattr(self.env, key, float(value))
+        if version < NEURADP_IMPLEMENTATION_VERSION:
+            print("NeurADP legacy weights loaded; corrected charging features and wait rewards require retraining for a corrected baseline.", flush=True)
         self.neuradp_td_errors = list(state.get("neuradp_td_errors", self.neuradp_td_errors))
         target_state = state.get("neuradp_target_network_state_dict")
         # Inference checkpoints store only the online network.

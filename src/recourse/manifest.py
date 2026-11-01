@@ -195,6 +195,7 @@ def _effective_model_hyperparameters(
         "state_variant",
         "learner_variant",
         "recourse_variant",
+        "neuradp_implementation_version",
     )
     rows = []
     seen = set()
@@ -213,6 +214,8 @@ def _effective_model_hyperparameters(
                     for field in fields
                     if hasattr(value_function, field)
                 },
+                **({"neuradp_config": _json_safe(value_function.neuradp_config)}
+                   if hasattr(value_function, "neuradp_config") else {}),
             }
         )
     return rows
@@ -246,6 +249,7 @@ def _effective_replay_hyperparameters(
                     "recourse_bonus",
                     "seed",
                 )
+                if hasattr(replay, field)
             }
         )
     return rows
