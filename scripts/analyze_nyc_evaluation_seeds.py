@@ -127,7 +127,12 @@ def read_method_results_seed(method, data_dir=DEFAULT_DATA, seeds=SEEDS):
                                       completed.completed_orders, err_msg=path.name)
         assert int(r.episodes) == days, path.name
         assert (d.generated_requests > 0).all(), path.name
-        assert ((d.completed_requests >= 0) & (d.completed_requests <= d.generated_requests)).all(), path.name
+        assert (d.completed_requests >= 0).all(), path.name
+        # The exporter buckets completions by completion timestamp, even though
+        # the daily sheet calls its date column request_date. This is a daily
+        # completion-to-release ratio, not a release-cohort completion fraction.
+        finish_counts = completed.groupby('completed_date').completed_orders.sum().reindex(d.index)
+        np.testing.assert_array_equal(d.completed_requests, finish_counts, err_msg=path.name)
         d['service_pct'] = 100 * d.completed_requests / d.generated_requests
         rewards = pd.DataFrame(json.loads(r.daily_evaluation_json)).set_index('date')
         assert not rewards.index.has_duplicates and set(rewards.index) == set(d.index), path.name
@@ -304,7 +309,7 @@ def make_full_policy_latex(result, data_dir=DEFAULT_DATA):
                ('aev_reward_per_day', 1e6, 3), ('service_daily_mean_pct', 1, 2),
                ('aev_completed_session_slot_time_pct', 1, 2)]
     lines = [r'\begin{table*}[!t]', r'\centering', r'\footnotesize',
-             rf'\caption{{NYC continuous-day evaluation, December 15--17, 2025. All {len(methods)} methods report mean $\pm$ sample standard deviation across evaluation seeds {", ".join(map(str, seeds))} ($n={len(seeds)}$ rollouts per configuration). Within each rollout, rewards and completed orders are daily means, and service is the mean of daily rates. HEV denotes the human-driven fleet.}}',
+             rf'\caption{{NYC continuous-day evaluation, December 15--17, 2025. All {len(methods)} methods report mean $\pm$ sample standard deviation across evaluation seeds {", ".join(map(str, seeds))} ($n={len(seeds)}$ rollouts per configuration). Within each rollout, rewards and completed orders are daily means, and service is the mean daily ratio of completed trips to newly released requests. RB denotes reservation-based charging; HEV denotes the human-driven fleet.}}',
              r'\label{tab:nyc-combined-policy-comparison-seeds}',
              r'\setlength{\tabcolsep}{1.9pt}', r'\begin{tabular}{@{}rllrrrrrrr@{}}', r'\toprule',
              r' & & & Reward & HEV completed & AEV completed & HEV reward & AEV reward & Service & $U_A^{\mathrm{cmp}}$ \\',
@@ -330,7 +335,8 @@ def make_full_policy_latex(result, data_dir=DEFAULT_DATA):
             table_rows.append(saved)
             # Keep the existing ten-column paper layout at its original width.
             tex_label = r'\shortstack[l]{NeurADP\\(2020)}' if method == 'neuradp' else label
-            lines.append(f'{num} & {mode} & {tex_label} & ' + ' & '.join(values) + r' \\')
+            display_mode = 'Reactive' if mode == 'current' else 'RB'
+            lines.append(f'{num} & {display_mode} & {tex_label} & ' + ' & '.join(values) + r' \\')
         if mode == 'current':
             lines.append(r'\midrule')
     lines += [r'\bottomrule', r'\end{tabular}', r'\par\smallskip',
@@ -354,7 +360,7 @@ def save_analysis(result, data_dir=DEFAULT_DATA):
         assert hashlib.sha256((Path(data_dir) / source['file']).read_bytes()).hexdigest() == source['sha256']
     notes = (
         'Each evaluation seed is one continuous three-day rollout, not three independent observations.\n'
-        'Reward and completions: daily means within each rollout. Service: arithmetic mean of the three daily request-cohort completion rates.\n'
+        'Reward and completions: daily means within each rollout. Service: arithmetic mean of the three daily completion-to-release ratios (completion date / release date).\n'
         'Across-seed SD uses ddof=1. Paired differences match seed IDs. 95% t intervals use n-1 degrees of freedom.\n'
         'These are unadjusted, normal-model intervals with a small seed sample, not distribution-free evidence or independent training replications.\n'
         'Same hourly/zone demand is verified across all workbooks. Matching seed IDs does not prove event-keyed common random numbers.\n'

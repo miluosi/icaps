@@ -24,12 +24,12 @@ def plot_policy_overview(result):
         ('reward_per_day', 1e6, 'Daily system reward', 'Reward ($ million/day)'),
         ('rejected_without_same_epoch_recourse_per_day', 1e3,
          'HEV-rejected requests without\nsame-epoch recourse', 'Requests (thousand/day)'),
-        ('service_daily_mean_pct', 1, 'Average daily service rate', 'Mean daily completed / generated (%)'),
+        ('service_daily_mean_pct', 1, 'Mean daily service rate', 'Completed / newly released (%)'),
         ('recourse_coverage_pct', 1, 'Same-epoch recourse coverage',
-         'Reassigned / unique HEV-rejected requests (%)'),
+         'Reassigned / HEV-rejected (%)'),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(18, 10))
-    fig.subplots_adjust(left=.065, right=.99, bottom=.09, top=.82, hspace=.43, wspace=.20)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7.5))
+    fig.subplots_adjust(left=.065, right=.99, bottom=.09, top=.87, hspace=.54, wspace=.20)
     x, width = np.arange(len(methods)), .37
     for ax, (metric, scale, title, ylabel) in zip(axes.flat, panels):
         tops = []
@@ -50,18 +50,24 @@ def plot_policy_overview(result):
             tops.extend(means+sd)
         labels = ['NeurADP\n(2020)' if m == 'neuradp' else METHODS[m].replace(' ', '\n', 1)
                   for m in methods]
-        ax.set_xticks(x, labels, fontsize=10)
-        ax.set(title=title, ylabel=ylabel)
+        ax.set_xticks(x, labels, fontsize=10.5)
+        ax.set_title(title, fontsize=15)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.tick_params(axis='y', labelsize=12)
         ax.set_ylim(0, 104 if metric == 'recourse_coverage_pct' else max(max(tops)*1.20, 1))
         ax.grid(axis='x', visible=False)
-    fig.suptitle('NYC policy comparison\n2025-12-15 to 2025-12-17; seeds '
-                 + ', '.join(map(str, seeds)), fontsize=18, y=.98)
-    fig.legend(handles=[Patch(facecolor='#697786', edgecolor='white', label='Current (left)'),
+    # Statistical definitions and dates appear in the paper caption.
+    # Offset close paired labels without moving bars or error bars.
+    for ax in axes.flat:
+        n = len(methods)
+        for first, second in zip(ax.texts[:n], ax.texts[n:]):
+            if abs(first.xy[1] - second.xy[1]) < .08 * ax.get_ylim()[1]:
+                second.set_position((0, 17))
+    fig.legend(handles=[Patch(facecolor='#697786', edgecolor='white', label='Reactive (left)'),
                         Patch(facecolor='#697786', edgecolor='white', hatch='///',
-                              label='Conservative (right)')],
-               loc='upper center', bbox_to_anchor=(.52, .915), ncol=2, frameon=False, fontsize=12)
-    fig.text(.52, .855, f'Bar heights: mean; error bars: sample SD across {len(seeds)} evaluation seeds.',
-             ha='center', fontsize=11)
+                              label='RB (right)')],
+               loc='upper center', bbox_to_anchor=(.52, .99), ncol=2,
+               frameon=False, fontsize=14)
     return fig
 
 
@@ -74,8 +80,8 @@ def plot_daily_completion(result):
     summary = result['hourly_summary'].set_index(['mode', 'method', 'date', 'hour'])
     demand = result['hourly_demand'].set_index(['date', 'hour']).generated_requests
     hours, centers = np.arange(24), np.arange(24)+.5
-    fig, axes = plt.subplots(1, 3, figsize=(24, 8), sharex=True, sharey=True)
-    fig.subplots_adjust(left=.05, right=.99, bottom=.14, top=.74, wspace=.08)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5.5), sharex=True, sharey=True)
+    fig.subplots_adjust(left=.05, right=.99, bottom=.14, top=.73, wspace=.08)
     for ax, date in zip(axes, dates):
         counts = demand.loc[date].reindex(hours)
         assert counts.notna().all()
@@ -102,25 +108,19 @@ def plot_daily_completion(result):
                         linewidth=2.4 if method == 'macro' else 1.7, zorder=3)
         ax.set_title(date, fontsize=15)
         ax.set_xticks(np.arange(0, 25, 4))
+        ax.tick_params(labelsize=14)
         ax.set_xlim(0, 24)
-        ax.set_xlabel('Hour of day', fontsize=13)
-    axes[0].set_ylabel('Completed requests / demand (thousand/hour)', fontsize=13)
+        ax.set_xlabel('Hour of day', fontsize=15)
+    axes[0].set_ylabel('Completed trips / demand (thousand/hour)', fontsize=14)
     axes[0].set_ylim(bottom=0)
-    fig.suptitle('Hourly completed requests: learning policies\n'
-                 '2025-12-15 to 2025-12-17; mean across seeds '
-                 + ', '.join(map(str, seeds)), fontsize=18, y=.99)
     fig.legend(handles=[Line2D([0], [0], color=COLORS[m], linewidth=2.5, label=METHODS[m])
-                        for m in methods], loc='upper center', bbox_to_anchor=(.52, .90),
-               ncol=len(methods), frameon=False, fontsize=13)
+                        for m in methods], loc='upper center', bbox_to_anchor=(.52, .99),
+               ncol=len(methods), frameon=False, fontsize=15)
     fig.legend(handles=[
         Line2D([0], [0], color='#444444', linestyle='-', marker='o', markersize=4,
-               label='Current: solid'),
+               label='Reactive'),
         Line2D([0], [0], color='#444444', linestyle=(0, (4, 2)), marker='s',
-               markerfacecolor='white', markersize=4, label='Conservative: dashed'),
+               markerfacecolor='white', markersize=4, label='RB'),
         Patch(facecolor='#aeb8c2', alpha=.3, label='Shared demand KDE'),
-    ], loc='upper center', bbox_to_anchor=(.52, .84), ncol=3, frameon=False, fontsize=12)
-    fig.text(.52, .035,
-             f'Lines / coloured bands: mean / sample SD across {len(seeds)} evaluation seeds. '
-             'Grey shading: demand KDE, not uncertainty. Completions are counted by completion hour.',
-             ha='center', fontsize=11)
+    ], loc='upper center', bbox_to_anchor=(.52, .90), ncol=3, frameon=False, fontsize=14)
     return fig
